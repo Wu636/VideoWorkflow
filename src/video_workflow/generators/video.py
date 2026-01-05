@@ -45,7 +45,10 @@ class ArkVideoGenerator(VideoGenerator):
                         "type": "image_url",
                         "image_url": {"url": img_data_uri}
                     }
-                ]
+                ],
+                extra_body={
+                    "watermark": False  # 去除AI生成水印
+                }
             )
 
         try:

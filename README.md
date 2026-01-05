@@ -76,10 +76,11 @@ python -m src.video_workflow.main "小狗送外卖" --count 2 --skip-review
 
 | 参数 | 说明 | 示例 |
 |------|------|------|
-| `topic` | 视频主题（必需） | `"小狗送外卖"` |
+| `topic` | 视频主题（使用已有图像时可省略） | `"小狗送外卖"` |
 | `--count, -c` | 分镜数量 | `--count 5` |
 | `--ref, -r` | 参考图路径 | `--ref references/dog.png` |
 | `--skip-review` | 跳过所有审阅步骤 | `--skip-review` |
+| `--from-images, -i` | 从已有图像生成视频 | `-i outputs/12345` |
 
 ### 参考图使用方式
 
@@ -94,6 +95,21 @@ python -m src.video_workflow.main "小狗送外卖" --count 2 --skip-review
 --ref references/
 ```
 
+### 从已有图像生成视频
+
+```bash
+# 使用之前生成的图像直接生成视频
+python -m src.video_workflow.main --from-images outputs/12345
+
+# 或使用简写
+python -m src.video_workflow.main -i outputs/12345
+```
+
+**使用场景**：
+- 已有满意的图像，想重新生成视频
+- 手动修改过图像后生成视频
+- 测试不同视频生成参数
+
 ### 工作流程
 
 1. **角色描述设置** - 自定义或使用默认配置
@@ -102,6 +118,16 @@ python -m src.video_workflow.main "小狗送外卖" --count 2 --skip-review
 4. **视频生成** - 基于图像生成视频片段
 
 ## 🎯 高级功能
+
+### 去除AI生成水印
+
+**自动配置**：代码已默认去除水印（图像和视频）
+
+如需开启水印，可在代码中修改：
+```python
+# image.py 和 video.py
+"watermark": True  # 显示"AI生成"水印
+```
 
 ### 角色一致性优化
 

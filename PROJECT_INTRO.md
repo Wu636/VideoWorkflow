@@ -174,6 +174,21 @@ IMAGE_STYLE_WEIGHT=0.8          # 参考图权重
 - 指数退避策略（1s → 2s → 4s）
 - 超时时间 120 秒
 
+### 7. 去除AI生成水印 🆕
+**自动去除水印**：
+- 图像和视频默认不带"AI生成"水印
+- 使用 `watermark: False` 参数
+- 符合火山方舟官方 API 规范
+
+### 8. 从已有图像生成视频 🆕
+**直接使用已生成的图像**：
+```bash
+python -m src.video_workflow.main --from-images outputs/12345
+```
+- 读取目录下的 `script.json` 和图像文件
+- 跳过脚本和图像生成，直接生成视频
+- 适合重新生成或测试不同参数
+
 ## 💡 使用示例
 
 ```bash
@@ -185,6 +200,12 @@ python -m src.video_workflow.main "小狗送外卖" --count 2 --skip-review
 
 # 多参考图模式
 python -m src.video_workflow.main "橘猫做菜" --count 3 --ref references/
+
+# 使用刚才生成的图像（outputs/40175）生成视频
+python -m src.video_workflow.main --from-images outputs/40175
+
+# 或使用简写
+python -m src.video_workflow.main -i outputs/40175
 
 # 查看帮助
 python -m src.video_workflow.main --help

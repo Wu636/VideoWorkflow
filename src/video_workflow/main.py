@@ -27,21 +27,78 @@ def display_script(storyboard: Storyboard):
     console.print("\n[bold cyan]═══════════════════════════════════════════[/bold cyan]\n")
 
 def main(
-    topic: str = typer.Argument(..., help="视频主题"),
+    topic: str = typer.Argument(None, help="视频主题（使用已有图像时可省略）"),
     count: int = typer.Option(5, "--count", "-c", help="生成的场景数量"),
     reference_image: str = typer.Option(None, "--ref", "-r", help="参考图路径（用于保持角色一致性）"),
-    skip_review: bool = typer.Option(False, "--skip-review", help="跳过所有审阅步骤，直接生成")
+    skip_review: bool = typer.Option(False, "--skip-review", help="跳过所有审阅步骤，直接生成"),
+    from_images: str = typer.Option(None, "--from-images", "-i", help="从已有图像目录生成视频（如 outputs/12345）")
 ):
     """
     为指定主题运行视频生成工作流。
     """
-    console.print(f"[bold green]正在启动视频生成工作流，主题：[/bold green] {topic}")
-    if reference_image:
-        console.print(f"[bold cyan]使用参考图：[/bold cyan] {reference_image}")
-    
     orchestrator = WorkflowOrchestrator()
     
     try:
+        # 模式1: 从已有图像生成视频
+        if from_images:
+            console.print(f"[bold green]📁 从已有图像生成视频[/bold green]")
+            console.print(f"[cyan]图像目录：{from_images}[/cyan]")
+            
+            from pathlib import Path
+            session_path = Path(from_images)
+            
+            if not session_path.exists():
+                console.print(f"[red]错误：目录不存在 {from_images}[/red]")
+                return
+            
+            # 读取已有的 script.json
+            script_file = session_path / "script.json"
+            if not script_file.exists():
+                console.print(f"[red]错误：未找到 script.json 文件[/red]")
+                return
+            
+            import json
+            with open(script_file, "r", encoding="utf-8") as f:
+                script_data = json.load(f)
+            
+            from src.video_workflow.types import Storyboard
+            storyboard = Storyboard(**script_data)
+            
+            # 检查和加载图像路径
+            images_dir = session_path / "images"
+            if not images_dir.exists():
+                console.print(f"[red]错误：未找到 images 目录[/red]")
+                return
+            
+            image_files = sorted(images_dir.glob("*_keyframe.png"))
+            if not image_files:
+                console.print(f"[red]错误：未找到首帧图像文件[/red]")
+                return
+            
+            # 将图像路径关联到场景
+            for idx, scene in enumerate(storyboard.scenes):
+                if idx < len(image_files):
+                    scene.image_path = str(image_files[idx])
+                    console.print(f"  ✅ 场景 {scene.id}: {image_files[idx].name}")
+            
+            console.print(f"\n[bold yellow]开始生成视频...[/bold yellow]")
+            
+            # 初始化并生成视频
+            asyncio.run(orchestrator.initialize())
+            asyncio.run(orchestrator.run_video_generation(storyboard, str(session_path)))
+            
+            console.print(f"\n[bold blue]✅ 成功！[/bold blue] 视频已保存至：{session_path / 'videos'}")
+            return
+        
+        # 模式2: 完整工作流
+        if not topic:
+            console.print("[red]错误：请指定视频主题或使用 --from-images 参数[/red]")
+            return
+        
+        console.print(f"[bold green]正在启动视频生成工作流，主题：[/bold green] {topic}")
+        if reference_image:
+            console.print(f"[bold cyan]使用参考图：[/bold cyan] {reference_image}")
+        
         # 初始化
         asyncio.run(orchestrator.initialize())
         

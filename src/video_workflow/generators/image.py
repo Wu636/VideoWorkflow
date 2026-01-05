@@ -68,7 +68,8 @@ class ArkImageGenerator(ImageGenerator):
             # 3. Add fixed seed for consistency
             # Note: Using extra_body to pass seed parameter
             extra_body = {
-                "seed": self._session_seed
+                "seed": self._session_seed,
+                "watermark": False  # 去除AI生成水印
             }
             
             # 4. Add reference images if provided (支持多图融合)
