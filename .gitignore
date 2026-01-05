@@ -1,0 +1,59 @@
+# Environment Variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+agent-env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Outputs (exclude all generated files)
+outputs/
+
+# Reference Images (exclude all reference files)
+references/*.png
+references/*.jpg
+references/*.jpeg
+references/*.gif
+references/*.webp
+
+# Temporary Files
+temp_script.json
+*.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
