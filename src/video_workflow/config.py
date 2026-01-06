@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # Models
     ARK_VIDEO_MODEL: str = "doubao-seedance-1-5-pro"  # 豆宝-Seedance-1.5-pro
     ARK_IMAGE_MODEL: str = "doubao-seedream-4-5-251128"  # 豆宝-Seedream-4.5
+    ARK_VISION_MODEL: str = "doubao-seed-1-6-251015"  # 豆包多模态（用于参考图分析）
     
     # Image Generation Parameters
     IMAGE_ASPECT_RATIO: str = "16:9"  # 支持: "1:1", "16:9", "9:16", "4:3", "3:4"

@@ -35,8 +35,19 @@ class DeepSeekGenerator(LLMGenerator):
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
 """
 
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
         prompt = f"请为一个关于 '{topic}' 的短视频创作分镜脚本。请精确生成 {count} 个分镜。"
+        
+        # 添加爆款模板指导
+        if template:
+            from src.video_workflow.templates import get_template_prompt_enhancement
+            template_prompt = get_template_prompt_enhancement(template)
+            if template_prompt:
+                prompt = template_prompt + "\n\n【用户主题】" + prompt
+        
+        # 添加角色描述（非常重要！确保脚本和图像角色一致）
+        if settings.CHARACTER_DESCRIPTION:
+            prompt += f"\n\n【重要！角色设定】\n主角外貌描述：{settings.CHARACTER_DESCRIPTION}\n请在所有分镜的 visual_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
         
         if reference_image:
             prompt += "\n注意：DeepSeek 不支持图像输入，将忽略参考图。建议使用 GLM 或 Claude。"
@@ -94,10 +105,14 @@ class GLMGenerator(LLMGenerator):
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串
 """
 
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
         import asyncio
         
-        # Prepare messages
+        # Template enhancement
+        template_enhancement = ""
+        if template:
+            from src.video_workflow.templates import get_template_prompt_enhancement
+            template_enhancement = get_template_prompt_enhancement(template)
         messages = [
             {"role": "system", "content": self.system_prompt}
         ]
@@ -165,6 +180,52 @@ class GLMGenerator(LLMGenerator):
             raise ValueError(f"Failed to parse GLM response as JSON: {e}\nContent: {content}")
         except Exception as e:
             raise ValueError(f"Failed to validate storyboard data: {e}")
+    
+    async def analyze_reference_image(self, image_path: str) -> str | None:
+        """使用 GLM 多模态能力分析参考图，生成角色描述"""
+        import asyncio
+        
+        image_file = Path(image_path)
+        if not image_file.exists():
+            return None
+        
+        with open(image_file, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+        
+        analysis_prompt = """请仔细分析这张图片中的主体角色（人物/动物/卡通形象），生成一段详细的外貌描述。
+
+要求：
+1. 描述要具体、准确，可用于后续 AI 图像生成
+2. 包含：物种/角色类型、体型、毛色/肤色、五官特征、服装配饰、表情气质
+3. 描述长度约50-100字
+4. 只输出描述文本，不要其他解释
+
+示例输出格式：
+一只圆润可爱的橘色猫咪，毛发蓬松柔软，戴着白色厨师帽，穿着蓝色围裙，大眼睛水汪汪的，表情憨态可掬，尾巴毛茸茸的"""
+        
+        loop = asyncio.get_running_loop()
+        
+        def _call_glm():
+            response = self.client.chat.completions.create(
+                model=settings.GLM_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                            {"type": "text", "text": analysis_prompt}
+                        ]
+                    }
+                ]
+            )
+            return response.choices[0].message.content
+        
+        try:
+            result = await loop.run_in_executor(None, _call_glm)
+            return result.strip() if result else None
+        except Exception as e:
+            print(f"GLM 图像分析失败: {e}")
+            return None
 
 
 class ArkLLMGenerator(LLMGenerator):
@@ -200,10 +261,21 @@ class ArkLLMGenerator(LLMGenerator):
 """
         print(f"🤖 使用火山方舟 LLM: {self.model}")
 
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
         import asyncio
         
         prompt = f"请为一个关于 '{topic}' 的短视频创作分镜脚本。请精确生成 {count} 个分镜。"
+        
+        # 添加爆款模板指导
+        if template:
+            from src.video_workflow.templates import get_template_prompt_enhancement
+            template_prompt = get_template_prompt_enhancement(template)
+            if template_prompt:
+                prompt = template_prompt + "\n\n【用户主题】" + prompt
+        
+        # 添加角色描述（确保脚本和图像角色一致）
+        if settings.CHARACTER_DESCRIPTION:
+            prompt += f"\n\n【重要！角色设定】\n主角外貌描述：{settings.CHARACTER_DESCRIPTION}\n请在所有分镜的 visual_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
         
         if reference_image:
             prompt += "\n注意：该模型不支持图像输入，将忽略参考图。"

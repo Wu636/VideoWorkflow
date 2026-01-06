@@ -4,9 +4,13 @@ from src.video_workflow.types import Storyboard, Scene
 
 class LLMGenerator(ABC):
     @abstractmethod
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None) -> Storyboard:
-        """Generate a storyboard based on the topic and optional reference image."""
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
+        """Generate a storyboard based on the topic, optional reference image, and template."""
         pass
+    
+    async def analyze_reference_image(self, image_path: str) -> str | None:
+        """Analyze reference image and return a character description. Default returns None."""
+        return None
 
 class ImageGenerator(ABC):
     @abstractmethod

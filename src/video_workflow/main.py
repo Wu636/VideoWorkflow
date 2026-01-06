@@ -11,6 +11,95 @@ from src.video_workflow.types import Storyboard
 
 console = Console()
 
+
+async def analyze_reference_image(image_path: str) -> str | None:
+    """使用多模态 LLM 分析参考图，自动生成角色描述。支持豆包和 GLM。"""
+    from src.video_workflow.config import settings
+    import base64
+    
+    image_file = Path(image_path)
+    if not image_file.exists():
+        console.print(f"[red]参考图不存在: {image_path}[/red]")
+        return None
+    
+    with open(image_file, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    
+    analysis_prompt = """请仔细分析这张图片中的主体角色（人物/动物/卡通形象），生成一段详细的外貌描述。
+
+要求：
+1. 描述要具体、准确，可用于后续 AI 图像生成
+2. 包含：物种/角色类型、体型、毛色/肤色、五官特征、服装配饰、表情气质
+3. 描述长度约50-100字
+4. 只输出描述文本，不要其他解释
+
+示例输出格式：
+一只圆润可爱的橘色猫咪，毛发蓬松柔软，戴着白色厨师帽，穿着蓝色围裙，大眼睛水汪汪的，表情憨态可掬，尾巴毛茸茸的"""
+    
+    loop = asyncio.get_running_loop()
+    
+    # 方案1: 优先使用智谱 GLM 多模态 (glm-4.7)
+    if settings.GLM_API_KEY:
+        try:
+            from zhipuai import ZhipuAI
+            client = ZhipuAI(api_key=settings.GLM_API_KEY)
+            
+            def _call_glm():
+                # 根据文件扩展名确定 MIME 类型
+                ext = image_file.suffix.lower()
+                mime_type = "image/png" if ext == ".png" else "image/jpeg"
+                
+                response = client.chat.completions.create(
+                    model=settings.GLM_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{img_b64}"}},
+                                {"type": "text", "text": analysis_prompt}
+                            ]
+                        }
+                    ],
+                    stream=False
+                )
+                return response.choices[0].message.content
+            
+            console.print(f"[dim]使用智谱 GLM 多模态模型 ({settings.GLM_MODEL}) 分析...[/dim]")
+            result = await loop.run_in_executor(None, _call_glm)
+            return result.strip() if result else None
+        except Exception as e:
+            console.print(f"[yellow]⚠️ GLM 分析失败: {e}，尝试豆包...[/yellow]")
+    
+    # 方案2: 回退到豆包多模态 (doubao-seed-1-6-251015)
+    if settings.ARK_API_KEY:
+        try:
+            from volcenginesdkarkruntime import Ark
+            client = Ark(api_key=settings.ARK_API_KEY, base_url=settings.ARK_BASE_URL)
+            
+            def _call_doubao():
+                response = client.chat.completions.create(
+                    model=settings.ARK_VISION_MODEL,  # 豆包多模态模型
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                                {"type": "text", "text": analysis_prompt}
+                            ]
+                        }
+                    ]
+                )
+                return response.choices[0].message.content
+            
+            console.print(f"[dim]使用豆包多模态模型 ({settings.ARK_VISION_MODEL}) 分析...[/dim]")
+            result = await loop.run_in_executor(None, _call_doubao)
+            return result.strip() if result else None
+        except Exception as e:
+            console.print(f"[yellow]⚠️ 豆包分析失败: {e}[/yellow]")
+    
+    console.print("[yellow]⚠️ 未配置多模态 API (GLM 或 ARK)，无法自动分析参考图[/yellow]")
+    return None
+
 def display_script(storyboard: Storyboard):
     """美化显示分镜脚本"""
     console.print("\n[bold cyan]═══════════════ 分镜脚本预览 ═══════════════[/bold cyan]\n")
@@ -31,7 +120,8 @@ def main(
     count: int = typer.Option(5, "--count", "-c", help="生成的场景数量"),
     reference_image: str = typer.Option(None, "--ref", "-r", help="参考图路径（用于保持角色一致性）"),
     skip_review: bool = typer.Option(False, "--skip-review", help="跳过所有审阅步骤，直接生成"),
-    from_images: str = typer.Option(None, "--from-images", "-i", help="从已有图像目录生成视频（如 outputs/12345）")
+    from_images: str = typer.Option(None, "--from-images", "-i", help="从已有图像目录生成视频（如 outputs/12345）"),
+    template: str = typer.Option(None, "--template", "-t", help="爆款脚本模板（反转剧/萌宠日常/治愈系/猎奇科普/搞笑剧场/情感共鸣）")
 ):
     """
     为指定主题运行视频生成工作流。
@@ -102,31 +192,87 @@ def main(
         # 初始化
         asyncio.run(orchestrator.initialize())
         
-        # 0. 询问角色外貌描述（如果没有跳过审阅）
+        # 0. 自动分析参考图生成角色描述（如果提供了参考图且没有跳过审阅）
         character_desc = None
         if not skip_review:
             from src.video_workflow.config import settings
-            if settings.CHARACTER_DESCRIPTION:
-                console.print(f"\n[cyan]📝 当前角色描述：[/cyan]{settings.CHARACTER_DESCRIPTION}")
-                use_default = Confirm.ask("是否使用此描述？", default=True)
-                if use_default:
-                    character_desc = settings.CHARACTER_DESCRIPTION
+            import src.video_workflow.config as config_module
+            
+            # 如果有参考图，先自动分析
+            if reference_image:
+                console.print("\n[bold cyan]🔍 正在分析参考图，自动生成角色描述...[/bold cyan]")
+                try:
+                    auto_desc = asyncio.run(analyze_reference_image(reference_image))
+                    if auto_desc:
+                        console.print(f"\n[green]✅ AI 自动生成的角色描述：[/green]")
+                        console.print(f"[bold white]{auto_desc}[/bold white]")
+                        
+                        # 先显示菜单，再获取用户选择
+                        console.print("\n[cyan]请选择操作：[/cyan]")
+                        console.print("  [dim]1[/dim] - ✅ 使用此描述")
+                        console.print("  [dim]2[/dim] - ✏️  在此基础上修改")
+                        console.print("  [dim]3[/dim] - 📝 手动输入新描述")
+                        
+                        choice = Prompt.ask(
+                            "请选择",
+                            choices=["1", "2", "3"],
+                            default="1"
+                        )
+                        
+                        if choice == "1":
+                            character_desc = auto_desc
+                        elif choice == "2":
+                            modified_desc = Prompt.ask("[yellow]请修改描述[/yellow]", default=auto_desc)
+                            character_desc = modified_desc
+                        else:
+                            character_desc = Prompt.ask("[yellow]请输入新的角色描述[/yellow]")
+                except Exception as e:
+                    console.print(f"[yellow]⚠️  自动分析失败: {e}，使用手动模式[/yellow]")
+            
+            # 如果没有参考图或分析失败，使用原有逻辑
+            if not character_desc:
+                if settings.CHARACTER_DESCRIPTION:
+                    console.print(f"\n[cyan]📝 当前配置的角色描述：[/cyan]{settings.CHARACTER_DESCRIPTION}")
+                    use_default = Confirm.ask("是否使用此描述？", default=True)
+                    if use_default:
+                        character_desc = settings.CHARACTER_DESCRIPTION
+                    else:
+                        character_desc = Prompt.ask("[yellow]请输入自定义角色外貌描述[/yellow]", default="")
                 else:
-                    character_desc = Prompt.ask("[yellow]请输入自定义角色外貌描述[/yellow]", default="")
-            else:
-                if Confirm.ask("\n是否需要自定义角色外貌描述？", default=False):
-                    character_desc = Prompt.ask("[yellow]请输入角色外貌描述[/yellow]")
+                    if Confirm.ask("\n是否需要自定义角色外貌描述？", default=False):
+                        character_desc = Prompt.ask("[yellow]请输入角色外貌描述[/yellow]")
             
             if character_desc:
-                # 临时覆盖配置
-                import src.video_workflow.config as config_module
                 config_module.settings.CHARACTER_DESCRIPTION = character_desc
-                console.print(f"[green]✅ 角色描述已设置：{character_desc}[/green]")
+                console.print(f"[green]✅ 角色描述已设置[/green]")
         
-        # 1. 生成分镜脚本
+        # 1. 选择爆款模板
+        selected_template = template
+        if not skip_review and not selected_template:
+            from src.video_workflow.templates import VIRAL_TEMPLATES, get_template_description
+            console.print("\n[bold cyan]📋 选择爆款脚本模板：[/bold cyan]")
+            console.print("  [dim]0[/dim] - 不使用模板（自由创作）")
+            for idx, (name, tmpl) in enumerate(VIRAL_TEMPLATES.items(), 1):
+                console.print(f"  [dim]{idx}[/dim] - [bold]{name}[/bold] - {tmpl.description}")
+            
+            template_choice = Prompt.ask(
+                "请选择模板编号", 
+                choices=["0", "1", "2", "3", "4", "5", "6", "7"],
+                default="0"
+            )
+            
+            if template_choice != "0":
+                template_names = list(VIRAL_TEMPLATES.keys())
+                selected_template = template_names[int(template_choice) - 1]
+                console.print(f"[green]✅ 已选择模板：{selected_template}[/green]")
+        
+        if selected_template:
+            console.print(f"[cyan]📋 使用爆款模板：{selected_template}[/cyan]")
+        
+        # 2. 生成分镜脚本
         console.print("\n[bold yellow]步骤 1/4：生成分镜脚本...[/bold yellow]")
         storyboard = asyncio.run(
-            orchestrator.llm.generate_storyboard(topic, count, reference_image)
+            orchestrator.llm.generate_storyboard(topic, count, reference_image, selected_template)
         )
         
         # 2. 脚本审阅（除非跳过）
