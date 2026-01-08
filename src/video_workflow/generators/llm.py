@@ -49,6 +49,13 @@ class DeepSeekGenerator(LLMGenerator):
         if settings.CHARACTER_DESCRIPTION:
             prompt += f"\n\n【重要！角色设定】\n主角外貌描述：{settings.CHARACTER_DESCRIPTION}\n请在所有分镜的 visual_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
         
+        # 添加风格一致性要求
+        if settings.IMAGE_STYLE:
+            prompt += f"\n\n【重要！视觉风格】\n所有分镜必须保持统一的视觉风格：{settings.IMAGE_STYLE}\n请在每个 visual_prompt 中体现这种风格，不要混用卡通、写实等不同风格！"
+        elif not settings.IMAGE_STYLE:
+            # 即使没有指定风格，也要强调一致性
+            prompt += "\n\n【重要！风格一致性】\n所有分镜的视觉风格必须保持一致！不要在某些场景使用卡通风格，某些场景使用写实风格。请选择一种统一的画风并贯穿始终。"
+        
         if reference_image:
             prompt += "\n注意：DeepSeek 不支持图像输入，将忽略参考图。建议使用 GLM 或 Claude。"
         
@@ -138,9 +145,20 @@ class GLMGenerator(LLMGenerator):
                 "text": f"请仔细观察这张参考图中的角色特征。然后为主题 '{topic}' 创作 {count} 个分镜脚本。\n\n**关键要求**：所有分镜中的角色外貌、服装、风格必须与参考图保持一致。"
             })
         else:
+            text_prompt = f"请为主题 '{topic}' 创作 {count} 个分镜脚本。"
+            
+            # 添加角色描述和风格要求
+            if settings.CHARACTER_DESCRIPTION:
+                text_prompt += f"\n\n【重要！角色设定】\n主角外貌描述：{settings.CHARACTER_DESCRIPTION}\n请在所有分镜中严格使用这个角色设定。"
+            
+            if settings.IMAGE_STYLE:
+                text_prompt += f"\n\n【重要！视觉风格】\n所有分镜必须保持统一的视觉风格：{settings.IMAGE_STYLE}\n请在每个 visual_prompt 中体现这种风格。"
+            elif not settings.IMAGE_STYLE:
+                text_prompt += "\n\n【重要！风格一致性】\n所有分镜的视觉风格必须保持一致！请选择一种统一的画风并贯穿始终。"
+            
             user_content.append({
                 "type": "text",
-                "text": f"请为主题 '{topic}' 创作 {count} 个分镜脚本。"
+                "text": text_prompt
             })
         
         messages.append({"role": "user", "content": user_content})
@@ -276,6 +294,12 @@ class ArkLLMGenerator(LLMGenerator):
         # 添加角色描述（确保脚本和图像角色一致）
         if settings.CHARACTER_DESCRIPTION:
             prompt += f"\n\n【重要！角色设定】\n主角外貌描述：{settings.CHARACTER_DESCRIPTION}\n请在所有分镜的 visual_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
+        
+        # 添加风格一致性要求
+        if settings.IMAGE_STYLE:
+            prompt += f"\n\n【重要！视觉风格】\n所有分镜必须保持统一的视觉风格：{settings.IMAGE_STYLE}\n请在每个 visual_prompt 中体现这种风格，不要混用卡通、写实等不同风格！"
+        elif not settings.IMAGE_STYLE:
+            prompt += "\n\n【重要！风格一致性】\n所有分镜的视觉风格必须保持一致！不要在某些场景使用卡通风格，某些场景使用写实风格。请选择一种统一的画风并贯穿始终。"
         
         if reference_image:
             prompt += "\n注意：该模型不支持图像输入，将忽略参考图。"

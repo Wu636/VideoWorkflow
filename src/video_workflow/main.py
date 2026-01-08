@@ -25,16 +25,18 @@ async def analyze_reference_image(image_path: str) -> str | None:
     with open(image_file, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
     
-    analysis_prompt = """请仔细分析这张图片中的主体角色（人物/动物/卡通形象），生成一段详细的外貌描述。
+    # 要求返回 JSON 格式，同时包含角色和风格
+    analysis_prompt = """请仔细分析这张图片，提取以下两部分信息，以 JSON 格式返回：
 
-要求：
-1. 描述要具体、准确，可用于后续 AI 图像生成
-2. 包含：物种/角色类型、体型、毛色/肤色、五官特征、服装配饰、表情气质
-3. 描述长度约50-100字
-4. 只输出描述文本，不要其他解释
+1. character（角色外貌描述，50-100字）：
+   - 包含：物种/类型、体型、毛色/肤色、五官特征、服装配饰、表情气质
 
-示例输出格式：
-一只圆润可爱的橘色猫咪，毛发蓬松柔软，戴着白色厨师帽，穿着蓝色围裙，大眼睛水汪汪的，表情憨态可掬，尾巴毛茸茸的"""
+2. style（视觉风格描述，20-50字）：
+   - 分析图片整体视觉风格（如：3D卡通渲染、写实摄影、水彩手绘、赛璐璐动画等）
+   - 包含：画面质感、光影风格、色彩特点
+
+请严格按照以下 JSON 格式输出，不要添加其他文字：
+{"character": "角色描述内容", "style": "风格描述内容"}"""
     
     loop = asyncio.get_running_loop()
     
@@ -66,7 +68,24 @@ async def analyze_reference_image(image_path: str) -> str | None:
             
             console.print(f"[dim]使用智谱 GLM 多模态模型 ({settings.GLM_MODEL}) 分析...[/dim]")
             result = await loop.run_in_executor(None, _call_glm)
-            return result.strip() if result else None
+            
+            # 解析 JSON 返回
+            if result:
+                import json
+                result_str = result.strip()
+                if result_str.startswith("```json"):
+                    result_str = result_str[7:]
+                if result_str.startswith("```"):
+                    result_str = result_str[3:]
+                if result_str.endswith("```"):
+                    result_str = result_str[:-3]
+                result_str = result_str.strip()
+                
+                try:
+                    return json.loads(result_str)
+                except:
+                    return {"character": result_str, "style": None}
+            return None
         except Exception as e:
             console.print(f"[yellow]⚠️ GLM 分析失败: {e}，尝试豆包...[/yellow]")
     
@@ -93,7 +112,23 @@ async def analyze_reference_image(image_path: str) -> str | None:
             
             console.print(f"[dim]使用豆包多模态模型 ({settings.ARK_VISION_MODEL}) 分析...[/dim]")
             result = await loop.run_in_executor(None, _call_doubao)
-            return result.strip() if result else None
+            
+            # 解析 JSON 返回
+            if result:
+                import json
+                result_str = result.strip()
+                if result_str.startswith("```json"):
+                    result_str = result_str[7:]
+                if result_str.startswith("```"):
+                    result_str = result_str[3:]
+                if result_str.endswith("```"):
+                    result_str = result_str[:-3]
+                result_str = result_str.strip()
+                
+                try:
+                    return json.loads(result_str)
+                except:
+                    return {"character": result_str, "style": None}
         except Exception as e:
             console.print(f"[yellow]⚠️ 豆包分析失败: {e}[/yellow]")
     
@@ -134,7 +169,6 @@ def main(
             console.print(f"[bold green]📁 从已有图像生成视频[/bold green]")
             console.print(f"[cyan]图像目录：{from_images}[/cyan]")
             
-            from pathlib import Path
             session_path = Path(from_images)
             
             if not session_path.exists():
@@ -200,32 +234,106 @@ def main(
             
             # 如果有参考图，先自动分析
             if reference_image:
-                console.print("\n[bold cyan]🔍 正在分析参考图，自动生成角色描述...[/bold cyan]")
+                console.print("\n[bold cyan]🔍 正在分析参考图，自动生成角色和风格描述...[/bold cyan]")
                 try:
-                    auto_desc = asyncio.run(analyze_reference_image(reference_image))
-                    if auto_desc:
-                        console.print(f"\n[green]✅ AI 自动生成的角色描述：[/green]")
-                        console.print(f"[bold white]{auto_desc}[/bold white]")
-                        
-                        # 先显示菜单，再获取用户选择
-                        console.print("\n[cyan]请选择操作：[/cyan]")
-                        console.print("  [dim]1[/dim] - ✅ 使用此描述")
-                        console.print("  [dim]2[/dim] - ✏️  在此基础上修改")
-                        console.print("  [dim]3[/dim] - 📝 手动输入新描述")
-                        
-                        choice = Prompt.ask(
-                            "请选择",
-                            choices=["1", "2", "3"],
-                            default="1"
-                        )
-                        
-                        if choice == "1":
-                            character_desc = auto_desc
-                        elif choice == "2":
-                            modified_desc = Prompt.ask("[yellow]请修改描述[/yellow]", default=auto_desc)
-                            character_desc = modified_desc
+                    analysis_result = asyncio.run(analyze_reference_image(reference_image))
+                    if analysis_result:
+                        # 处理返回结果（可能是字符串或字典）
+                        if isinstance(analysis_result, dict):
+                            auto_character = analysis_result.get("character", "")
+                            auto_style = analysis_result.get("style", "")
                         else:
-                            character_desc = Prompt.ask("[yellow]请输入新的角色描述[/yellow]")
+                            auto_character = str(analysis_result)
+                            auto_style = ""
+                        
+                        # 显示分析结果（角色+风格一起显示）
+                        if auto_character or auto_style:
+                            console.print(f"\n[green]✅ AI 自动分析结果：[/green]")
+                            console.print(f"[bold]角色描述：[/bold]{auto_character or '（未识别）'}")
+                            console.print(f"[bold]视觉风格：[/bold]{auto_style or '（未识别）'}")
+                            
+                            # 编辑审阅循环
+                            while True:
+                                console.print("\n[cyan]请选择操作：[/cyan]")
+                                console.print("  [dim]1[/dim] - ✅ 确认使用以上设置")
+                                console.print("  [dim]2[/dim] - ✏️  编辑角色描述和风格（打开编辑器）")
+                                console.print("  [dim]3[/dim] - 📝 手动输入")
+                                console.print("  [dim]4[/dim] - ❌ 跳过，不使用")
+                                
+                                choice = Prompt.ask("请选择", choices=["1", "2", "3", "4"], default="1")
+                                
+                                if choice == "1":
+                                    character_desc = auto_character
+                                    if auto_style:
+                                        config_module.settings.IMAGE_STYLE = auto_style
+                                    console.print("[green]✅ 设置已确认[/green]")
+                                    break
+                                    
+                                elif choice == "2":
+                                    # 创建临时文件让用户编辑
+                                    temp_file = Path("temp_character_style.txt")
+                                    content = f"""# 角色描述和视觉风格设置
+# 请直接修改下方内容，保存后关闭文件
+
+【角色描述】
+{auto_character}
+
+【视觉风格】
+{auto_style or '（未识别，可手动填写）'}
+"""
+                                    temp_file.write_text(content, encoding="utf-8")
+                                    console.print(f"\n[cyan]已创建编辑文件：[bold]{temp_file}[/bold][/cyan]")
+                                    console.print("[cyan]请修改后保存，然后按回车继续...[/cyan]")
+                                    input()
+                                    
+                                    # 读取修改后的内容
+                                    try:
+                                        edited = temp_file.read_text(encoding="utf-8")
+                                        lines = edited.split("\n")
+                                        in_char, in_style = False, False
+                                        char_lines, style_lines = [], []
+                                        
+                                        for line in lines:
+                                            if line.startswith("#"):
+                                                continue
+                                            if "【角色描述】" in line:
+                                                in_char, in_style = True, False
+                                                continue
+                                            if "【视觉风格】" in line:
+                                                in_char, in_style = False, True
+                                                continue
+                                            if in_char:
+                                                char_lines.append(line)
+                                            elif in_style:
+                                                style_lines.append(line)
+                                        
+                                        auto_character = "\n".join(char_lines).strip()
+                                        auto_style = "\n".join(style_lines).strip()
+                                        if auto_style.startswith("（"):
+                                            auto_style = ""
+                                        
+                                        temp_file.unlink()
+                                        
+                                        # 显示修改后内容供审阅
+                                        console.print(f"\n[green]修改后的设置：[/green]")
+                                        console.print(f"[bold]角色描述：[/bold]{auto_character}")
+                                        console.print(f"[bold]视觉风格：[/bold]{auto_style or '（无）'}")
+                                        
+                                    except Exception as e:
+                                        console.print(f"[red]读取失败: {e}[/red]")
+                                        if temp_file.exists():
+                                            temp_file.unlink()
+                                
+                                elif choice == "3":
+                                    auto_character = Prompt.ask("[yellow]角色描述[/yellow]", default=auto_character)
+                                    auto_style = Prompt.ask("[yellow]视觉风格（可跳过）[/yellow]", default=auto_style or "")
+                                    console.print(f"\n[green]设置完成：[/green]")
+                                    console.print(f"[bold]角色描述：[/bold]{auto_character}")
+                                    console.print(f"[bold]视觉风格：[/bold]{auto_style or '（无）'}")
+                                
+                                elif choice == "4":
+                                    break
+                            
                 except Exception as e:
                     console.print(f"[yellow]⚠️  自动分析失败: {e}，使用手动模式[/yellow]")
             
@@ -237,7 +345,8 @@ def main(
                     if use_default:
                         character_desc = settings.CHARACTER_DESCRIPTION
                     else:
-                        character_desc = Prompt.ask("[yellow]请输入自定义角色外貌描述[/yellow]", default="")
+                        # 让用户在原描述基础上修改
+                        character_desc = Prompt.ask("[yellow]请修改角色描述[/yellow]", default=settings.CHARACTER_DESCRIPTION)
                 else:
                     if Confirm.ask("\n是否需要自定义角色外貌描述？", default=False):
                         character_desc = Prompt.ask("[yellow]请输入角色外貌描述[/yellow]")
@@ -246,7 +355,21 @@ def main(
                 config_module.settings.CHARACTER_DESCRIPTION = character_desc
                 console.print(f"[green]✅ 角色描述已设置[/green]")
         
-        # 1. 选择爆款模板
+        # 2. 选择分镜数量（交互模式）
+        if not skip_review:
+            count_input = Prompt.ask(
+                "\n[cyan]📊 请输入分镜数量[/cyan]",
+                default=str(count)
+            )
+            try:
+                count = int(count_input)
+                if count < 1:
+                    count = 5
+            except:
+                count = 5
+            console.print(f"[green]✅ 将生成 {count} 个分镜[/green]")
+        
+        # 3. 选择爆款模板
         selected_template = template
         if not skip_review and not selected_template:
             from src.video_workflow.templates import VIRAL_TEMPLATES, get_template_description
@@ -367,54 +490,117 @@ def review_script_loop(orchestrator, storyboard: Storyboard, topic: str, referen
 
 
 def review_images_loop(session_dir, storyboard: Storyboard, orchestrator, reference_image: str | None) -> bool:
-    """交互式图像审阅循环"""
+    """交互式图像审阅循环，支持选择性重新生成"""
     from pathlib import Path
     
     while True:
-        # 显示图像路径
+        # 显示图像路径（带编号）
         console.print("\n[bold cyan]═══════════════ 生成的图像 ═══════════════[/bold cyan]\n")
         
         images_dir = Path(session_dir) / "images"
-        image_files = list(images_dir.glob("*.png"))
+        image_files = sorted(list(images_dir.glob("*_keyframe.png")))
         
         if not image_files:
             console.print("[red]未找到生成的图像！[/red]")
             return False
         
-        for img_file in sorted(image_files):
-            console.print(f"  📷 {img_file}")
+        for idx, img_file in enumerate(image_files, 1):
+            scene_id = idx
+            console.print(f"  [dim]{idx}[/dim] 📷 {img_file.name}")
         
         console.print(f"\n[cyan]👉 请在文件浏览器中查看: {images_dir}[/cyan]\n")
         console.print("[bold cyan]═══════════════════════════════════════════[/bold cyan]\n")
         
         console.print("[bold]请选择操作：[/bold]")
-        console.print("  [green]1[/green] - ✅ 确认图像，继续生成视频")
-        console.print("  [yellow]2[/yellow] - 🔄 输入修改建议，重新生成所有图像")
-        console.print("  [red]3[/red] - ❌ 取消并退出")
+        console.print("  [green]1[/green] - ✅ 确认全部图像，继续生成视频")
+        console.print("  [yellow]2[/yellow] - 🔄 重新生成指定分镜的图像")
+        console.print("  [blue]3[/blue] - 🔄 重新生成所有图像")
+        console.print("  [red]4[/red] - ❌ 取消并退出")
         
-        choice = Prompt.ask("请输入选项", choices=["1", "2", "3"], default="1")
+        choice = Prompt.ask("请输入选项", choices=["1", "2", "3", "4"], default="1")
         
         if choice == "1":
             console.print("[green]✅ 图像已确认，开始生成视频...[/green]")
             return True
         
         elif choice == "2":
+            # 选择性重新生成
+            scene_ids_input = Prompt.ask(
+                "[yellow]请输入要重新生成的分镜编号[/yellow]",
+                default="1"
+            )
+            
+            # 解析编号（支持逗号分隔，如 "1,3,5"）
+            try:
+                scene_ids = [int(x.strip()) for x in scene_ids_input.split(",")]
+                scene_ids = [x for x in scene_ids if 1 <= x <= len(storyboard.scenes)]
+            except:
+                console.print("[red]编号格式错误，请输入数字（如：1 或 1,3,5）[/red]")
+                continue
+            
+            if not scene_ids:
+                console.print("[red]未选择有效的分镜编号[/red]")
+                continue
+            
+            # 选择参考图来源
+            console.print("\n[cyan]请选择参考图来源：[/cyan]")
+            console.print("  [dim]1[/dim] - 🖼️  使用原始参考图")
+            if len(image_files) > 0:
+                console.print("  [dim]2[/dim] - 📷 使用已生成的某个分镜图像")
+            
+            ref_choice = Prompt.ask("请选择", choices=["1", "2"] if len(image_files) > 0 else ["1"], default="1")
+            
+            current_ref = reference_image
+            if ref_choice == "2":
+                ref_scene = Prompt.ask(
+                    "[yellow]请输入要作为参考的分镜编号[/yellow]",
+                    default="1"
+                )
+                try:
+                    ref_idx = int(ref_scene) - 1
+                    if 0 <= ref_idx < len(image_files):
+                        current_ref = str(image_files[ref_idx])
+                        console.print(f"[green]✅ 使用 {image_files[ref_idx].name} 作为参考图[/green]")
+                except:
+                    console.print("[yellow]编号无效，使用原始参考图[/yellow]")
+            
+            # 输入修改建议
+            feedback = Prompt.ask("[yellow]请输入修改建议（可回车跳过）[/yellow]", default="")
+            
+            console.print(f"[bold]正在重新生成分镜 {scene_ids}...[/bold]")
+            
+            # 更新选中场景的 visual_prompt
+            for scene_id in scene_ids:
+                scene = storyboard.scenes[scene_id - 1]
+                if feedback.strip():
+                    scene.visual_prompt += f"\n修改要求：{feedback}"
+            
+            # 只重新生成选中的场景
+            try:
+                asyncio.run(orchestrator.run_image_generation(
+                    storyboard, current_ref, str(session_dir), 
+                    scene_ids=scene_ids
+                ))
+                console.print("[green]✅ 选中的图像已重新生成！[/green]")
+            except Exception as e:
+                console.print(f"[red]重新生成失败: {e}[/red]")
+        
+        elif choice == "3":
+            # 重新生成所有图像
             feedback = Prompt.ask("[yellow]请输入修改建议（如：让角色更可爱，改变光线）[/yellow]")
             if feedback.strip():
-                console.print("[bold]正在根据您的建议重新生成图像...[/bold]")
+                console.print("[bold]正在根据您的建议重新生成所有图像...[/bold]")
                 
-                # 更新每个场景的 visual_prompt
                 for scene in storyboard.scenes:
                     scene.visual_prompt += f"\n修改要求：{feedback}"
                 
-                # 重新生成图像
                 try:
                     asyncio.run(orchestrator.run_image_generation(storyboard, reference_image, str(session_dir)))
                     console.print("[green]✅ 图像已重新生成！请查看新的结果：[/green]")
                 except Exception as e:
                     console.print(f"[red]重新生成失败: {e}[/red]")
         
-        elif choice == "3":
+        elif choice == "4":
             return False
 
 
