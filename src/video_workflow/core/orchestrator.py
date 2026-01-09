@@ -192,14 +192,26 @@ class WorkflowOrchestrator:
         logger.info("图像生成完成。")
         return str(session_dir), all_success
 
-    async def run_video_generation(self, storyboard: Storyboard, session_dir: str):
+    async def run_video_generation(self, storyboard: Storyboard, session_dir: str, scene_ids: list[int] | None = None):
         """
         仅生成视频（在图像审阅后调用）
+        
+        Args:
+            storyboard: 分镜脚本
+            session_dir: 会话目录
+            scene_ids: 要生成视频的场景ID列表，None表示全部生成
         """
         await self.initialize()
         session_path = Path(session_dir)
         
         logger.info(f"开始生成视频 (Session: {session_path.name})")
+        
+        # 筛选要生成的场景
+        if scene_ids:
+            scenes_to_generate = [s for s in storyboard.scenes if s.id in scene_ids and s.image_path]
+            logger.info(f"选择性生成视频: 场景 {scene_ids}")
+        else:
+            scenes_to_generate = [s for s in storyboard.scenes if s.image_path]
         
         # Generate videos concurrently
         semaphore = asyncio.Semaphore(settings.WORKFLOW_CONCURRENCY)
@@ -225,7 +237,7 @@ class WorkflowOrchestrator:
                     scene.video_status = GenerationStatus.FAILED
                     scene.error_message = str(e)
         
-        tasks = [_bounded_video_gen(scene) for scene in storyboard.scenes]
+        tasks = [_bounded_video_gen(scene) for scene in scenes_to_generate]
         await asyncio.gather(*tasks)
         
         # Save final script

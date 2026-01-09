@@ -14,28 +14,40 @@ class DeepSeekGenerator(LLMGenerator):
             base_url=settings.DEEPSEEK_BASE_URL
         )
         self.system_prompt = """
-你是一位专业的短视频分镜师和导演。
+你是一位专业的AI短视频分镜师和导演，擅长创作爆款短视频脚本。
 你的任务是根据给定的主题生成详细的分镜脚本。
-输出必须是符合以下结构的有效 JSON 对象：
+
+【输出格式】必须是符合以下结构的有效 JSON 对象：
 {
     "topic": "string",
     "scenes": [
         {
             "id": 1,
-            "narrative": "分镜的旁白或画外音文本...",
-            "visual_prompt": "详细的静态画面描述，用于生成首帧图像，包含光影、构图、风格和主体细节...",
-            "motion_prompt": "详细的动态描述，用于生成视频，清晰描述运镜（如推拉摇移）和主体动作..."
+            "narrative": "【角色名】: '台词内容'（语气/音色/情绪）",
+            "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
+            "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
         }
     ]
 }
 
-- visual_prompt 应当非常详细，专注于视觉表现。
-- motion_prompt 应当清晰描述动作和运镜。
-- narrative (旁白) 应当简洁生动，富有感染力。
+【创作铁律】
+1. narrative 是角色说的台词（不是旁白！），必须包含角色名和声音描述：
+   - 示例：【大橘猫】: '今天又要加班...'（无奈叹气，声音低沉疲惫）
+   - 示例：【小柯基】: '这是什么？好香啊！'（兴奋上扬，声音轻快好奇）
+2. 台词长度严格控制：5秒视频 = 10-15个字，绝对不能超过20个字！
+3. 情绪状态要具体："眼眶微红/嘴角微扬/眉头紧锁" 比 "伤心/开心/生气" 效果好10倍
+4. 动作描述要细化："向前迈步 + 挥出右爪" 比 "打架" 效果好
+5. 一个镜头只做1-2个动作：太多动作会让画面很乱
+6. 营造氛围感：描写光影（如"暖黄色的夕阳余晖"）
+7. 视觉风格一致：所有分镜保持统一画风，不要卡通和写实混用
+
+- visual_prompt 应当非常详细，专注于视觉表现和情绪细节。
+- motion_prompt 应当清晰描述动作和运镜，每镜头1-2个动作。
+- narrative 必须是【角色名】: '台词'（语气），不要写旁白！
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
 """
 
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None, include_dialogue: bool = True) -> Storyboard:
         prompt = f"请为一个关于 '{topic}' 的短视频创作分镜脚本。请精确生成 {count} 个分镜。"
         
         # 添加爆款模板指导
@@ -45,6 +57,23 @@ class DeepSeekGenerator(LLMGenerator):
             if template_prompt:
                 prompt = template_prompt + "\n\n【用户主题】" + prompt
         
+        # 核心：根据是否包含台词调整 Prompt
+        if include_dialogue:
+            prompt += """
+\n【重要！必须严格遵循的台词规则】
+1. narrative 必须是【角色名】: '台词'（语气）格式
+2. visual/motion 必须描述角色说话时的动作（如张嘴、肢体配合）
+3. 确保画面与台词在时间线上融合，不要出现"画外音"感觉
+"""
+        else:
+            prompt += """
+\n【重要！必须严格遵循的规则：无台词模式】
+1. narrative 字段**严禁**包含任何角色台词！
+2. narrative 只可以写简短的动作描述、画面补充说明，或者直接留空。
+3. visual_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
+4. 绝对不要出现角色开口说话的描述。
+"""
+
         # 添加角色描述（非常重要！确保脚本和图像角色一致）
         if settings.CHARACTER_DESCRIPTION:
             prompt += f"\n\n【重要！角色设定】\n主角外貌描述：{settings.CHARACTER_DESCRIPTION}\n请在所有分镜的 visual_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
@@ -88,31 +117,41 @@ class GLMGenerator(LLMGenerator):
             raise ValueError("GLM_API_KEY not configured")
         self.client = ZhipuAI(api_key=settings.GLM_API_KEY)
         self.system_prompt = """
-你是一位专业的短视频分镜师和导演。
+你是一位专业的AI短视频分镜师和导演，擅长创作爆款短视频脚本。
 你的任务是根据给定的主题和参考图生成详细的分镜脚本。
 
 **重要**：如果提供了参考图，请仔细分析图中的角色特征（外貌、服装、风格、色彩），并在所有分镜的描述中保持这些特征的一致性。
 
-输出必须是符合以下结构的有效 JSON 对象：
+【输出格式】必须是符合以下结构的有效 JSON 对象：
 {
     "topic": "string",
     "scenes": [
         {
             "id": 1,
-            "narrative": "分镜的旁白或画外音文本...",
-            "visual_prompt": "详细的静态画面描述，用于生成首帧图像。必须包含：角色外貌（发型、五官、服装）、场景环境、光影效果、构图细节...",
-            "motion_prompt": "详细的动态描述，用于生成视频，清晰描述运镜（如推拉摇移）和主体动作..."
+            "narrative": "【角色名】: '台词内容'（语气/音色/情绪）",
+            "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
+            "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
         }
     ]
 }
 
-- visual_prompt 必须包含详细的角色描述，确保所有分镜中角色外观一致
-- motion_prompt 应当清晰描述动作和运镜
-- narrative (旁白) 应当简洁生动，富有感染力
+【创作铁律】
+1. narrative 是角色说的台词（不是旁白！），必须包含角色名和声音描述：
+   - 示例：【大橘猫】: '今天又要加班...'（无奈叹气，声音低沉疲惫）
+   - 示例：【小柯基】: '这是什么？好香啊！'（兴奋上扬，声音轻快好奇）
+2. 台词长度严格控制：5秒视频 = 10-15个字，绝对不能超过20个字！
+3. 情绪状态要具体："眼眶微红/嘴角微扬/眉头紧锁" 比 "伤心/开心/生气" 效果好10倍
+4. 动作描述要细化，一个镜头只做1-2个动作
+5. 营造氛围感：描写光影（如"暖黄色的夕阳余晖"）
+6. 视觉风格一致：所有分镜保持统一画风
+
+- visual_prompt 必须包含详细的角色描述和情绪细节，确保所有分镜中角色外观一致
+- motion_prompt 应当清晰描述动作和运镜，每镜头1-2个动作
+- narrative 必须是【角色名】: '台词'（语气），不要写旁白！
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串
 """
 
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None, include_dialogue: bool = True) -> Storyboard:
         import asyncio
         
         # Template enhancement
@@ -123,6 +162,24 @@ class GLMGenerator(LLMGenerator):
         messages = [
             {"role": "system", "content": self.system_prompt}
         ]
+
+        # 核心：根据是否包含台词调整 Prompt
+        dialogue_prompt_addendum = ""
+        if include_dialogue:
+            dialogue_prompt_addendum = """
+\n【重要！必须严格遵循的台词规则】
+1. narrative 必须是【角色名】: '台词'（语气）格式
+2. visual/motion 必须描述角色说话时的动作（如张嘴、肢体配合）
+3. 确保画面与台词在时间线上融合，不要出现"画外音"感觉
+"""
+        else:
+            dialogue_prompt_addendum = """
+\n【重要！必须严格遵循的规则：无台词模式】
+1. narrative 字段**严禁**包含任何角色台词！
+2. narrative 只可以写简短的动作描述、画面补充说明，或者直接留空。
+3. visual_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
+4. 绝对不要出现角色开口说话的描述。
+"""
         
         # Build user message with optional image
         user_content = []
@@ -142,10 +199,10 @@ class GLMGenerator(LLMGenerator):
             })
             user_content.append({
                 "type": "text",
-                "text": f"请仔细观察这张参考图中的角色特征。然后为主题 '{topic}' 创作 {count} 个分镜脚本。\n\n**关键要求**：所有分镜中的角色外貌、服装、风格必须与参考图保持一致。"
+                "text": f"请仔细观察这张参考图中的角色特征。然后为主题 '{topic}' 创作 {count} 个分镜脚本。\n\n**关键要求**：所有分镜中的角色外貌、服装、风格必须与参考图保持一致。" + dialogue_prompt_addendum
             })
         else:
-            text_prompt = f"请为主题 '{topic}' 创作 {count} 个分镜脚本。"
+            text_prompt = f"请为主题 '{topic}' 创作 {count} 个分镜脚本。" + dialogue_prompt_addendum
             
             # 添加角色描述和风格要求
             if settings.CHARACTER_DESCRIPTION:
@@ -257,29 +314,40 @@ class ArkLLMGenerator(LLMGenerator):
         )
         self.model = settings.ARK_LLM_MODEL
         self.system_prompt = """
-你是一位专业的短视频分镜师和导演。
+你是一位专业的AI短视频分镜师和导演，擅长创作爆款短视频脚本。
 你的任务是根据给定的主题生成详细的分镜脚本。
-输出必须是符合以下结构的有效 JSON 对象：
+
+【输出格式】必须是符合以下结构的有效 JSON 对象：
 {
     "topic": "string",
     "scenes": [
         {
             "id": 1,
-            "narrative": "分镜的旁白或画外音文本...",
-            "visual_prompt": "详细的静态画面描述，用于生成首帧图像，包含光影、构图、风格和主体细节...",
-            "motion_prompt": "详细的动态描述，用于生成视频，清晰描述运镜（如推拉摇移）和主体动作..."
+            "narrative": "【角色名】: '台词内容'（语气/音色/情绪）",
+            "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
+            "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
         }
     ]
 }
 
-- visual_prompt 应当非常详细，专注于视觉表现。
-- motion_prompt 应当清晰描述动作和运镜。
-- narrative (旁白) 应当简洁生动，富有感染力。
+【创作铁律】
+1. narrative 是角色说的台词（不是旁白！），必须包含角色名和声音描述：
+   - 示例：【大橘猫】: '今天又要加班...'（无奈叹气，声音低沉疲惫）
+   - 示例：【小柯基】: '这是什么？好香啊！'（兴奋上扬，声音轻快好奇）
+2. 台词长度严格控制：5秒视频 = 10-15个字，绝对不能超过20个字！
+3. 情绪状态要具体："眼眶微红/嘴角微扬/眉头紧锁" 比 "伤心/开心/生气" 效果好10倍
+4. 动作描述要细化，一个镜头只做1-2个动作
+5. 营造氛围感：描写光影（如"暖黄色的夕阳余晖"）
+6. 视觉风格一致：所有分镜保持统一画风
+
+- visual_prompt 应当非常详细，专注于视觉表现和情绪细节。
+- motion_prompt 应当清晰描述动作和运镜，每镜头1-2个动作。
+- narrative 必须是【角色名】: '台词'（语气），不要写旁白！
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
 """
         print(f"🤖 使用火山方舟 LLM: {self.model}")
 
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None, include_dialogue: bool = True) -> Storyboard:
         import asyncio
         
         prompt = f"请为一个关于 '{topic}' 的短视频创作分镜脚本。请精确生成 {count} 个分镜。"
@@ -290,6 +358,23 @@ class ArkLLMGenerator(LLMGenerator):
             template_prompt = get_template_prompt_enhancement(template)
             if template_prompt:
                 prompt = template_prompt + "\n\n【用户主题】" + prompt
+        
+        # 核心：根据是否包含台词调整 Prompt
+        if include_dialogue:
+            prompt += """
+\n【重要！必须严格遵循的台词规则】
+1. narrative 必须是【角色名】: '台词'（语气）格式
+2. visual/motion 必须描述角色说话时的动作（如张嘴、肢体配合）
+3. 确保画面与台词在时间线上融合，不要出现"画外音"感觉
+"""
+        else:
+            prompt += """
+\n【重要！必须严格遵循的规则：无台词模式】
+1. narrative 字段**严禁**包含任何角色台词！
+2. narrative 只可以写简短的动作描述、画面补充说明，或者直接留空。
+3. visual_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
+4. 绝对不要出现角色开口说话的描述。
+"""
         
         # 添加角色描述（确保脚本和图像角色一致）
         if settings.CHARACTER_DESCRIPTION:

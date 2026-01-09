@@ -4,7 +4,7 @@ from src.video_workflow.types import Storyboard, Scene
 
 class LLMGenerator(ABC):
     @abstractmethod
-    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None) -> Storyboard:
+    async def generate_storyboard(self, topic: str, count: int = 5, reference_image: str | None = None, template: str | None = None, include_dialogue: bool = True) -> Storyboard:
         """Generate a storyboard based on the topic, optional reference image, and template."""
         pass
     

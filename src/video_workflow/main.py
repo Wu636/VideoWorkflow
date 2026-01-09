@@ -380,7 +380,7 @@ def main(
             
             template_choice = Prompt.ask(
                 "请选择模板编号", 
-                choices=["0", "1", "2", "3", "4", "5", "6", "7"],
+                choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"],
                 default="0"
             )
             
@@ -392,10 +392,20 @@ def main(
         if selected_template:
             console.print(f"[cyan]📋 使用爆款模板：{selected_template}[/cyan]")
         
+        # 3.5 是否包含台词
+        include_dialogue = True
+        if not skip_review:
+            # 如果选择了"萌宠开口说话"(8号)模板，默认开启台词
+            default_dialogue = True if selected_template == "萌宠开口说话" else False
+            include_dialogue = Confirm.ask(
+                "\n[cyan]💬 脚本中是否包含角色台词？[/cyan]\n[dim](Yes=生成台词+声音描述, No=纯视觉动作叙事)[/dim]", 
+                default=default_dialogue
+            )
+        
         # 2. 生成分镜脚本
         console.print("\n[bold yellow]步骤 1/4：生成分镜脚本...[/bold yellow]")
         storyboard = asyncio.run(
-            orchestrator.llm.generate_storyboard(topic, count, reference_image, selected_template)
+            orchestrator.llm.generate_storyboard(topic, count, reference_image, selected_template, include_dialogue)
         )
         
         # 2. 脚本审阅（除非跳过）
@@ -422,9 +432,45 @@ def main(
                 console.print("[yellow]用户取消了工作流。[/yellow]")
                 return
         
-        # 4. 生成视频
+        # 4. 生成视频（可选择性生成）
         console.print("\n[bold yellow]步骤 3/4：生成视频片段...[/bold yellow]")
-        asyncio.run(orchestrator.run_video_generation(storyboard, session_dir))
+        
+        # 显示可用图像并让用户选择要生成视频的场景
+        if not skip_review:
+            console.print("\n[cyan]可生成视频的分镜：[/cyan]")
+            for scene in storyboard.scenes:
+                if scene.image_path:
+                    console.print(f"  [dim]{scene.id}[/dim] - 📷 {Path(scene.image_path).name}")
+            
+            console.print("\n[bold]请选择操作：[/bold]")
+            console.print("  [green]1[/green] - ✅ 生成全部分镜的视频")
+            console.print("  [yellow]2[/yellow] - 🎯 选择指定分镜生成视频")
+            console.print("  [red]3[/red] - ❌ 跳过视频生成")
+            
+            video_choice = Prompt.ask("请选择", choices=["1", "2", "3"], default="1")
+            
+            if video_choice == "3":
+                console.print("[yellow]跳过视频生成。[/yellow]")
+                console.print(f"\n[bold blue]✅ 图像已保存至：{session_dir}[/bold blue]")
+                return
+            
+            video_scene_ids = None
+            if video_choice == "2":
+                scene_ids_input = Prompt.ask(
+                    "[yellow]请输入要生成视频的分镜编号（如：1,3,5）[/yellow]",
+                    default=",".join(str(s.id) for s in storyboard.scenes if s.image_path)
+                )
+                try:
+                    video_scene_ids = [int(x.strip()) for x in scene_ids_input.split(",")]
+                    video_scene_ids = [x for x in video_scene_ids if 1 <= x <= len(storyboard.scenes)]
+                    console.print(f"[green]✅ 将生成分镜 {video_scene_ids} 的视频[/green]")
+                except:
+                    console.print("[yellow]格式错误，将生成全部视频[/yellow]")
+                    video_scene_ids = None
+            
+            asyncio.run(orchestrator.run_video_generation(storyboard, session_dir, scene_ids=video_scene_ids))
+        else:
+            asyncio.run(orchestrator.run_video_generation(storyboard, session_dir))
         
         console.print(f"\n[bold blue]✅ 成功！[/bold blue] 输出已保存至：{session_dir}")
             
@@ -569,11 +615,13 @@ def review_images_loop(session_dir, storyboard: Storyboard, orchestrator, refere
             
             console.print(f"[bold]正在重新生成分镜 {scene_ids}...[/bold]")
             
-            # 更新选中场景的 visual_prompt
+            # 更新选中场景的 visual_prompt（只保留最新的修改建议）
             for scene_id in scene_ids:
                 scene = storyboard.scenes[scene_id - 1]
                 if feedback.strip():
-                    scene.visual_prompt += f"\n修改要求：{feedback}"
+                    # 移除旧的修改要求，只保留原始 prompt 和最新修改
+                    base_prompt = scene.visual_prompt.split("\n修改要求：")[0]
+                    scene.visual_prompt = f"{base_prompt}\n修改要求：{feedback}"
             
             # 只重新生成选中的场景
             try:
@@ -591,8 +639,10 @@ def review_images_loop(session_dir, storyboard: Storyboard, orchestrator, refere
             if feedback.strip():
                 console.print("[bold]正在根据您的建议重新生成所有图像...[/bold]")
                 
+                # 移除旧的修改要求，只保留原始 prompt 和最新修改
                 for scene in storyboard.scenes:
-                    scene.visual_prompt += f"\n修改要求：{feedback}"
+                    base_prompt = scene.visual_prompt.split("\n修改要求：")[0]
+                    scene.visual_prompt = f"{base_prompt}\n修改要求：{feedback}"
                 
                 try:
                     asyncio.run(orchestrator.run_image_generation(storyboard, reference_image, str(session_dir)))
