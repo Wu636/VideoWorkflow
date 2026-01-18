@@ -34,12 +34,16 @@ class ArkVideoGenerator(VideoGenerator):
         loop = asyncio.get_running_loop()
 
         def _submit_task():
+            # 构建带有 duration 参数的 prompt
+            duration = getattr(scene, 'duration', 5)  # 默认 5 秒
+            prompt_with_duration = f"{scene.motion_prompt} --duration {duration}"
+            
             return self.client.content_generation.tasks.create(
                 model=self.model,
                 content=[
                     {
                         "type": "text", 
-                        "text": scene.motion_prompt  # Remove unsupported parameters
+                        "text": prompt_with_duration
                     },
                     {
                         "type": "image_url",

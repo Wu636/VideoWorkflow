@@ -105,6 +105,15 @@ python -m src.video_workflow.main --from-images outputs/12345
 python -m src.video_workflow.main -i outputs/12345
 ```
 
+# 命令行直接指定
+python -m src.video_workflow.main "橘猫开会" --template 搞笑剧场
+
+# 或简写
+python -m src.video_workflow.main "流浪狗的故事" -t 治愈系
+
+# 交互式选择（不指定模板时自动提示）
+python -m src.video_workflow.main "小狗送外卖"
+
 **使用场景**：
 - 已有满意的图像，想重新生成视频
 - 手动修改过图像后生成视频

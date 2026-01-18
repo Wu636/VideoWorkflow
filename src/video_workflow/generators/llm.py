@@ -23,6 +23,7 @@ class DeepSeekGenerator(LLMGenerator):
     "scenes": [
         {
             "id": 1,
+            "duration": 5,
             "narrative": "【角色名】: '台词内容'（语气/音色/情绪）",
             "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
             "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
@@ -40,6 +41,7 @@ class DeepSeekGenerator(LLMGenerator):
 5. 一个镜头只做1-2个动作：太多动作会让画面很乱
 6. 营造氛围感：描写光影（如"暖黄色的夕阳余晖"）
 7. 视觉风格一致：所有分镜保持统一画风，不要卡通和写实混用
+8. 每个分镜必须包含 duration 字段，取值 4-12 秒，根据动作复杂度和台词长度智能调整
 
 - visual_prompt 应当非常详细，专注于视觉表现和情绪细节。
 - motion_prompt 应当清晰描述动作和运镜，每镜头1-2个动作。
@@ -128,6 +130,7 @@ class GLMGenerator(LLMGenerator):
     "scenes": [
         {
             "id": 1,
+            "duration": 5,
             "narrative": "【角色名】: '台词内容'（语气/音色/情绪）",
             "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
             "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
@@ -144,6 +147,7 @@ class GLMGenerator(LLMGenerator):
 4. 动作描述要细化，一个镜头只做1-2个动作
 5. 营造氛围感：描写光影（如"暖黄色的夕阳余晖"）
 6. 视觉风格一致：所有分镜保持统一画风
+7. 每个分镜必须包含 duration 字段，取值 4-12 秒，根据动作复杂度和台词长度智能调整
 
 - visual_prompt 必须包含详细的角色描述和情绪细节，确保所有分镜中角色外观一致
 - motion_prompt 应当清晰描述动作和运镜，每镜头1-2个动作
@@ -323,6 +327,7 @@ class ArkLLMGenerator(LLMGenerator):
     "scenes": [
         {
             "id": 1,
+            "duration": 5,
             "narrative": "【角色名】: '台词内容'（语气/音色/情绪）",
             "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
             "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
@@ -339,6 +344,7 @@ class ArkLLMGenerator(LLMGenerator):
 4. 动作描述要细化，一个镜头只做1-2个动作
 5. 营造氛围感：描写光影（如"暖黄色的夕阳余晖"）
 6. 视觉风格一致：所有分镜保持统一画风
+7. 每个分镜必须包含 duration 字段，取值 4-12 秒，根据动作复杂度和台词长度智能调整
 
 - visual_prompt 应当非常详细，专注于视觉表现和情绪细节。
 - motion_prompt 应当清晰描述动作和运镜，每镜头1-2个动作。

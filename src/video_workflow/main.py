@@ -135,6 +135,62 @@ async def analyze_reference_image(image_path: str) -> str | None:
     console.print("[yellow]⚠️ 未配置多模态 API (GLM 或 ARK)，无法自动分析参考图[/yellow]")
     return None
 
+
+def concatenate_videos(session_dir: str, video_files: list) -> str:
+    """使用 ffmpeg 将所有分镜视频按顺序拼接成一个完整视频"""
+    import subprocess
+    import tempfile
+    
+    session_path = Path(session_dir)
+    output_path = session_path / "final_video.mp4"
+    
+    # 创建临时文件列表供 ffmpeg 使用
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        filelist_path = f.name
+        for video_file in video_files:
+            # ffmpeg concat 格式需要绝对路径并转义单引号
+            abs_path = str(video_file.absolute()).replace("'", "'\\''")
+            f.write(f"file '{abs_path}'\n")
+    
+    try:
+        console.print("[dim]正在拼接视频...[/dim]")
+        
+        # 使用 ffmpeg concat demuxer 拼接视频
+        cmd = [
+            "ffmpeg", "-y",  # 覆盖输出文件
+            "-f", "concat",
+            "-safe", "0",
+            "-i", filelist_path,
+            "-c", "copy",  # 直接复制流，不重新编码
+            str(output_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            # 如果直接复制失败，尝试重新编码
+            console.print("[yellow]直接合并失败，尝试重新编码...[/yellow]")
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", filelist_path,
+                "-c:v", "libx264",
+                "-c:a", "aac",
+                str(output_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                raise RuntimeError(f"ffmpeg 拼接失败: {result.stderr}")
+        
+        return str(output_path)
+        
+    finally:
+        # 清理临时文件
+        Path(filelist_path).unlink(missing_ok=True)
+
+
 def display_script(storyboard: Storyboard):
     """美化显示分镜脚本"""
     console.print("\n[bold cyan]═══════════════ 分镜脚本预览 ═══════════════[/bold cyan]\n")
@@ -472,6 +528,132 @@ def main(
         else:
             asyncio.run(orchestrator.run_video_generation(storyboard, session_dir))
         
+        # 视频审阅循环
+        if not skip_review:
+            while True:
+                # 显示已生成的视频
+                videos_dir = Path(session_dir) / "videos"
+                video_files = sorted(list(videos_dir.glob("*_video.mp4"))) if videos_dir.exists() else []
+                
+                console.print("\n[bold cyan]═══════════════ 生成的视频 ═══════════════[/bold cyan]\n")
+                for vf in video_files:
+                    console.print(f"  🎬 {vf.name}")
+                console.print(f"\n[cyan]👉 请在文件浏览器中查看: {videos_dir}[/cyan]")
+                console.print("[bold cyan]═══════════════════════════════════════════[/bold cyan]\n")
+                
+                console.print("[bold]请选择操作：[/bold]")
+                console.print("  [green]1[/green] - ✅ 确认全部视频，进入拼接步骤")
+                console.print("  [yellow]2[/yellow] - 🖼️  重新生成某个分镜的首帧图，再重新生成视频")
+                console.print("  [cyan]3[/cyan] - 🎬 直接重新生成某个分镜的视频（保持首帧图不变）")
+                console.print("  [red]4[/red] - ⏭️  跳过视频审阅，直接拼接")
+                
+                video_review_choice = Prompt.ask("请选择", choices=["1", "2", "3", "4"], default="1")
+                
+                if video_review_choice == "1" or video_review_choice == "4":
+                    break
+                
+                elif video_review_choice == "2":
+                    # 重新生成首帧图再生成视频
+                    scene_id_input = Prompt.ask("[yellow]请输入要重新生成的分镜编号[/yellow]", default="1")
+                    try:
+                        scene_id = int(scene_id_input.strip())
+                        if 1 <= scene_id <= len(storyboard.scenes):
+                            scene = storyboard.scenes[scene_id - 1]
+                            
+                            # 选择参考图
+                            console.print("\n[bold]请选择参考图来源：[/bold]")
+                            console.print("  [green]1[/green] - 🖼️  使用原始参考图")
+                            console.print("  [yellow]2[/yellow] - 📷 使用已生成的某个分镜图像")
+                            ref_choice = Prompt.ask("请选择", choices=["1", "2"], default="1")
+                            
+                            regen_ref = reference_image
+                            if ref_choice == "2":
+                                ref_scene_id = Prompt.ask("请输入要作为参考的分镜编号", default="1")
+                                try:
+                                    ref_id = int(ref_scene_id.strip())
+                                    ref_scene = storyboard.scenes[ref_id - 1]
+                                    if ref_scene.image_path:
+                                        regen_ref = ref_scene.image_path
+                                        console.print(f"[green]✅ 使用 {Path(regen_ref).name} 作为参考图[/green]")
+                                except:
+                                    pass
+                            
+                            # 修改建议
+                            feedback = Prompt.ask("[yellow]请输入修改建议（可回车跳过）[/yellow]", default="")
+                            if feedback.strip():
+                                scene.visual_prompt = f"{scene.visual_prompt.split(chr(10) + '修改要求：')[0]}\n修改要求：{feedback}"
+                            
+                            # 重新生成图像
+                            console.print(f"[bold]正在重新生成分镜 {scene_id} 的首帧图...[/bold]")
+                            asyncio.run(orchestrator.run_image_generation(
+                                storyboard, regen_ref, session_dir, scene_ids=[scene_id]
+                            ))
+                            
+                            # 显示生成的图像并让用户确认
+                            images_dir = Path(session_dir) / "images"
+                            regenerated_image = images_dir / f"{scene_id}_keyframe.png"
+                            
+                            console.print(f"\n[cyan]📷 首帧图已重新生成：{regenerated_image}[/cyan]")
+                            console.print("[cyan]请在文件浏览器中查看图像[/cyan]\n")
+                            
+                            console.print("[bold]请选择操作：[/bold]")
+                            console.print("  [green]1[/green] - ✅ 确认图像，继续生成视频")
+                            console.print("  [yellow]2[/yellow] - 🔄 重新生成该图像")
+                            console.print("  [red]3[/red] - ❌ 取消，返回视频审阅")
+                            
+                            img_confirm_choice = Prompt.ask("请选择", choices=["1", "2", "3"], default="1")
+                            
+                            if img_confirm_choice == "1":
+                                # 重新生成视频
+                                console.print(f"[bold]正在重新生成分镜 {scene_id} 的视频...[/bold]")
+                                asyncio.run(orchestrator.run_video_generation(
+                                    storyboard, session_dir, scene_ids=[scene_id]
+                                ))
+                                console.print(f"[green]✅ 分镜 {scene_id} 已重新生成！[/green]")
+                            elif img_confirm_choice == "2":
+                                console.print("[yellow]请重新选择操作重新生成图像[/yellow]")
+                            else:
+                                console.print("[yellow]已取消视频生成[/yellow]")
+                        else:
+                            console.print("[red]无效的分镜编号[/red]")
+                    except Exception as e:
+                        console.print(f"[red]错误：{e}[/red]")
+                
+                elif video_review_choice == "3":
+                    # 只重新生成视频
+                    scene_ids_input = Prompt.ask("[yellow]请输入要重新生成视频的分镜编号（如：1,3）[/yellow]", default="1")
+                    try:
+                        scene_ids = [int(x.strip()) for x in scene_ids_input.split(",")]
+                        scene_ids = [x for x in scene_ids if 1 <= x <= len(storyboard.scenes)]
+                        if scene_ids:
+                            console.print(f"[bold]正在重新生成分镜 {scene_ids} 的视频...[/bold]")
+                            asyncio.run(orchestrator.run_video_generation(
+                                storyboard, session_dir, scene_ids=scene_ids
+                            ))
+                            console.print(f"[green]✅ 分镜 {scene_ids} 的视频已重新生成！[/green]")
+                        else:
+                            console.print("[red]无效的分镜编号[/red]")
+                    except Exception as e:
+                        console.print(f"[red]错误：{e}[/red]")
+        
+        # 步骤 4/4：询问是否拼接所有视频
+        console.print("\n[bold yellow]步骤 4/4：视频拼接...[/bold yellow]")
+        
+        # 检查是否有生成的视频
+        videos_dir = Path(session_dir) / "videos"
+        video_files = sorted(list(videos_dir.glob("*_video.mp4"))) if videos_dir.exists() else []
+        
+        if len(video_files) > 1:
+            console.print(f"\n[cyan]已生成 {len(video_files)} 个分镜视频[/cyan]")
+            if Confirm.ask("是否将所有分镜视频按顺序拼接成一个完整视频？", default=True):
+                try:
+                    final_video_path = concatenate_videos(session_dir, video_files)
+                    console.print(f"[green]✅ 拼接完成！完整视频：{final_video_path}[/green]")
+                except Exception as e:
+                    console.print(f"[red]❌ 拼接失败：{e}[/red]")
+        elif len(video_files) == 1:
+            console.print("[dim]只有1个视频，无需拼接[/dim]")
+        
         console.print(f"\n[bold blue]✅ 成功！[/bold blue] 输出已保存至：{session_dir}")
             
     except KeyboardInterrupt:
@@ -483,22 +665,40 @@ def main(
 
 
 def review_script_loop(orchestrator, storyboard: Storyboard, topic: str, reference_image: str | None) -> Storyboard | None:
-    """交互式脚本审阅循环"""
+    """交互式脚本审阅循环 - 使用临时文件让用户完整查看和编辑"""
+    
+    temp_file = Path("temp_script_review.json")
     
     while True:
-        # 显示当前脚本
-        display_script(storyboard)
+        # 将脚本保存到临时文件供用户审阅
+        import json
+        temp_file.write_text(json.dumps(storyboard.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8")
+        
+        console.print("\n[bold cyan]═══════════════ 分镜脚本预览 ═══════════════[/bold cyan]\n")
+        console.print(f"[cyan]📄 完整脚本已保存到临时文件：[bold]{temp_file.absolute()}[/bold][/cyan]")
+        console.print(f"[dim]请用编辑器打开查看完整内容（共 {len(storyboard.scenes)} 个分镜）[/dim]\n")
+        
+        # 在控制台显示简要概览
+        for scene in storyboard.scenes:
+            duration_str = f"[{scene.duration}s]" if hasattr(scene, 'duration') else ""
+            narrative_preview = scene.narrative[:50] + "..." if len(scene.narrative) > 50 else scene.narrative
+            console.print(f"  [dim]{scene.id}[/dim] {duration_str} {narrative_preview}")
+        
+        console.print("\n[bold cyan]═══════════════════════════════════════════[/bold cyan]\n")
         
         console.print("[bold]请选择操作：[/bold]")
         console.print("  [green]1[/green] - ✅ 确认脚本，继续生成图像和视频")
         console.print("  [yellow]2[/yellow] - 🤖 输入修改建议，让 AI 修改脚本")
-        console.print("  [cyan]3[/cyan] - ✏️  手动编辑脚本文件")
+        console.print("  [cyan]3[/cyan] - ✏️  我已编辑临时文件，重新加载")
         console.print("  [red]4[/red] - ❌ 取消并退出")
         
         choice = Prompt.ask("请输入选项", choices=["1", "2", "3", "4"], default="1")
         
         if choice == "1":
             console.print("[green]✅ 脚本已确认，开始生成...[/green]")
+            # 删除临时文件
+            if temp_file.exists():
+                temp_file.unlink()
             return storyboard
         
         elif choice == "2":
@@ -515,23 +715,19 @@ def review_script_loop(orchestrator, storyboard: Storyboard, topic: str, referen
                     console.print(f"[red]修改失败: {e}[/red]")
         
         elif choice == "3":
-            # 手动编辑模式
-            temp_file = Path("temp_script.json")
-            temp_file.write_text(storyboard.model_dump_json(indent=2), encoding="utf-8")
-            console.print(f"\n[cyan]脚本已保存到 [bold]{temp_file}[/bold][/cyan]")
-            console.print("[cyan]请使用编辑器修改后保存，然后按回车继续...[/cyan]")
-            input()
-            
+            # 从临时文件重新加载
             try:
                 with open(temp_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 storyboard = Storyboard(**data)
-                console.print("[green]✅ 脚本已从文件加载！请查看修改后的内容：[/green]")
-                temp_file.unlink()  # 删除临时文件
+                console.print("[green]✅ 脚本已从文件加载！[/green]")
             except Exception as e:
                 console.print(f"[red]加载失败: {e}[/red]")
         
         elif choice == "4":
+            # 删除临时文件
+            if temp_file.exists():
+                temp_file.unlink()
             return None
 
 

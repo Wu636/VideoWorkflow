@@ -13,6 +13,7 @@ class Scene(BaseModel):
     narrative: str = Field(..., description="Voiceover or narrative text for the scene")
     visual_prompt: str = Field(..., description="Detailed prompt for generating the static keyframe image")
     motion_prompt: str = Field(..., description="Prompt describing the movement/action for video generation")
+    duration: int = Field(default=5, ge=4, le=12, description="Video duration in seconds (4-12)")
     
     # Paths to generated assets
     image_path: Optional[str] = None
