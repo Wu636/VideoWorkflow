@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./outputs:/app/outputs # Persist outputs
+      - ./src:/app/src # Hot reload support (optional if mapped correctly with volume/reload)
+    environment:
+      - GLM_API_KEY=${GLM_API_KEY}
+      - ARK_API_KEY=${ARK_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - OUTPUT_DIR=/app/outputs
+    env_file:
+      - .env
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3002:3002"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8001/api
+    depends_on:
+      - backend
+
+volumes:
+  outputs:

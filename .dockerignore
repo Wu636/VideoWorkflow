@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.env
+.venv
+venv
+outputs/
+frontend/node_modules
+frontend/.next
+.git
+.idea
