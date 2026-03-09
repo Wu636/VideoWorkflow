@@ -2,8 +2,8 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, Wand2, Video, Sparkles, Loader2, Zap, Terminal, Cpu } from "lucide-react";
-import { createSession } from "@/lib/api";
+import { Upload, Wand2, Video, Sparkles, Loader2, Zap, Terminal, Cpu, CheckCircle } from "lucide-react";
+import { createSession, analyzeImage, uploadFile } from "@/lib/api";
 import { VIRAL_TEMPLATES } from "@/types";
 
 export default function CreationHub() {
@@ -12,14 +12,37 @@ export default function CreationHub() {
     const [loading, setLoading] = useState(false);
     const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
     const [refImage, setRefImage] = useState<string | null>(null);
+    const [refImageFile, setRefImageFile] = useState<File | null>(null);
     const [dragActive, setDragActive] = useState(false);
 
-    const handleFile = (file: File) => {
+    // Analysis State
+    const [analyzing, setAnalyzing] = useState(false);
+    const [characterDesc, setCharacterDesc] = useState("");
+    const [imageStyle, setImageStyle] = useState("");
+    const [showAnalysis, setShowAnalysis] = useState(false);
+
+    const handleFile = async (file: File) => {
+        // Show preview immediately
         const reader = new FileReader();
         reader.onloadend = () => {
             setRefImage(reader.result as string);
         };
         reader.readAsDataURL(file);
+        setRefImageFile(file);
+
+        // Auto-analyze
+        setAnalyzing(true);
+        setShowAnalysis(true);
+        try {
+            const result = await analyzeImage(file);
+            if (result.character) setCharacterDesc(result.character);
+            if (result.style) setImageStyle(result.style);
+        } catch (e) {
+            console.error("Analysis failed:", e);
+            // Non-blocking error, user can still edit manually if they want (not implemented yet, but good for UX)
+        } finally {
+            setAnalyzing(false);
+        }
     };
 
     const handleDrag = (e: React.DragEvent) => {
@@ -45,11 +68,21 @@ export default function CreationHub() {
         if (!topic) return;
         setLoading(true);
         try {
+            let refImagePath = undefined;
+
+            // Upload file first if exists
+            if (refImageFile) {
+                const uploadRes = await uploadFile(refImageFile);
+                refImagePath = uploadRes.path;
+            }
+
             const res = await createSession({
                 topic,
-                reference_image: refImage || undefined,
+                reference_image: refImagePath,
                 template: selectedTemplate || undefined,
-                count: 5
+                count: 5,
+                character_description: characterDesc || undefined,
+                image_style: imageStyle || undefined
             });
             router.push(`/workspace/${res.session_id}/script`);
         } catch (e) {
@@ -67,7 +100,7 @@ export default function CreationHub() {
             <div className="flex-1 space-y-8 pt-10 text-center lg:text-left">
                 <div className="inline-flex items-center space-x-2 px-4 py-1 border-l-2 border-neon-cyan bg-neon-cyan/5 text-neon-cyan text-sm font-mono tracking-widest uppercase">
                     <Terminal className="w-4 h-4" />
-                    <span>System Ready // V.2.0.45</span>
+                    <span>System Ready // V.2.1.0</span>
                 </div>
 
                 <h1 className="text-6xl md:text-8xl font-black tracking-tighter leading-none text-white uppercase ml-[-4px]">
@@ -82,18 +115,6 @@ export default function CreationHub() {
                     <span className="text-neon-purple opacity-70">&gt;&gt;</span> Initialize neural rendering...<br />
                     <span className="text-neon-purple opacity-70">&gt;&gt;</span> Transform ideas into cinematic reality.
                 </p>
-
-                <div className="flex items-center justify-center lg:justify-start space-x-8 pt-8 opacity-60 hover:opacity-100 transition-opacity">
-                    <div className="flex flex-col">
-                        <span className="text-2xl font-bold font-mono text-white">4.2s</span>
-                        <span className="text-xs text-gray-500 uppercase tracking-widest">Latency</span>
-                    </div>
-                    <div className="w-px h-10 bg-white/20"></div>
-                    <div className="flex flex-col">
-                        <span className="text-2xl font-bold font-mono text-neon-green">99.9%</span>
-                        <span className="text-xs text-gray-500 uppercase tracking-widest">Uptime</span>
-                    </div>
-                </div>
             </div>
 
             {/* Right Column: Console Interface */}
@@ -146,14 +167,22 @@ export default function CreationHub() {
                                     onChange={(e) => e.target.files?.[0] && handleFile(e.target.files[0])}
                                     accept="image/*"
                                 />
-                                {/* Grid Background */}
                                 <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:20px_20px]"></div>
 
                                 {refImage ? (
                                     <>
                                         <img src={refImage} alt="Ref" className="absolute inset-0 w-full h-full object-cover opacity-60 grayscale group-hover:grayscale-0 transition-all duration-500" />
                                         <div className="absolute inset-0 bg-black/40 z-10 flex items-center justify-center pointer-events-none">
-                                            <p className="text-neon-cyan font-mono text-xs uppercase tracking-widest">[REPLACE_DATA]</p>
+                                            {analyzing ? (
+                                                <div className="flex flex-col items-center">
+                                                    <Loader2 className="animate-spin w-6 h-6 text-neon-cyan" />
+                                                    <span className="text-[10px] text-neon-cyan mt-2 tracking-widest">ANALYZING...</span>
+                                                </div>
+                                            ) : (
+                                                <div className="bg-black/50 backdrop-blur px-2 py-1 rounded border border-white/10">
+                                                    <CheckCircle className="w-4 h-4 text-green-400" />
+                                                </div>
+                                            )}
                                         </div>
                                     </>
                                 ) : (
@@ -184,12 +213,46 @@ export default function CreationHub() {
                             </div>
                         </div>
 
+                        {/* Analysis Result (Editable) */}
+                        {showAnalysis && (
+                            <div className="space-y-4 animate-in fade-in slide-in-from-top-4 border-t border-white/10 pt-4">
+                                <div className="flex items-center gap-2 text-neon-cyan text-xs font-bold uppercase tracking-widest">
+                                    <Sparkles className="w-3 h-3" />
+                                    <span>AI Analysis Results</span>
+                                </div>
+
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className="text-[10px] text-gray-500 uppercase tracking-widest mb-1 block">Character Description</label>
+                                        <textarea
+                                            value={characterDesc}
+                                            onChange={(e) => setCharacterDesc(e.target.value)}
+                                            className="w-full input-cyber p-3 text-xs min-h-[80px]"
+                                            placeholder={analyzing ? "AI is analyzing the image..." : "Character description will appear here..."}
+                                            disabled={analyzing}
+                                        />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] text-gray-500 uppercase tracking-widest mb-1 block">Visual Style</label>
+                                        <input
+                                            type="text"
+                                            value={imageStyle}
+                                            onChange={(e) => setImageStyle(e.target.value)}
+                                            className="w-full input-cyber p-3 text-xs"
+                                            placeholder={analyzing ? "Analyzing style..." : "Visual style will appear here..."}
+                                            disabled={analyzing}
+                                        />
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         {/* CTA */}
                         <button
                             onClick={handleSubmit}
-                            disabled={!topic || loading}
+                            disabled={!topic || loading || analyzing}
                             className={`w-full h-16 btn-cyber group/btn flex items-center justify-center space-x-3
-                                ${!topic || loading
+                                ${!topic || loading || analyzing
                                     ? 'grayscale opacity-50 cursor-not-allowed'
                                     : ''
                                 }`}

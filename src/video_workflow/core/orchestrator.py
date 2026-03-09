@@ -35,7 +35,44 @@ class WorkflowOrchestrator:
         except Exception as e:
             logger.warning(f"Failed to init generators (likely missing keys): {e}")
 
-    async def process_scene(self, scene: Scene, session_dir: Path, reference_image: str | None = None):
+    def _get_or_create_seed(self, session_dir: Path) -> int:
+        """Get existing seed from session.json or generate a new one."""
+        import random
+        import json
+        
+        session_json_path = session_dir / "session.json"
+        
+        # Load existing seed
+        if session_json_path.exists():
+            try:
+                with open(session_json_path, "r", encoding="utf-8") as f:
+                    session_data = json.load(f)
+                    if "seed" in session_data:
+                        return int(session_data["seed"])
+            except Exception as e:
+                logger.warning(f"Failed to read session.json: {e}")
+        
+        # Generate new seed
+        new_seed = random.randint(1, 999999999)
+        logger.info(f"Generated new session seed: {new_seed}")
+        
+        # Save to session.json
+        try:
+            session_data = {}
+            if session_json_path.exists():
+                with open(session_json_path, "r", encoding="utf-8") as f:
+                    session_data = json.load(f)
+            
+            session_data["seed"] = new_seed
+            with open(session_json_path, "w", encoding="utf-8") as f:
+                import json
+                json.dump(session_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save seed to session.json: {e}")
+            
+        return new_seed
+
+    async def process_scene(self, scene: Scene, session_dir: Path, reference_image: str | None = None, seed: int | None = None):
         """Pipeline for a single scene: Image -> Video"""
         if not self.image_gen or not self.video_gen:
             logger.error("生成器未初始化")
@@ -50,7 +87,7 @@ class WorkflowOrchestrator:
             image_dir = session_dir / "images"
             image_dir.mkdir(exist_ok=True)
             
-            img_path = await self.image_gen.generate_image(scene, str(image_dir), reference_image)
+            img_path = await self.image_gen.generate_image(scene, str(image_dir), reference_image, seed=seed)
             scene.image_path = img_path
             scene.image_status = GenerationStatus.COMPLETED
         except Exception as e:
@@ -81,7 +118,10 @@ class WorkflowOrchestrator:
         session_dir = self.output_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"开始执行工作流，主题: {topic} (Session: {session_id})")
+        # Get or create seed
+        seed = self._get_or_create_seed(session_dir)
+        
+        logger.info(f"开始执行工作流，主题: {topic} (Session: {session_id}), Seed: {seed}")
         if reference_image:
             logger.info(f"使用参考图: {reference_image}")
 
@@ -102,7 +142,7 @@ class WorkflowOrchestrator:
         
         async def _bounded_process(scene: Scene):
             async with semaphore:
-                await self.process_scene(scene, session_dir, reference_image)
+                await self.process_scene(scene, session_dir, reference_image, seed=seed)
         
         tasks = [_bounded_process(scene) for scene in storyboard.scenes]
         await asyncio.gather(*tasks)
@@ -139,6 +179,15 @@ class WorkflowOrchestrator:
             session_id = str(int(asyncio.get_event_loop().time()))
             session_dir = self.output_dir / session_id
             session_dir.mkdir(parents=True, exist_ok=True)
+            
+        # 0. Handle Persistence of Seed
+        current_seed = self._get_or_create_seed(session_dir)
+                
+        logger.info(f"Using Image Seed: {current_seed}")
+        
+        # Pass seed to ArkImageGenerator if it's the right type (it is by default now)
+        # We will pass it in the loop below
+
         
         # Save the reviewed script
         with open(session_dir / "script.json", "w") as f:
@@ -171,7 +220,7 @@ class WorkflowOrchestrator:
                     image_dir = session_dir / "images"
                     image_dir.mkdir(exist_ok=True)
                     
-                    img_path = await self.image_gen.generate_image(scene, str(image_dir), reference_image)
+                    img_path = await self.image_gen.generate_image(scene, str(image_dir), reference_image, seed=current_seed)
                     scene.image_path = img_path
                     scene.image_status = GenerationStatus.COMPLETED
                 except Exception as e:
@@ -245,3 +294,11 @@ class WorkflowOrchestrator:
             f.write(storyboard.model_dump_json(indent=2))
         
         logger.info("视频生成完成。")
+
+    async def revise_storyboard(self, storyboard: Storyboard, feedback: str, reference_image: str | None = None) -> Storyboard:
+        """
+        Delegate revision to the LLM backend.
+        """
+        await self.initialize()
+        logger.info("正在根据反馈修订分镜脚本...")
+        return await self.llm.revise_storyboard(storyboard, feedback, reference_image)

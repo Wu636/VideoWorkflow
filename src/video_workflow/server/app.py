@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from src.video_workflow.server.routers import workflow
+from src.video_workflow.server.routers import workflow, files
 
 app = FastAPI(title="VideoWorkflow API", version="0.1.0")
 
@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from src.video_workflow.config import settings
 
 app.include_router(workflow.router, prefix="/api")
+app.include_router(files.router, prefix="/api")
 app.mount("/static", StaticFiles(directory=settings.OUTPUT_DIR), name="static")
 
 

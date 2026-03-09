@@ -38,7 +38,8 @@ class ArkImageGenerator(ImageGenerator):
         self, 
         scene: Scene, 
         output_dir: str,
-        reference_image_path: str | None = None
+        reference_image_path: str | None = None,
+        seed: int | None = None
     ) -> str:
         loop = asyncio.get_running_loop()
         
@@ -65,10 +66,11 @@ class ArkImageGenerator(ImageGenerator):
                 "response_format": "b64_json"
             }
             
-            # 3. Add fixed seed for consistency
+            # 3. Add seed for consistency (use passed seed or session seed)
             # Note: Using extra_body to pass seed parameter
+            current_seed = seed if seed is not None else self._session_seed
             extra_body = {
-                "seed": self._session_seed,
+                "seed": current_seed,
                 "watermark": False  # 去除AI生成水印
             }
             

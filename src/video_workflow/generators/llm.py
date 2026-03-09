@@ -112,6 +112,37 @@ class DeepSeekGenerator(LLMGenerator):
         except Exception as e:
             raise ValueError(f"Failed to validate storyboard data: {e}")
 
+    async def revise_storyboard(self, storyboard: Storyboard, feedback: str, reference_image: str | None = None) -> Storyboard:
+        current_script = storyboard.model_dump_json(indent=2)
+        prompt = f"""请根据以下用户反馈，修改现有的分镜脚本。
+        
+【用户反馈】
+{feedback}
+
+【当前脚本】
+{current_script}
+
+请输出修改后的完整脚本（JSON格式），保持原有的 id 结构（除非需要增删分镜）。
+"""
+        response = await self.client.chat.completions.create(
+            model=settings.DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            stream=False,
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("DeepSeek returned empty content")
+            
+        try:
+            data = json.loads(content)
+            return Storyboard(**data)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse DeepSeek response as JSON: {e}")
+
 
 class GLMGenerator(LLMGenerator):
     def __init__(self):
@@ -306,6 +337,61 @@ class GLMGenerator(LLMGenerator):
             print(f"GLM 图像分析失败: {e}")
             return None
 
+    async def revise_storyboard(self, storyboard: Storyboard, feedback: str, reference_image: str | None = None) -> Storyboard:
+        import asyncio
+        current_script = storyboard.model_dump_json(indent=2)
+        
+        # Build prompt
+        prompt_text = f"""请根据以下用户反馈，修改现有的分镜脚本。
+        
+【用户反馈】
+{feedback}
+
+【当前脚本】
+{current_script}
+
+请输出修改后的完整脚本（JSON格式），保持原有的 id 结构（除非需要增删分镜）。
+"""
+        messages = [{"role": "system", "content": self.system_prompt}]
+        
+        # Handle reference image if provided (new one overrides or supplements)
+        user_content = []
+        if reference_image:
+             image_path = Path(reference_image)
+             if image_path.exists():
+                with open(image_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                })
+        
+        user_content.append({"type": "text", "text": prompt_text})
+        messages.append({"role": "user", "content": user_content})
+        
+        loop = asyncio.get_running_loop()
+        def _call_glm():
+            response = self.client.chat.completions.create(
+                model=settings.GLM_MODEL,
+                messages=messages,
+            )
+            return response.choices[0].message.content
+
+        content = await loop.run_in_executor(None, _call_glm)
+        
+        # Parse JSON
+        content = content.strip()
+        if content.startswith("```json"): content = content[7:]
+        if content.startswith("```"): content = content[3:]
+        if content.endswith("```"): content = content[:-3]
+        content = content.strip()
+        
+        try:
+            data = json.loads(content)
+            return Storyboard(**data)
+        except Exception as e:
+             raise ValueError(f"Failed to parse GLM response: {e}")
+
 
 class ArkLLMGenerator(LLMGenerator):
     """火山方舟托管的 LLM（豆包1.8、DeepSeek 3.2 等）"""
@@ -432,3 +518,42 @@ class ArkLLMGenerator(LLMGenerator):
             raise ValueError(f"Failed to parse Ark LLM response as JSON: {e}\nContent: {content}")
         except Exception as e:
             raise ValueError(f"Failed to validate storyboard data: {e}")
+
+    async def revise_storyboard(self, storyboard: Storyboard, feedback: str, reference_image: str | None = None) -> Storyboard:
+        import asyncio
+        current_script = storyboard.model_dump_json(indent=2)
+        prompt = f"""请根据以下用户反馈，修改现有的分镜脚本。
+        
+【用户反馈】
+{feedback}
+
+【当前脚本】
+{current_script}
+
+请输出修改后的完整脚本（JSON格式），保持原有的 id 结构。
+"""
+        loop = asyncio.get_running_loop()
+        def _call_ark():
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response.choices[0].message.content
+            
+        content = await loop.run_in_executor(None, _call_ark)
+        
+        # Parse JSON
+        content = content.strip()
+        if content.startswith("```json"): content = content[7:]
+        if content.startswith("```"): content = content[3:]
+        if content.endswith("```"): content = content[:-3]
+        content = content.strip()
+        
+        try:
+            data = json.loads(content)
+            return Storyboard(**data)
+        except Exception as e:
+            raise ValueError(f"Failed to parse Ark response: {e}")

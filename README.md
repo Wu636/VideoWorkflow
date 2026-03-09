@@ -231,3 +231,5 @@ MIT License
 ---
 
 **🌟 如果这个项目对你有帮助，请给个 Star！**
+
+## uvicorn src.video_workflow.server.app:app --reload --port 8001

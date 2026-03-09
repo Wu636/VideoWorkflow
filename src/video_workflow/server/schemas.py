@@ -4,10 +4,12 @@ from src.video_workflow.types import Storyboard, Scene
 
 class CreateSessionRequest(BaseModel):
     topic: str
-    reference_image: Optional[str] = None  # Base64 string
+    reference_image: Optional[str] = None  # File path (from upload endpoint)
     template: Optional[str] = None
     count: int = 5
     include_dialogue: bool = True
+    character_description: Optional[str] = None  # From AI analysis or user input
+    image_style: Optional[str] = None  # From AI analysis or user input
 
 class SessionResponse(BaseModel):
     session_id: str

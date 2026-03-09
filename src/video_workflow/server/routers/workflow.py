@@ -47,39 +47,49 @@ def save_storyboard(session_id: str, storyboard: Storyboard):
 async def create_session(request: CreateSessionRequest):
     """Start a new session: generate script from topic"""
     try:
-        # We need to run orchestration steps.
-        # Run step 1: Generate Storyboard
-        # Note: orchestrator.llm.generate_storyboard returns a Storyboard object
-        # but orchestrator.run is designed to run the full flow or parts and return session_path.
-        # We should use orchestrator methods granualarly.
-        
         await orchestrator.initialize()
         
-        # 1. Generate Storyboard
+        # Apply user-provided character description and style to settings
+        # This ensures they are used in both script generation and image generation
+        import src.video_workflow.config as config_module
+        
+        if request.character_description:
+            config_module.settings.CHARACTER_DESCRIPTION = request.character_description
+            logger.info(f"Using character description: {request.character_description[:50]}...")
+        
+        if request.image_style:
+            config_module.settings.IMAGE_STYLE = request.image_style
+            logger.info(f"Using image style: {request.image_style}")
+        
+        # Generate Storyboard
         storyboard = await orchestrator.llm.generate_storyboard(
             topic=request.topic,
             count=request.count,
-            reference_image=request.reference_image,  # TODO: Handle base64 or path?
-            # analyze_reference_image usually takes a path. 
-            # If request.reference_image is base64, we might need to save it first?
-            # For now assume it logic inside llm handles it or we need to save it.
+            reference_image=request.reference_image,  # Now expects file path
             template=request.template,
             include_dialogue=request.include_dialogue
         )
         
-        # Create session directory manually since we are breaking down steps
+        # Create session directory
         import time
         session_id = str(int(time.time()))
         session_dir = settings.OUTPUT_DIR / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save reference image if provided (to keep session self-contained)
-        # Note: logic for handling base64 vs path needs care. 
-        # For this prototype, assume logic handles path or we'd need to upload separate.
-        # Simplest: Save script.
+        # Save session metadata (including character description for future reference)
+        session_meta = {
+            "topic": request.topic,
+            "character_description": request.character_description,
+            "image_style": request.image_style,
+            "reference_image": request.reference_image,
+        }
+        with open(session_dir / "session.json", "w", encoding="utf-8") as f:
+            import json
+            json.dump(session_meta, f, ensure_ascii=False, indent=2)
         
-        with open(session_dir / "script.json", "w") as f:
-            f.write(storyboard.model_dump_json(indent=2))
+        # Save script
+        with open(session_dir / "script.json", "w", encoding="utf-8") as f:
+            f.write(storyboard.model_dump_json(indent=2, exclude_none=True))
             
         return SessionResponse(
             session_id=session_id,
@@ -89,6 +99,7 @@ async def create_session(request: CreateSessionRequest):
     except Exception as e:
         logger.error(f"Failed to create session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/{session_id}/script", response_model=Storyboard)
 async def get_script(session_id: str):

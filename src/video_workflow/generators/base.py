@@ -12,13 +12,19 @@ class LLMGenerator(ABC):
         """Analyze reference image and return a character description. Default returns None."""
         return None
 
+    @abstractmethod
+    async def revise_storyboard(self, storyboard: Storyboard, feedback: str, reference_image: str | None = None) -> Storyboard:
+        """Revise an existing storyboard based on user feedback."""
+        pass
+
 class ImageGenerator(ABC):
     @abstractmethod
     async def generate_image(
         self, 
         scene: Scene, 
         output_path: str,
-        reference_image_path: str | None = None
+        reference_image_path: str | None = None,
+        seed: int | None = None
     ) -> str:
         """Generate an image for the scene and return the file path."""
         pass

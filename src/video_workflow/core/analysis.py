@@ -1,34 +1,38 @@
+"""
+Reference image analysis module.
+Uses multimodal LLMs (GLM or Doubao) to extract character description and visual style.
+"""
+
 import asyncio
 import base64
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Any
 
 from src.video_workflow.config import settings
 
 logger = logging.getLogger(__name__)
 
-async def analyze_reference_image(image_path: str) -> Optional[Dict[str, Any]]:
+
+async def analyze_reference_image(image_path: str) -> dict | None:
     """
-    使用多模态 LLM 分析参考图，自动生成角色描述。支持豆包和 GLM。
+    Analyze a reference image using multimodal LLM.
     
+    Args:
+        image_path: Path to the image file
+        
     Returns:
-        Optional[Dict[str, Any]]: {"character": "...", "style": "..."} or None if failed.
+        dict with 'character' and 'style' keys, or None if analysis fails
     """
     image_file = Path(image_path)
     if not image_file.exists():
-        logger.error(f"参考图不存在: {image_path}")
+        logger.error(f"Reference image not found: {image_path}")
         return None
     
-    try:
-        with open(image_file, "rb") as f:
-            img_b64 = base64.b64encode(f.read()).decode("utf-8")
-    except Exception as e:
-        logger.error(f"读取参考图失败: {e}")
-        return None
+    with open(image_file, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
     
-    # 要求返回 JSON 格式，同时包含角色和风格
+    # Prompt for extracting character and style info
     analysis_prompt = """请仔细分析这张图片，提取以下两部分信息，以 JSON 格式返回：
 
 1. character（角色外貌描述，50-100字）：
@@ -43,14 +47,13 @@ async def analyze_reference_image(image_path: str) -> Optional[Dict[str, Any]]:
     
     loop = asyncio.get_running_loop()
     
-    # 方案1: 优先使用智谱 GLM 多模态 (glm-4.7)
+    # Method 1: Try GLM first (better multimodal support)
     if settings.GLM_API_KEY:
         try:
             from zhipuai import ZhipuAI
             client = ZhipuAI(api_key=settings.GLM_API_KEY)
             
             def _call_glm():
-                # 根据文件扩展名确定 MIME 类型
                 ext = image_file.suffix.lower()
                 mime_type = "image/png" if ext == ".png" else "image/jpeg"
                 
@@ -69,14 +72,16 @@ async def analyze_reference_image(image_path: str) -> Optional[Dict[str, Any]]:
                 )
                 return response.choices[0].message.content
             
-            logger.info(f"使用智谱 GLM 多模态模型 ({settings.GLM_MODEL}) 分析 reference image...")
+            logger.info(f"Analyzing image with GLM ({settings.GLM_MODEL})...")
             result = await loop.run_in_executor(None, _call_glm)
-            return _parse_json_result(result)
             
+            if result:
+                return _parse_json_result(result)
+                
         except Exception as e:
-            logger.warning(f"GLM 分析失败: {e}，尝试豆包...")
+            logger.warning(f"GLM analysis failed: {e}, trying Doubao...")
     
-    # 方案2: 回退到豆包多模态 (doubao-seed-1-6-251015)
+    # Method 2: Fallback to Doubao Vision
     if settings.ARK_API_KEY:
         try:
             from volcenginesdkarkruntime import Ark
@@ -84,7 +89,7 @@ async def analyze_reference_image(image_path: str) -> Optional[Dict[str, Any]]:
             
             def _call_doubao():
                 response = client.chat.completions.create(
-                    model=settings.ARK_VISION_MODEL,  # 豆包多模态模型
+                    model=settings.ARK_VISION_MODEL,
                     messages=[
                         {
                             "role": "user",
@@ -97,22 +102,24 @@ async def analyze_reference_image(image_path: str) -> Optional[Dict[str, Any]]:
                 )
                 return response.choices[0].message.content
             
-            logger.info(f"使用豆包多模态模型 ({settings.ARK_VISION_MODEL}) 分析 reference image...")
+            logger.info(f"Analyzing image with Doubao Vision ({settings.ARK_VISION_MODEL})...")
             result = await loop.run_in_executor(None, _call_doubao)
-            return _parse_json_result(result)
             
+            if result:
+                return _parse_json_result(result)
+                
         except Exception as e:
-            logger.warning(f"豆包分析失败: {e}")
+            logger.warning(f"Doubao analysis failed: {e}")
     
-    logger.warning("未配置多模态 API (GLM 或 ARK)，或分析全部失败")
+    logger.error("No multimodal API configured (GLM or ARK)")
     return None
 
-def _parse_json_result(result: str) -> Dict[str, Any]:
-    """Helper to safely parse JSON from LLM response"""
-    if not result:
-        return None
-        
+
+def _parse_json_result(result: str) -> dict:
+    """Parse JSON from LLM response, handling markdown code blocks."""
     result_str = result.strip()
+    
+    # Remove markdown code block wrappers
     if result_str.startswith("```json"):
         result_str = result_str[7:]
     if result_str.startswith("```"):
@@ -123,5 +130,6 @@ def _parse_json_result(result: str) -> Dict[str, Any]:
     
     try:
         return json.loads(result_str)
-    except:
+    except json.JSONDecodeError:
+        # If JSON parsing fails, treat entire result as character description
         return {"character": result_str, "style": None}
