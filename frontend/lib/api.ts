@@ -3,6 +3,7 @@ import type {
     Asset,
     AssetRole,
     Delivery,
+    H3PromptSkill,
     ImageProviderOption,
     Project,
     ProjectBrief,
@@ -215,6 +216,26 @@ export async function generateKeyframes(
             shot_ids: shotIds || null,
             revision_mode: options.revisionMode || "fresh",
             user_suggestions: options.userSuggestions || "",
+        }),
+    });
+}
+
+export async function getH3PromptSkills(): Promise<{ default_skill_id: string; skills: H3PromptSkill[] }> {
+    return api("/projects/h3-prompt-skills");
+}
+
+export async function generateH3Prompts(
+    projectId: string,
+    shotIds: string[],
+    skillId: string,
+    userSuggestions = "",
+): Promise<Shot[]> {
+    return api(`/projects/${projectId}/h3-prompts/generate`, {
+        method: "POST",
+        body: JSON.stringify({
+            shot_ids: shotIds,
+            skill_id: skillId,
+            user_suggestions: userSuggestions,
         }),
     });
 }

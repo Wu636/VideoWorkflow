@@ -190,6 +190,9 @@ class Shot(BaseModel):
     # prompt shown to the user and submitted to ComfyUI.
     video_prompt_source: str = ""
     video_prompt: str = ""
+    h3_prompt_skill_id: str = "h3-prompt-writing"
+    h3_prompt_skill_version: str = ""
+    h3_prompt_skill_output: str = ""
     negative_prompt: str = ""
     generation_mode: GenerationMode = GenerationMode.AUTO
     resolved_generation_mode: GenerationMode | None = None

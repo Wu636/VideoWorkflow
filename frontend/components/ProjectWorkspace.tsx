@@ -47,10 +47,12 @@ import {
     enqueueRender,
     exportKeyframes,
     finalizeProject,
+    generateH3Prompts,
     generateKeyframes,
     generateStoryboard,
     generateSubtitles,
     getProject,
+    getH3PromptSkills,
     getRenderJobs,
     planRender,
     projectDownloadUrl,
@@ -62,7 +64,7 @@ import {
     uploadProjectAsset,
     uploadProjectScript,
 } from "@/lib/api";
-import type { Asset, AssetRole, CharacterProfile, Delivery, Project, ProjectAnalysisDraft, ProjectBundle, RenderJob, ScriptRewriteDraft, Shot } from "@/types";
+import type { Asset, AssetRole, CharacterProfile, Delivery, H3PromptSkill, Project, ProjectAnalysisDraft, ProjectBundle, RenderJob, ScriptRewriteDraft, Shot } from "@/types";
 
 type Tab = "brief" | "storyboard" | "assets" | "production" | "review" | "delivery";
 
@@ -322,7 +324,7 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
                         <Field label="本镜头角色" wide><div className="grid gap-2 rounded-lg border border-white/8 p-3 sm:grid-cols-2 lg:grid-cols-3">{bundle.project.characters.length === 0 ? <span className="text-xs text-white/30">请先在“需求与角色”中建立角色。</span> : bundle.project.characters.map((character) => <label key={character.id} className="flex items-center gap-2 text-xs text-white/60"><input type="checkbox" checked={shot.character_ids.includes(character.id)} onChange={() => patchShot(shot.id, { character_ids: toggle(shot.character_ids, character.id) })} />{character.name}</label>)}</div></Field>
                         <Field label="通用分镜 Prompt" wide><textarea rows={5} value={shot.visual_prompt} onChange={(event) => patchShot(shot.id, { visual_prompt: event.target.value })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">描述整镜的画面方向，可用于通用图像/视频模型；不会直接覆盖下面的首帧 Prompt。</span></Field>
                         <Field label="首帧图 Prompt" wide><textarea rows={5} value={shot.keyframe_prompt} onChange={(event) => patchShot(shot.id, { keyframe_prompt: event.target.value })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">只描述视频开始时的静态画面，生成分镜图时实际使用这一项。</span></Field>
-                        <Field label="MiniMax H3 Prompt" wide><textarea rows={6} value={shot.video_prompt} onChange={(event) => patchShot(shot.id, { video_prompt: event.target.value })} /></Field>
+                        <Field label={`MiniMax H3 Prompt · ${shot.h3_prompt_skill_id || "h3-prompt-writing"}`} wide><textarea rows={6} value={shot.video_prompt} onChange={(event) => patchShot(shot.id, { video_prompt: event.target.value })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">可手动微调；在“H3 生成”页可选择官方风格 Skill 批量重新生成。</span></Field>
                     </div>
                     <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="studio-secondary px-3" disabled={index === 0 || !!busy} onClick={() => moveShot(index, -1)}><ChevronUp size={14} />上移</button><button className="studio-secondary px-3" disabled={index === bundle.shots.length - 1 || !!busy} onClick={() => moveShot(index, 1)}><ChevronDown size={14} />下移</button><button className="studio-danger" onClick={() => void action(`delete-${shot.id}`, () => deleteShot(bundle.project.id, shot.id), `镜头 ${shot.ordinal} 已删除`)}><Trash2 size={14} />删除</button><button className="studio-primary" disabled={busy === `shot-${shot.id}`} onClick={() => void action(`shot-${shot.id}`, () => updateShot(shot), `镜头 ${shot.ordinal} 已保存`, false).then(refresh)}>{busy === `shot-${shot.id}` ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}保存镜头</button></div>
                 </div>}
@@ -416,6 +418,7 @@ function H3ShotCard({ shot, project, assets, checked, busy, toggleChecked, save 
             <input type="checkbox" checked={checked} onChange={toggleChecked} />
             <div className="min-w-48 flex-1"><strong>#{shot.ordinal} {shot.title}</strong><p className="line-clamp-1 text-xs text-white/35">{shot.video_prompt}</p></div>
             <span className="studio-status uppercase">{draft.generation_mode === "auto" ? `AUTO→${effectiveMode}` : effectiveMode}</span>
+            <span className="rounded bg-white/[.05] px-2 py-1 text-[10px] text-white/45" title={draft.h3_prompt_skill_version ? `Skill version ${draft.h3_prompt_skill_version}` : "尚未通过风格 Skill 重新生成"}>{draft.h3_prompt_skill_id || "h3-prompt-writing"}{draft.h3_prompt_skill_version ? ` · v${draft.h3_prompt_skill_version}` : ""}</span>
             <span className="rounded bg-cyan-300/8 px-2 py-1 font-mono text-[11px] text-cyan-100/70">{width}×{height} · {draft.render_frames}帧 · {draft.h3_turbo ? "Turbo" : "原生"}{draft.h3_steps}步 · 约 {relativeWork.toFixed(1)}×算力</span>
         </div>
         {tuningWarnings.length > 0 && <div className="mt-3 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-3 py-2.5"><strong className="text-xs text-amber-100/80">当前参数有 {tuningWarnings.length} 项画质提醒</strong><ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] leading-5 text-amber-50/55">{tuningWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div>}
@@ -447,6 +450,10 @@ function H3ShotCard({ shot, project, assets, checked, busy, toggleChecked, save 
 function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bundle: ProjectBundle; busy: string; error: string; notice: string; action: Action; refresh: () => Promise<void> }) {
     const [preflight, setPreflight] = useState<Record<string, unknown> | null>(null);
     const [selected, setSelected] = useState<string[]>(bundle.shots[0] ? [bundle.shots[0].id] : []);
+    const [promptSkills, setPromptSkills] = useState<H3PromptSkill[]>([]);
+    const [promptSkillId, setPromptSkillId] = useState(bundle.shots[0]?.h3_prompt_skill_id || "h3-prompt-writing");
+    const [promptSkillSuggestions, setPromptSkillSuggestions] = useState("");
+    const [promptSkillError, setPromptSkillError] = useState("");
     const [keyframeBoardOpen, setKeyframeBoardOpen] = useState(false);
     const [keyframeEditor, setKeyframeEditor] = useState<KeyframeEditorState | null>(null);
     const [keyframePreview, setKeyframePreview] = useState<MediaPreviewState | null>(null);
@@ -459,8 +466,26 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
     const allGeneratedSelected = generatedShotIds.length > 0 && selectedKeyframes.length === generatedShotIds.length;
     const editorShot = keyframeEditor ? bundle.shots.find((shot) => shot.id === keyframeEditor.shotId) : undefined;
     const editorKeyframe = editorShot?.keyframe_asset_id ? keyframeAssets.get(editorShot.keyframe_asset_id) : undefined;
+    const selectedPromptSkill = promptSkills.find((skill) => skill.id === promptSkillId);
+    useEffect(() => {
+        let active = true;
+        void getH3PromptSkills().then((payload) => {
+            if (!active) return;
+            setPromptSkills(payload.skills);
+            setPromptSkillId((current) => payload.skills.some((skill) => skill.id === current) ? current : payload.default_skill_id);
+            setPromptSkillError("");
+        }).catch((reason: unknown) => {
+            if (active) setPromptSkillError(reason instanceof Error ? reason.message : "H3 Prompt Skill 列表加载失败");
+        });
+        return () => { active = false; };
+    }, []);
     const runPreflight = () => action("preflight", async () => { setPreflight(await comfyPreflight(bundle.project.id)); }, "服务器检查完成；结果显示在当前按钮下方。", false);
     const generateSelectedKeyframes = () => action("keyframes", () => generateKeyframes(bundle.project.id, selected), `所选 ${selected.length} 镜的分镜首帧已处理；成功图片显示在下方并自动绑定到 I2V 首帧。`);
+    const generateSelectedH3Prompts = () => action(
+        "h3-prompts",
+        () => generateH3Prompts(bundle.project.id, selected, promptSkillId, promptSkillSuggestions.trim()),
+        `已用“${selectedPromptSkill?.name || promptSkillId}”生成并保存 ${selected.length} 个 H3 Prompt。`,
+    );
     const toggleAllGeneratedKeyframes = () => setSelected(allGeneratedSelected ? [] : generatedShotIds);
     const exportSelectedKeyframes = () => action(
         "export-keyframes",
@@ -525,6 +550,7 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
     const applyBulkPreset = (preset: H3Preset) => action(`preset-${preset}`, () => Promise.all(bundle.shots.filter((shot) => selected.includes(shot.id)).map((shot) => updateShot({ ...shot, ...h3PresetPatch(preset, bundle.project) }))), `已将${preset === "fast" ? "快速预览" : preset === "balanced" ? "均衡" : "清晰优先"}应用到 ${selected.length} 个镜头`);
     const busyText = busy === "preflight" ? "正在检查 ComfyUI 节点与模型…"
         : busy === "keyframes" ? `正在调用分镜图模型生成 ${selected.length} 张首帧，请稍候…`
+            : busy === "h3-prompts" ? `正在按“${selectedPromptSkill?.name || promptSkillId}”为 ${selected.length} 个镜头生成 H3 Prompt…`
             : busy === "plan" ? "正在编译所有镜头的 H3 模式、参考素材、帧数和参数…"
                 : busy === "render" ? `正在把 ${selected.length} 个镜头写入本地持久队列…`
                     : busy.startsWith("preset-") ? "正在保存所选镜头的批量预设…"
@@ -538,6 +564,16 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
                 <div className="rounded-lg border border-white/8 bg-white/[.02] p-3"><strong className="text-white/75">2. 生成所选首帧</strong><p className="mt-1 leading-5 text-white/35">调用“模型设置 → 分镜首帧生成”；产物既是分镜图，也是 I2V 的第一帧。</p></div>
                 <div className="rounded-lg border border-white/8 bg-white/[.02] p-3"><strong className="text-white/75">3. 编译计划</strong><p className="mt-1 leading-5 text-white/35">按素材自动决定 I2V/R2V，整理 Prompt、帧数和参数；不开始生成。</p></div>
                 <div className="rounded-lg border border-white/8 bg-white/[.02] p-3"><strong className="text-white/75">4. 提交镜头</strong><p className="mt-1 leading-5 text-white/35">把勾选镜头送入 H3 持久队列；这是实际的视频生成步骤，会占用云端 GPU。</p></div>
+            </div>
+            <div className="mt-4 rounded-xl border border-cyan-300/15 bg-cyan-300/[.025] p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="studio-kicker">OFFICIAL PROMPT SKILLS</p><h3 className="font-semibold">先选风格 Skill，再生成 H3 Prompt</h3><p className="mt-1 max-w-3xl text-xs leading-5 text-white/40">底层固定使用 MiniMax 官方 I2V/R2V 提示词结构，上层按所选风格重新导演镜头、材质、动效、声音和节拍；只处理当前勾选镜头，不会启动 ComfyUI。</p></div>{selectedPromptSkill && <a className="text-xs text-cyan-200/70 underline underline-offset-2" href={selectedPromptSkill.source_url} target="_blank" rel="noreferrer">查看官方 Skill v{selectedPromptSkill.version}</a>}</div>
+                <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(240px,.72fr)_minmax(300px,1.28fr)_auto]">
+                    <label><span className="studio-label">风格 Skill</span><select className="studio-input" value={promptSkillId} disabled={!!busy || promptSkills.length === 0} onChange={(event) => setPromptSkillId(event.target.value)}>{promptSkills.length === 0 ? <option value={promptSkillId}>正在加载官方风格…</option> : promptSkills.map((skill) => <option key={skill.id} value={skill.id}>{skill.category} · {skill.name}</option>)}</select></label>
+                    <label><span className="studio-label">本次 Prompt 建议（可选）</span><input className="studio-input" maxLength={4000} value={promptSkillSuggestions} onChange={(event) => setPromptSkillSuggestions(event.target.value)} placeholder="例如：动作更克制；保留当前群像构图；不要背景音乐……" /></label>
+                    <button type="button" className="studio-primary self-end" disabled={!!busy || selected.length === 0 || promptSkills.length === 0} onClick={() => void generateSelectedH3Prompts()}>{busy === "h3-prompts" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}生成所选 {selected.length} 镜 Prompt</button>
+                </div>
+                {selectedPromptSkill && <p className="mt-3 text-xs leading-5 text-cyan-50/50"><strong className="text-cyan-100/70">{selectedPromptSkill.name}：</strong>{selectedPromptSkill.summary}</p>}
+                {promptSkillError && <p className="mt-3 text-xs text-red-300/80">{promptSkillError}</p>}
             </div>
             {(busyText || error || notice) && <div aria-live="polite" className={`mt-4 ${error ? "studio-error" : "studio-notice"}`}>{busyText && <span className="inline-flex items-center gap-2"><Loader2 className="animate-spin" size={15} />{busyText}</span>}{!busyText && (error || notice)}{error && <Link className="ml-2 underline underline-offset-2" href="/logs">查看运行日志</Link>}</div>}
         </section>

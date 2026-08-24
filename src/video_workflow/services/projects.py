@@ -28,6 +28,10 @@ from src.video_workflow.domain import (
     Shot,
 )
 from src.video_workflow.generators.image import create_image_generator
+from src.video_workflow.h3_prompt_skills import (
+    get_h3_prompt_skill,
+    h3_prompt_system_instruction,
+)
 from src.video_workflow.integrations.comfyui import h3_frames_for_seconds
 from src.video_workflow.media_paths import resolve_media_path
 from src.video_workflow.storage import ProjectStore
@@ -825,9 +829,16 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
     @staticmethod
     def _reference_assets_in_shot_order(shot: Shot, assets: list[Asset]) -> list[Asset]:
         asset_map = {asset.id: asset for asset in assets}
-        return [asset_map[asset_id] for asset_id in shot.reference_asset_ids if asset_id in asset_map]
+        ordered_ids = [
+            asset_id
+            for asset_id in [shot.keyframe_asset_id, *shot.reference_asset_ids]
+            if asset_id
+        ]
+        return [asset_map[asset_id] for asset_id in dict.fromkeys(ordered_ids) if asset_id in asset_map]
 
     def compile_h3_prompt(self, project: Project, shot: Shot, assets: list[Asset]) -> str:
+        if shot.h3_prompt_skill_output.strip():
+            return shot.h3_prompt_skill_output.strip()
         mode = self.resolve_generation_mode(shot, assets)
         style = self._compact_prompt_text(project.brief.visual_style or project.style_bible, 240)
         narrative = self._compact_prompt_text(shot.narrative or shot.scene_description, 260)
@@ -998,6 +1009,7 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
             result: list[dict[str, object]] = []
             for turn, duration in zip(visual_turns, durations, strict=False):
                 segment = shot.model_copy(deep=True)
+                segment.h3_prompt_skill_output = ""
                 delivery_duration = round(max(0.35, duration), 3)
                 generation_duration = max(5.0, min(settings.H3_MAX_SEGMENT_SECONDS, delivery_duration))
                 segment.duration_seconds = generation_duration
@@ -1087,6 +1099,7 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
         result: list[dict[str, object]] = []
         for index, (phase, duration) in enumerate(zip(phases, durations, strict=False)):
             segment = shot.model_copy(deep=True)
+            segment.h3_prompt_skill_output = ""
             delivery_duration = round(duration, 3)
             generation_duration = max(5.0, min(settings.H3_MAX_SEGMENT_SECONDS, delivery_duration))
             segment.duration_seconds = generation_duration
@@ -1179,6 +1192,135 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
 
     def plan_all_shots(self, project_id: str) -> list[Shot]:
         return [self.plan_shot(project_id, shot.id) for shot in self.store.list_shots(project_id)]
+
+    async def generate_h3_prompts(
+        self,
+        project_id: str,
+        shot_ids: list[str] | None,
+        skill_id: str,
+        user_suggestions: str = "",
+    ) -> list[Shot]:
+        """Generate and persist H3 prompts with the official prompt schema plus a style Skill."""
+        project = self.require_project(project_id)
+        skill = get_h3_prompt_skill(skill_id)
+        all_shots = self.store.list_shots(project_id)
+        shot_map = {shot.id: shot for shot in all_shots}
+        selected_ids = list(dict.fromkeys(shot_ids or [shot.id for shot in all_shots]))
+        unknown = [shot_id for shot_id in selected_ids if shot_id not in shot_map]
+        if unknown:
+            raise ValueError(f"项目中不存在这些镜头: {', '.join(unknown)}")
+        if not selected_ids:
+            raise ValueError("请至少选择一个镜头")
+
+        assets = self.store.list_assets(project_id)
+        asset_map = {asset.id: asset for asset in assets}
+        provider = settings.LLM_PROVIDER
+        llm = create_llm_generator(provider)
+        suggestions = user_suggestions.strip()
+        semaphore = asyncio.Semaphore(3)
+
+        async def generate_one(shot: Shot) -> tuple[Shot, str]:
+            mode = self.resolve_generation_mode(shot, assets)
+            references = self._reference_assets_in_shot_order(shot, assets)
+            counters = {AssetType.IMAGE: 0, AssetType.VIDEO: 0, AssetType.AUDIO: 0}
+            reference_manifest: list[str] = []
+            if mode == GenerationMode.R2V and shot.dialogue.strip():
+                counters[AssetType.AUDIO] = 1
+                speaker = next(
+                    (character for character in project.characters if character.id == shot.dialogue_speaker_id),
+                    None,
+                )
+                reference_manifest.append(
+                    f"<Audio 1>: clean Chinese dialogue track for {speaker.name if speaker else 'the designated speaker'}; "
+                    "only that speaker may move their lips"
+                )
+            for asset in references:
+                if asset.type not in counters:
+                    continue
+                counters[asset.type] += 1
+                label = {
+                    AssetType.IMAGE: "Picture",
+                    AssetType.VIDEO: "Video",
+                    AssetType.AUDIO: "Audio",
+                }[asset.type]
+                reference_manifest.append(
+                    f"<{label} {counters[asset.type]}>: {asset.role.value} reference named {asset.name}; "
+                    f"{asset.description or 'use only for its declared reference role'}"
+                )
+
+            visible_characters = [
+                {
+                    "id": character.id,
+                    "name": character.name,
+                    "appearance": character.description,
+                    "wardrobe": character.wardrobe,
+                    "voice": character.voice_description,
+                    "reference_assets": [
+                        asset_map[asset_id].name for asset_id in character.reference_asset_ids if asset_id in asset_map
+                    ],
+                    "speaks_in_this_shot": character.id == shot.dialogue_speaker_id,
+                }
+                for character in project.characters
+                if character.id in shot.character_ids
+            ]
+            prompt = f"""Create one final MiniMax H3 prompt for the following approved shot.
+
+PROJECT
+- title: {project.brief.title}
+- aspect ratio: {project.brief.aspect_ratio}
+- approved visual style: {project.brief.visual_style or project.style_bible or 'derive only from the selected style Skill'}
+- project continuity bible: {project.style_bible or 'none'}
+- global negative constraints: {project.brief.negative_prompt or 'none'}
+
+SHOT
+- ordinal/title: {shot.ordinal} / {shot.title}
+- duration: {shot.duration_seconds:.2f} seconds
+- generation mode: {mode.value.upper()}
+- narrative event: {shot.narrative}
+- opening/scene state: {shot.scene_description}
+- shot size / angle / lens / camera: {shot.shot_size} / {shot.camera_angle} / {shot.lens} / {shot.camera_motion}
+- subject action: {shot.subject_motion}
+- exact dialogue or narration: {shot.dialogue or 'none'}
+- sound design: {shot.audio_design or 'natural diegetic sound only'}
+- transition context: {shot.transition}
+- visible characters: {json.dumps(visible_characters, ensure_ascii=False)}
+- available references in exact API order: {json.dumps(reference_manifest, ensure_ascii=False)}
+- current approved first-frame prompt: {shot.keyframe_prompt or 'none'}
+- current general storyboard prompt: {shot.visual_prompt or 'none'}
+- user instructions for this generation: {suggestions or 'none'}
+
+Do not copy the full project bible or every character into the result. Include only details needed for this shot. Keep exactly the authored character count, speaker ownership, dialogue and reference labels. For I2V, <Picture 1> is the approved first frame. For R2V, use only labels listed in the manifest. Return the final prompt in the required JSON field."""
+            async with semaphore:
+                payload = await llm.generate_json(
+                    h3_prompt_system_instruction(skill, mode),
+                    prompt,
+                )
+            output = str(payload.get("video_prompt") or "").strip()
+            if not output:
+                raise ValueError(f"镜头 {shot.ordinal} 的 H3 Prompt 生成结果为空")
+            if len(output) > 6000:
+                raise ValueError(f"镜头 {shot.ordinal} 的 H3 Prompt 超过 6000 字符，请缩短建议后重试")
+            required = (
+                ("subject_definitions:", "detailed_description:")
+                if mode == GenerationMode.R2V
+                else ("integrated_multimodal_description:", "overall_soundscape:")
+            )
+            if not all(section in output for section in required):
+                raise ValueError(f"镜头 {shot.ordinal} 的生成结果不符合 {mode.value.upper()} 官方结构")
+            return shot, output
+
+        generated = await asyncio.gather(*(generate_one(shot_map[shot_id]) for shot_id in selected_ids))
+        saved: list[Shot] = []
+        for shot, output in generated:
+            shot.h3_prompt_skill_id = skill.id
+            shot.h3_prompt_skill_version = skill.version
+            shot.h3_prompt_skill_output = output
+            shot.video_prompt_source = output
+            shot.video_prompt = output
+            shot.resolved_generation_mode = self.resolve_generation_mode(shot, assets)
+            shot.version += 1
+            saved.append(self.store.save_shot(shot))
+        return saved
 
     async def generate_keyframes(
         self,

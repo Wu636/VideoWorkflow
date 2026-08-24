@@ -139,6 +139,16 @@ export interface RuntimeLogRecord {
     exception: string;
 }
 
+export interface H3PromptSkill {
+    id: string;
+    name: string;
+    version: string;
+    category: string;
+    summary: string;
+    source_url: string;
+    source_commit: string;
+}
+
 export interface Shot {
     id: string;
     project_id: string;
@@ -164,6 +174,9 @@ export interface Shot {
     keyframe_prompt: string;
     video_prompt_source: string;
     video_prompt: string;
+    h3_prompt_skill_id: string;
+    h3_prompt_skill_version: string;
+    h3_prompt_skill_output: string;
     negative_prompt: string;
     generation_mode: GenerationMode;
     resolved_generation_mode: GenerationMode | null;

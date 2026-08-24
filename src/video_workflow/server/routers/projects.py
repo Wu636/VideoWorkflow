@@ -31,6 +31,7 @@ from src.video_workflow.domain import (
     Shot,
 )
 from src.video_workflow.integrations.comfyui import ComfyUIClient, H3WorkflowBuilder
+from src.video_workflow.h3_prompt_skills import list_h3_prompt_skills
 from src.video_workflow.media_paths import resolve_media_path
 from src.video_workflow.services.finalize import Finalizer
 from src.video_workflow.services.projects import ProjectService
@@ -80,6 +81,12 @@ class KeyframeExportRequest(BaseModel):
     shot_ids: list[str] | None = None
 
 
+class H3PromptGenerateRequest(BaseModel):
+    shot_ids: list[str] | None = None
+    skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
+    user_suggestions: str = Field(default="", max_length=4000)
+
+
 class ReorderRequest(BaseModel):
     shot_ids: list[str]
 
@@ -118,6 +125,14 @@ async def list_projects():
 @router.post("")
 async def create_project(brief: ProjectBrief):
     return project_service.create_project(brief)
+
+
+@router.get("/h3-prompt-skills")
+async def get_h3_prompt_skills():
+    return {
+        "default_skill_id": "h3-prompt-writing",
+        "skills": list_h3_prompt_skills(),
+    }
 
 
 @router.get("/legacy/sessions")
@@ -457,6 +472,24 @@ async def generate_keyframes(project_id: str, request: KeyframeRequest):
     except Exception as exc:
         logger.exception("项目 %s 的分镜首帧生成失败", project_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/h3-prompts/generate")
+async def generate_h3_prompts(project_id: str, request: H3PromptGenerateRequest):
+    try:
+        return await project_service.generate_h3_prompts(
+            project_id,
+            request.shot_ids,
+            request.skill_id,
+            request.user_suggestions,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的 H3 Prompt Skill 生成失败", project_id)
+        raise HTTPException(status_code=500, detail=f"H3 Prompt 生成失败: {exc}") from exc
 
 
 def _safe_archive_component(value: str, fallback: str) -> str:
