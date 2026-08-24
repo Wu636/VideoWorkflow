@@ -5,7 +5,10 @@ import csv
 import io
 import logging
 import mimetypes
+import re
 import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -13,6 +16,7 @@ from uuid import uuid4
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from src.video_workflow.config import settings
 from src.video_workflow.domain import (
@@ -70,6 +74,10 @@ class KeyframeRequest(BaseModel):
     image_model: str | None = None
     revision_mode: Literal["fresh", "iterate"] = "fresh"
     user_suggestions: str = Field(default="", max_length=4000)
+
+
+class KeyframeExportRequest(BaseModel):
+    shot_ids: list[str] | None = None
 
 
 class ReorderRequest(BaseModel):
@@ -448,6 +456,61 @@ async def generate_keyframes(project_id: str, request: KeyframeRequest):
     except Exception as exc:
         logger.exception("项目 %s 的分镜首帧生成失败", project_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _safe_archive_component(value: str, fallback: str) -> str:
+    clean = re.sub(r'[\x00-\x1f<>:"/\\|?*]+', "_", (value or "").strip()).strip(" ._")
+    return (clean or fallback)[:80]
+
+
+def _build_keyframe_archive(project_id: str, shot_ids: list[str] | None) -> tuple[Path, str, int]:
+    project = project_service.require_project(project_id)
+    selected = set(shot_ids) if shot_ids is not None else None
+    entries: list[tuple[Shot, Path]] = []
+    for shot in store.list_shots(project_id):
+        if selected is not None and shot.id not in selected:
+            continue
+        asset = store.get_asset(shot.keyframe_asset_id) if shot.keyframe_asset_id else None
+        if asset is None or asset.project_id != project_id:
+            continue
+        path = resolve_media_path(asset.path)
+        if path.is_file():
+            entries.append((shot, path))
+    if not entries:
+        raise ValueError("所选镜头中没有可导出的已生成分镜图")
+
+    handle = tempfile.NamedTemporaryFile(prefix="videoworkflow-keyframes-", suffix=".zip", delete=False)
+    archive_path = Path(handle.name)
+    handle.close()
+    try:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            for shot, source in entries:
+                title = _safe_archive_component(shot.title, f"镜头_{shot.ordinal:03d}")
+                suffix = source.suffix.lower() or ".png"
+                archive.write(source, arcname=f"镜头_{shot.ordinal:03d}_{title}{suffix}")
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    project_title = _safe_archive_component(project.brief.title, project.id)
+    return archive_path, f"{project_title}_分镜图_{len(entries)}张.zip", len(entries)
+
+
+@router.post("/{project_id}/keyframes/export")
+async def export_keyframes(project_id: str, request: KeyframeExportRequest):
+    try:
+        archive_path, filename, _ = await asyncio.to_thread(
+            _build_keyframe_archive,
+            project_id,
+            request.shot_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
+    )
 
 
 @router.post("/{project_id}/render/plan")

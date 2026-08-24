@@ -45,6 +45,7 @@ import {
     deleteProjectAsset,
     deleteShot,
     enqueueRender,
+    exportKeyframes,
     finalizeProject,
     generateKeyframes,
     generateStoryboard,
@@ -451,11 +452,31 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
     const active = bundle.jobs.filter((job) => ACTIVE_JOBS.has(job.status));
     const cost = bundle.jobs.reduce((sum, job) => sum + (job.estimated_cost || 0), 0);
     const keyframeAssets = new Map(bundle.assets.map((asset) => [asset.id, asset]));
-    const generatedKeyframes = bundle.shots.filter((shot) => shot.keyframe_asset_id && keyframeAssets.has(shot.keyframe_asset_id)).length;
+    const generatedShotIds = bundle.shots.filter((shot) => shot.keyframe_asset_id && keyframeAssets.has(shot.keyframe_asset_id)).map((shot) => shot.id);
+    const generatedKeyframes = generatedShotIds.length;
+    const selectedKeyframes = generatedShotIds.filter((shotId) => selected.includes(shotId));
+    const allGeneratedSelected = generatedShotIds.length > 0 && selectedKeyframes.length === generatedShotIds.length;
     const editorShot = keyframeEditor ? bundle.shots.find((shot) => shot.id === keyframeEditor.shotId) : undefined;
     const editorKeyframe = editorShot?.keyframe_asset_id ? keyframeAssets.get(editorShot.keyframe_asset_id) : undefined;
     const runPreflight = () => action("preflight", async () => { setPreflight(await comfyPreflight(bundle.project.id)); }, "服务器检查完成；结果显示在当前按钮下方。", false);
     const generateSelectedKeyframes = () => action("keyframes", () => generateKeyframes(bundle.project.id, selected), `所选 ${selected.length} 镜的分镜首帧已处理；成功图片显示在下方并自动绑定到 I2V 首帧。`);
+    const toggleAllGeneratedKeyframes = () => setSelected(allGeneratedSelected ? [] : generatedShotIds);
+    const exportSelectedKeyframes = () => action(
+        "export-keyframes",
+        async () => {
+            const { blob, filename } = await exportKeyframes(bundle.project.id, selectedKeyframes);
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        },
+        `已将所选 ${selectedKeyframes.length} 张分镜图打包导出。`,
+        false,
+    );
     const openKeyframeEditor = (shot: Shot) => {
         const currentKeyframe = shot.keyframe_asset_id ? keyframeAssets.get(shot.keyframe_asset_id) : undefined;
         setKeyframeEditor({
@@ -517,7 +538,7 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
         </section>
         {preflight && <div className={preflight.online ? "studio-notice" : "rounded-lg border border-amber-400/20 bg-amber-400/6 px-4 py-3 text-sm text-amber-100/75"}>{preflight.online ? `服务器在线 · 节点/模型检查：${preflight.ok ? "通过" : "有缺失"}` : <span className="inline-flex items-center gap-2"><CloudOff size={15} />服务器处于关闭状态，参数仍可在本地编辑保存。</span>} {preflight.error ? String(preflight.error) : ""}</div>}
         <section className="studio-panel">
-            <div className={`flex flex-wrap items-center justify-between gap-3 ${keyframeBoardOpen ? "mb-4" : ""}`}><div><p className="studio-kicker">KEYFRAME BOARD</p><h3 className="font-semibold">分镜图 / I2V 首帧</h3><p className="mt-1 text-xs text-white/35">已生成 {generatedKeyframes}/{bundle.shots.length}。{keyframeBoardOpen ? "勾选镜头后用上方按钮批量生成，也可在卡片中单独生成或重做。" : "当前已收起，展开后可查看、选择和生成分镜图。"}</p></div><div className="flex flex-wrap items-center gap-2"><span className="studio-status">已选 {selected.length} 镜</span><Link href="/settings" className="studio-secondary px-3">分镜图模型设置</Link><button type="button" className="studio-secondary px-3" aria-expanded={keyframeBoardOpen} aria-controls="keyframe-board-content" onClick={() => setKeyframeBoardOpen((open) => !open)}>{keyframeBoardOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}{keyframeBoardOpen ? "收起" : "展开"}</button></div></div>
+            <div className={`flex flex-wrap items-center justify-between gap-3 ${keyframeBoardOpen ? "mb-4" : ""}`}><div><p className="studio-kicker">KEYFRAME BOARD</p><h3 className="font-semibold">分镜图 / I2V 首帧</h3><p className="mt-1 text-xs text-white/35">已生成 {generatedKeyframes}/{bundle.shots.length}。{keyframeBoardOpen ? "可全选已生成图片并打包导出；也可在卡片中单独生成或重做。" : "当前已收起，展开后可查看、选择和生成分镜图。"}</p></div><div className="flex flex-wrap items-center gap-2"><span className="studio-status">已选 {selected.length} 镜 · 可导出 {selectedKeyframes.length} 张</span><button type="button" className="studio-secondary px-3" disabled={!!busy || generatedShotIds.length === 0} onClick={toggleAllGeneratedKeyframes}><Check size={15} />{allGeneratedSelected ? "取消全选" : `全选已生成 ${generatedShotIds.length} 张`}</button><button type="button" className="studio-secondary px-3" disabled={!!busy || selectedKeyframes.length === 0} onClick={() => void exportSelectedKeyframes()}>{busy === "export-keyframes" ? <Loader2 className="animate-spin" size={15} /> : <Download size={15} />}导出选中 {selectedKeyframes.length} 张</button><Link href="/settings" className="studio-secondary px-3">分镜图模型设置</Link><button type="button" className="studio-secondary px-3" aria-expanded={keyframeBoardOpen} aria-controls="keyframe-board-content" onClick={() => setKeyframeBoardOpen((open) => !open)}>{keyframeBoardOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}{keyframeBoardOpen ? "收起" : "展开"}</button></div></div>
             {keyframeBoardOpen && <div id="keyframe-board-content">{bundle.shots.length === 0 ? <p className="rounded-lg border border-dashed border-white/10 p-5 text-sm text-white/35">请先在“分镜设计”中生成或导入分镜。</p> : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">{bundle.shots.map((shot) => {
                 const keyframe = shot.keyframe_asset_id ? keyframeAssets.get(shot.keyframe_asset_id) : undefined;
                 const imageStatus = shot.image_status === "processing"

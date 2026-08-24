@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from src.video_workflow.domain import Delivery, Shot
+from src.video_workflow.domain import AssetRole, Delivery, Shot
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
@@ -158,6 +160,45 @@ class ProjectApiTests(unittest.TestCase):
         delivered = self.client.get(f"/api/projects/{project_id}").json()
         self.assertEqual(delivered["project"]["status"], "delivered")
         self.assertEqual(len(delivered["reviews"]), 2)
+
+    def test_keyframe_export_only_includes_generated_selected_shots(self) -> None:
+        project = self.client.post(
+            "/api/projects",
+            json={"title": "分镜图导出测试", "story": "两个镜头", "target_duration_seconds": 10},
+        ).json()
+        project_id = project["id"]
+        first = router.store.save_shot(Shot(project_id=project_id, ordinal=1, title="开场/入镜"))
+        second = router.store.save_shot(Shot(project_id=project_id, ordinal=2, title="尚未生成"))
+        image_path = router.project_service.project_dir(project_id) / "assets" / "first-frame.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(b"fake-png-content")
+        asset = router.project_service.register_existing_asset(
+            project_id,
+            image_path,
+            AssetRole.KEYFRAME,
+            "镜头 1 首帧",
+        )
+        first.keyframe_asset_id = asset.id
+        first.image_status = "completed"
+        router.store.save_shot(first)
+
+        response = self.client.post(
+            f"/api/projects/{project_id}/keyframes/export",
+            json={"shot_ids": [second.id, first.id]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        self.assertIn("filename*=utf-8", response.headers["content-disposition"].lower())
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(archive.namelist(), ["镜头_001_开场_入镜.png"])
+            self.assertEqual(archive.read(archive.namelist()[0]), b"fake-png-content")
+
+        empty = self.client.post(
+            f"/api/projects/{project_id}/keyframes/export",
+            json={"shot_ids": [second.id]},
+        )
+        self.assertEqual(empty.status_code, 400, empty.text)
+        self.assertIn("没有可导出", empty.json()["detail"])
 
 
 if __name__ == "__main__":
