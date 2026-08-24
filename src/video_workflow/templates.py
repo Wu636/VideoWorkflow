@@ -240,3 +240,15 @@ def get_template_description(template_name: str) -> str:
     if template_name not in VIRAL_TEMPLATES:
         return "未知模板"
     return VIRAL_TEMPLATES[template_name].description
+
+
+def get_template_catalog() -> list[dict[str, str]]:
+    """返回供前端消费的模板元数据，避免前后端配置漂移。"""
+    return [
+        {
+            "name": template.name,
+            "description": template.description,
+            "example_prompt": template.example_prompt,
+        }
+        for template in VIRAL_TEMPLATES.values()
+    ]

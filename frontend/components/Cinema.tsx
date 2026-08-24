@@ -1,9 +1,10 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useState, useRef } from "react";
 import { Download, Loader2, Film, RotateCcw, Image as ImageIcon, ArrowLeft } from "lucide-react";
 import Link from "next/link";
-import { Storyboard, Scene } from "@/types";
+import { Storyboard } from "@/types";
 import { getScript, concatenateVideos, generateVideos } from "@/lib/api";
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001/api").replace("/api", "");
@@ -53,7 +54,7 @@ export default function Cinema({ sessionId }: { sessionId: string }) {
             // If transitioned to completed (or initially loaded as completed), we can allow a refresh
             // But to avoid infinite initial refresh, we might not strictly need it on mounting if browser cache is ok.
             // However, to be safe against previous regenerations:
-            if (current === 'COMPLETED' && prev !== 'COMPLETED' && prev !== undefined) {
+            if (current === 'completed' && prev !== 'completed' && prev !== undefined) {
                 setVideoVersions(v => ({ ...v, [scene.id]: Date.now() }));
             }
 
@@ -121,7 +122,7 @@ export default function Cinema({ sessionId }: { sessionId: string }) {
                                     controls
                                     className="w-full h-full object-contain"
                                 />
-                            ) : (regeneratingMap[scene.id] || scene.video_status === 'PROCESSING') ? (
+                            ) : (regeneratingMap[scene.id] || scene.video_status === 'processing') ? (
                                 <div className="flex items-center justify-center h-full text-gray-500 flex-col gap-2">
                                     <Loader2 className="animate-spin w-8 h-8" />
                                     {regeneratingMap[scene.id] ? "Regenerating..." : "Rendering..."}
@@ -129,10 +130,13 @@ export default function Cinema({ sessionId }: { sessionId: string }) {
                             ) : (
                                 // Fallback to image if not generating video
                                 scene.image_path ? (
-                                    <img
+                                    <Image
                                         src={getVideoUrl(scene.image_path)}
-                                        className="w-full h-full object-contain"
                                         alt={`Scene ${scene.id}`}
+                                        fill
+                                        unoptimized
+                                        sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
+                                        className="h-full w-full object-contain"
                                     />
                                 ) : (
                                     <div className="flex items-center justify-center h-full text-gray-500">

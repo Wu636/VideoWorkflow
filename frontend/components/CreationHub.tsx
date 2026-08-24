@@ -1,16 +1,32 @@
 "use client";
 
-import { useState } from "react";
+import Image from "next/image";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Upload, Wand2, Video, Sparkles, Loader2, Zap, Terminal, Cpu, CheckCircle } from "lucide-react";
-import { createSession, analyzeImage, uploadFile } from "@/lib/api";
-import { VIRAL_TEMPLATES } from "@/types";
+import { Upload, Sparkles, Loader2, Zap, Terminal, Cpu, CheckCircle } from "lucide-react";
+import { createSession, analyzeImage, uploadFile, getTemplates, getImageOptions, getVideoOptions } from "@/lib/api";
+import {
+    DEFAULT_IMAGE_PROVIDERS,
+    DEFAULT_VIDEO_PROVIDERS,
+    DEFAULT_VIRAL_TEMPLATES,
+    ImageProviderOption,
+    TemplateOption,
+    VideoProviderOption,
+} from "@/types";
 
 export default function CreationHub() {
     const router = useRouter();
     const [topic, setTopic] = useState("");
     const [loading, setLoading] = useState(false);
     const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
+    const [templates, setTemplates] = useState<TemplateOption[]>(DEFAULT_VIRAL_TEMPLATES);
+    const [imageProviders, setImageProviders] = useState<ImageProviderOption[]>(DEFAULT_IMAGE_PROVIDERS);
+    const [selectedProvider, setSelectedProvider] = useState<string>(DEFAULT_IMAGE_PROVIDERS[0]?.provider ?? "ark");
+    const [selectedImageModel, setSelectedImageModel] = useState<string>(DEFAULT_IMAGE_PROVIDERS[0]?.default_model ?? "");
+    const [videoProviders, setVideoProviders] = useState<VideoProviderOption[]>(DEFAULT_VIDEO_PROVIDERS);
+    const [selectedVideoProvider, setSelectedVideoProvider] = useState<string>(DEFAULT_VIDEO_PROVIDERS[0]?.provider ?? "grsai");
+    const [selectedVideoModel, setSelectedVideoModel] = useState<string>(DEFAULT_VIDEO_PROVIDERS[0]?.default_model ?? "veo3.1-fast");
+    const [selectedVideoAspectRatio, setSelectedVideoAspectRatio] = useState<string>(DEFAULT_VIDEO_PROVIDERS[0]?.default_aspect_ratio ?? "16:9");
     const [refImage, setRefImage] = useState<string | null>(null);
     const [refImageFile, setRefImageFile] = useState<File | null>(null);
     const [dragActive, setDragActive] = useState(false);
@@ -20,6 +36,82 @@ export default function CreationHub() {
     const [characterDesc, setCharacterDesc] = useState("");
     const [imageStyle, setImageStyle] = useState("");
     const [showAnalysis, setShowAnalysis] = useState(false);
+
+    useEffect(() => {
+        getTemplates()
+            .then((items) => {
+                if (items.length > 0) {
+                    setTemplates(items);
+                }
+            })
+            .catch((error) => {
+                console.warn("Failed to load templates, using fallback list:", error);
+            });
+
+        getImageOptions()
+            .then((items) => {
+                if (items.length > 0) {
+                    setImageProviders(items);
+                }
+            })
+            .catch((error) => {
+                console.warn("Failed to load image options, using fallback list:", error);
+            });
+
+        getVideoOptions()
+            .then((items) => {
+                if (items.length > 0) {
+                    setVideoProviders(items);
+                }
+            })
+            .catch((error) => {
+                console.warn("Failed to load video options, using fallback list:", error);
+            });
+    }, []);
+
+    useEffect(() => {
+        if (imageProviders.length === 0) {
+            return;
+        }
+
+        const provider = imageProviders.find((item) => item.provider === selectedProvider) ?? imageProviders[0];
+        if (provider.provider !== selectedProvider) {
+            setSelectedProvider(provider.provider);
+            return;
+        }
+
+        const hasSelectedModel = provider.models.some((item) => item.id === selectedImageModel);
+        if (!hasSelectedModel) {
+            setSelectedImageModel(provider.default_model);
+        }
+    }, [imageProviders, selectedProvider, selectedImageModel]);
+
+    useEffect(() => {
+        if (videoProviders.length === 0) {
+            return;
+        }
+
+        const provider = videoProviders.find((item) => item.provider === selectedVideoProvider) ?? videoProviders[0];
+        if (provider.provider !== selectedVideoProvider) {
+            setSelectedVideoProvider(provider.provider);
+            return;
+        }
+
+        const hasSelectedModel = provider.models.some((item) => item.id === selectedVideoModel);
+        if (!hasSelectedModel) {
+            setSelectedVideoModel(provider.default_model);
+        }
+
+        if (!provider.supported_aspect_ratios.includes(selectedVideoAspectRatio)) {
+            setSelectedVideoAspectRatio(provider.default_aspect_ratio);
+        }
+    }, [videoProviders, selectedVideoProvider, selectedVideoModel, selectedVideoAspectRatio]);
+
+    const activeProvider = imageProviders.find((item) => item.provider === selectedProvider) ?? imageProviders[0];
+    const activeModels = activeProvider?.models ?? [];
+    const activeVideoProvider = videoProviders.find((item) => item.provider === selectedVideoProvider) ?? videoProviders[0];
+    const activeVideoModels = activeVideoProvider?.models ?? [];
+    const activeVideoAspectRatios = activeVideoProvider?.supported_aspect_ratios ?? ["16:9", "9:16", "1:1"];
 
     const handleFile = async (file: File) => {
         // Show preview immediately
@@ -81,8 +173,14 @@ export default function CreationHub() {
                 reference_image: refImagePath,
                 template: selectedTemplate || undefined,
                 count: 5,
+                include_dialogue: false,
                 character_description: characterDesc || undefined,
-                image_style: imageStyle || undefined
+                image_style: imageStyle || undefined,
+                image_provider: selectedProvider,
+                image_model: selectedImageModel || activeProvider?.default_model,
+                video_provider: selectedVideoProvider,
+                video_model: selectedVideoModel || activeVideoProvider?.default_model,
+                video_aspect_ratio: selectedVideoAspectRatio || activeVideoProvider?.default_aspect_ratio,
             });
             router.push(`/workspace/${res.session_id}/script`);
         } catch (e) {
@@ -171,7 +269,14 @@ export default function CreationHub() {
 
                                 {refImage ? (
                                     <>
-                                        <img src={refImage} alt="Ref" className="absolute inset-0 w-full h-full object-cover opacity-60 grayscale group-hover:grayscale-0 transition-all duration-500" />
+                                        <Image
+                                            src={refImage}
+                                            alt="Ref"
+                                            fill
+                                            unoptimized
+                                            sizes="(max-width: 1024px) 50vw, 20vw"
+                                            className="absolute inset-0 h-full w-full object-cover opacity-60 grayscale transition-all duration-500 group-hover:grayscale-0"
+                                        />
                                         <div className="absolute inset-0 bg-black/40 z-10 flex items-center justify-center pointer-events-none">
                                             {analyzing ? (
                                                 <div className="flex flex-col items-center">
@@ -198,9 +303,9 @@ export default function CreationHub() {
                                 <div className="sticky top-0 bg-black/90 z-10 p-2 border-b border-white/10 backdrop-blur-sm">
                                     <div className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">Select Mode</div>
                                 </div>
-                                {VIRAL_TEMPLATES.map((t) => (
+                                {templates.map((t) => (
                                     <button
-                                        key={t.id}
+                                        key={t.name}
                                         onClick={() => setSelectedTemplate(selectedTemplate === t.name ? null : t.name)}
                                         className={`w-full text-left p-2 text-xs font-mono transition-all border-l-2 ${selectedTemplate === t.name
                                             ? 'bg-neon-cyan/10 border-neon-cyan text-white'
@@ -211,6 +316,143 @@ export default function CreationHub() {
                                     </button>
                                 ))}
                             </div>
+                        </div>
+
+                        <div className="space-y-3 border border-white/10 bg-black/30 p-4">
+                            <div className="flex items-center justify-between gap-3">
+                                <label className="text-xs font-bold text-neon-cyan uppercase tracking-widest">
+                                    Render Engine
+                                </label>
+                                <span className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">
+                                    Session Scoped
+                                </span>
+                            </div>
+
+                            <div className="text-[10px] text-gray-500 uppercase tracking-widest">Image Generation</div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="space-y-1">
+                                    <label className="text-[10px] text-gray-500 uppercase tracking-widest block">
+                                        Provider
+                                    </label>
+                                    <select
+                                        value={selectedProvider}
+                                        onChange={(e) => {
+                                            const nextProvider = e.target.value;
+                                            const nextProviderConfig = imageProviders.find((item) => item.provider === nextProvider);
+                                            setSelectedProvider(nextProvider);
+                                            setSelectedImageModel(nextProviderConfig?.default_model ?? "");
+                                        }}
+                                        className="w-full input-cyber h-12 px-4 text-xs font-mono"
+                                    >
+                                        {imageProviders.map((provider) => (
+                                            <option key={provider.provider} value={provider.provider}>
+                                                {provider.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div className="space-y-1">
+                                    <label className="text-[10px] text-gray-500 uppercase tracking-widest block">
+                                        Image Model
+                                    </label>
+                                    <select
+                                        value={selectedImageModel}
+                                        onChange={(e) => setSelectedImageModel(e.target.value)}
+                                        className="w-full input-cyber h-12 px-4 text-xs font-mono"
+                                    >
+                                        {activeModels.map((model) => (
+                                            <option key={model.id} value={model.id}>
+                                                {model.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+                            </div>
+
+                            {activeProvider && (
+                                <div className="space-y-1">
+                                    <p className="text-[10px] text-gray-500 font-mono leading-relaxed">
+                                        {activeProvider.description}
+                                    </p>
+                                    <p className="text-[10px] text-gray-600 font-mono uppercase tracking-widest">
+                                        API Key Env: {activeProvider.api_key_env}
+                                    </p>
+                                </div>
+                            )}
+
+                            <div className="border-t border-white/10 pt-3 text-[10px] text-gray-500 uppercase tracking-widest">Video Generation</div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className="space-y-1">
+                                    <label className="text-[10px] text-gray-500 uppercase tracking-widest block">
+                                        Video Provider
+                                    </label>
+                                    <select
+                                        value={selectedVideoProvider}
+                                        onChange={(e) => {
+                                            const nextProvider = e.target.value;
+                                            const nextProviderConfig = videoProviders.find((item) => item.provider === nextProvider);
+                                            setSelectedVideoProvider(nextProvider);
+                                            setSelectedVideoModel(nextProviderConfig?.default_model ?? "");
+                                            setSelectedVideoAspectRatio(nextProviderConfig?.default_aspect_ratio ?? "16:9");
+                                        }}
+                                        className="w-full input-cyber h-12 px-4 text-xs font-mono"
+                                    >
+                                        {videoProviders.map((provider) => (
+                                            <option key={provider.provider} value={provider.provider}>
+                                                {provider.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div className="space-y-1">
+                                    <label className="text-[10px] text-gray-500 uppercase tracking-widest block">
+                                        Video Model
+                                    </label>
+                                    <select
+                                        value={selectedVideoModel}
+                                        onChange={(e) => setSelectedVideoModel(e.target.value)}
+                                        className="w-full input-cyber h-12 px-4 text-xs font-mono"
+                                    >
+                                        {activeVideoModels.map((model) => (
+                                            <option key={model.id} value={model.id}>
+                                                {model.label}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div className="space-y-1 md:col-span-2">
+                                    <label className="text-[10px] text-gray-500 uppercase tracking-widest block">
+                                        Video Aspect Ratio
+                                    </label>
+                                    <select
+                                        value={selectedVideoAspectRatio}
+                                        onChange={(e) => setSelectedVideoAspectRatio(e.target.value)}
+                                        className="w-full input-cyber h-12 px-4 text-xs font-mono"
+                                    >
+                                        {activeVideoAspectRatios.map((ratio) => (
+                                            <option key={ratio} value={ratio}>
+                                                {ratio}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+                            </div>
+
+                            {activeVideoProvider && (
+                                <div className="space-y-1">
+                                    <p className="text-[10px] text-gray-500 font-mono leading-relaxed">
+                                        {activeVideoProvider.description}
+                                    </p>
+                                    <p className="text-[10px] text-gray-600 font-mono uppercase tracking-widest">
+                                        API Key Env: {activeVideoProvider.api_key_env}
+                                    </p>
+                                </div>
+                            )}
                         </div>
 
                         {/* Analysis Result (Editable) */}

@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterable, Iterator, TypeVar
+
+from pydantic import BaseModel
+
+from src.video_workflow.domain import (
+    Asset,
+    Delivery,
+    JobStatus,
+    Project,
+    RenderJob,
+    Review,
+    Shot,
+    utc_now,
+)
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class ProjectStore:
+    """Small durable repository built on SQLite JSON records.
+
+    The JSON payload keeps the domain model easy to evolve while indexed columns
+    provide the project/job queries used by the UI and render worker.
+    """
+
+    def __init__(self, database_path: Path):
+        self.database_path = Path(database_path)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._initialize()
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.database_path, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _initialize(self) -> None:
+        schema = """
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS shots (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, ordinal);
+        CREATE TABLE IF NOT EXISTS assets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            type TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_assets_project ON assets(project_id, created_at);
+        CREATE TABLE IF NOT EXISTS render_jobs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            shot_id TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON render_jobs(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_project ON render_jobs(project_id, created_at);
+        CREATE TABLE IF NOT EXISTS reviews (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS deliveries (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        """
+        with self._lock, self._connect() as conn:
+            conn.executescript(schema)
+
+    @staticmethod
+    def _dump(model: BaseModel) -> str:
+        return json.dumps(model.model_dump(mode="json"), ensure_ascii=False)
+
+    @staticmethod
+    def _load(row: sqlite3.Row | None, model_type: type[T]) -> T | None:
+        if row is None:
+            return None
+        return model_type.model_validate_json(row["data"])
+
+    def save_project(self, project: Project) -> Project:
+        project.updated_at = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO projects(id,status,created_at,updated_at,data)
+                VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                status=excluded.status, updated_at=excluded.updated_at, data=excluded.data""",
+                (project.id, project.status.value, project.created_at, project.updated_at, self._dump(project)),
+            )
+        return project
+
+    def get_project(self, project_id: str) -> Project | None:
+        with self._connect() as conn:
+            return self._load(conn.execute("SELECT data FROM projects WHERE id=?", (project_id,)).fetchone(), Project)
+
+    def list_projects(self) -> list[Project]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM projects ORDER BY updated_at DESC").fetchall()
+        return [Project.model_validate_json(row["data"]) for row in rows]
+
+    def delete_project(self, project_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+            return cursor.rowcount > 0
+
+    def replace_shots(self, project_id: str, shots: Iterable[Shot]) -> list[Shot]:
+        items = list(shots)
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM shots WHERE project_id=?", (project_id,))
+            conn.executemany(
+                "INSERT INTO shots(id,project_id,ordinal,updated_at,data) VALUES(?,?,?,?,?)",
+                [(s.id, project_id, s.ordinal, s.updated_at, self._dump(s)) for s in items],
+            )
+        return items
+
+    def save_shot(self, shot: Shot) -> Shot:
+        shot.updated_at = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO shots(id,project_id,ordinal,updated_at,data) VALUES(?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,
+                updated_at=excluded.updated_at,data=excluded.data""",
+                (shot.id, shot.project_id, shot.ordinal, shot.updated_at, self._dump(shot)),
+            )
+        return shot
+
+    def get_shot(self, shot_id: str) -> Shot | None:
+        with self._connect() as conn:
+            return self._load(conn.execute("SELECT data FROM shots WHERE id=?", (shot_id,)).fetchone(), Shot)
+
+    def list_shots(self, project_id: str) -> list[Shot]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM shots WHERE project_id=? ORDER BY ordinal", (project_id,)).fetchall()
+        return [Shot.model_validate_json(row["data"]) for row in rows]
+
+    def save_asset(self, asset: Asset) -> Asset:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO assets(id,project_id,type,role,created_at,data) VALUES(?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET type=excluded.type,role=excluded.role,data=excluded.data""",
+                (asset.id, asset.project_id, asset.type.value, asset.role.value, asset.created_at, self._dump(asset)),
+            )
+        return asset
+
+    def get_asset(self, asset_id: str) -> Asset | None:
+        with self._connect() as conn:
+            return self._load(conn.execute("SELECT data FROM assets WHERE id=?", (asset_id,)).fetchone(), Asset)
+
+    def list_assets(self, project_id: str) -> list[Asset]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM assets WHERE project_id=? ORDER BY created_at", (project_id,)).fetchall()
+        return [Asset.model_validate_json(row["data"]) for row in rows]
+
+    def delete_asset(self, asset_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM assets WHERE id=?", (asset_id,))
+            return cursor.rowcount > 0
+
+    def save_job(self, job: RenderJob) -> RenderJob:
+        job.updated_at = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO render_jobs(id,project_id,shot_id,status,created_at,updated_at,data)
+                VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                status=excluded.status,updated_at=excluded.updated_at,data=excluded.data""",
+                (job.id, job.project_id, job.shot_id, job.status.value, job.created_at, job.updated_at, self._dump(job)),
+            )
+        return job
+
+    def get_job(self, job_id: str) -> RenderJob | None:
+        with self._connect() as conn:
+            return self._load(conn.execute("SELECT data FROM render_jobs WHERE id=?", (job_id,)).fetchone(), RenderJob)
+
+    def list_jobs(self, project_id: str | None = None) -> list[RenderJob]:
+        query = "SELECT data FROM render_jobs"
+        params: tuple[str, ...] = ()
+        if project_id:
+            query += " WHERE project_id=?"
+            params = (project_id,)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [RenderJob.model_validate_json(row["data"]) for row in rows]
+
+    def claim_next_job(self) -> RenderJob | None:
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT data FROM render_jobs WHERE status=? ORDER BY created_at LIMIT 1",
+                (JobStatus.QUEUED.value,),
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            job = RenderJob.model_validate_json(row["data"])
+            job.status = JobStatus.SUBMITTING
+            job.started_at = job.started_at or utc_now()
+            job.attempt += 1
+            job.updated_at = utc_now()
+            conn.execute(
+                "UPDATE render_jobs SET status=?,updated_at=?,data=? WHERE id=?",
+                (job.status.value, job.updated_at, self._dump(job), job.id),
+            )
+            conn.commit()
+            return job
+
+    def recover_interrupted_jobs(self) -> int:
+        recovered = 0
+        for job in self.list_jobs():
+            if job.status in {JobStatus.SUBMITTING, JobStatus.RUNNING}:
+                job.status = JobStatus.QUEUED
+                job.error = "Recovered after backend restart"
+                self.save_job(job)
+                recovered += 1
+        return recovered
+
+    def save_review(self, review: Review) -> Review:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO reviews(id,project_id,target_id,created_at,data) VALUES(?,?,?,?,?)",
+                (review.id, review.project_id, review.target_id, review.created_at, self._dump(review)),
+            )
+        return review
+
+    def list_reviews(self, project_id: str) -> list[Review]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM reviews WHERE project_id=? ORDER BY created_at", (project_id,)).fetchall()
+        return [Review.model_validate_json(row["data"]) for row in rows]
+
+    def save_delivery(self, delivery: Delivery) -> Delivery:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO deliveries(id,project_id,created_at,data) VALUES(?,?,?,?)",
+                (delivery.id, delivery.project_id, delivery.created_at, self._dump(delivery)),
+            )
+        return delivery
+
+    def list_deliveries(self, project_id: str) -> list[Delivery]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM deliveries WHERE project_id=? ORDER BY created_at DESC", (project_id,)).fetchall()
+        return [Delivery.model_validate_json(row["data"]) for row in rows]

@@ -1,158 +1,576 @@
 import asyncio
 import base64
+import json
+import logging
 import random
 from pathlib import Path
-from typing import List
+from typing import Any
+
 import aiofiles
+import httpx
 from volcenginesdkarkruntime import Ark
+
 from src.video_workflow.config import settings
-from src.video_workflow.types import Scene
 from src.video_workflow.generators.base import ImageGenerator
+from src.video_workflow.types import Scene
+
+logger = logging.getLogger(__name__)
+
+GRSAI_MODELS: list[dict[str, str]] = [
+    {"id": "gpt-image-2", "label": "gpt-image-2", "description": "GPT Image 2，适合中文提示词与角色构图"},
+    {"id": "gpt-image-2-vip", "label": "gpt-image-2-vip", "description": "GPT Image 2 高质量版本，支持更高分辨率"},
+    {"id": "nano-banana-fast", "label": "nano-banana-fast", "description": "速度优先，适合批量分镜快速出图"},
+    {"id": "nano-banana", "label": "nano-banana", "description": "平衡质量与速度的标准模型"},
+    {"id": "nano-banana-2", "label": "nano-banana-2", "description": "新版本 Nano Banana，支持更高规格参数"},
+    {"id": "nano-banana-pro", "label": "nano-banana-pro", "description": "质量优先，适合关键画面"},
+    {"id": "nano-banana-pro-vt", "label": "nano-banana-pro-vt", "description": "高质量 Pro 变体"},
+    {"id": "nano-banana-pro-cl", "label": "nano-banana-pro-cl", "description": "高质量 Pro 变体"},
+    {"id": "nano-banana-pro-vip", "label": "nano-banana-pro-vip", "description": "支持更高规格输出的 VIP 版本"},
+    {"id": "nano-banana-pro-4k-vip", "label": "nano-banana-pro-4k-vip", "description": "4K 输出专用 VIP 版本"},
+]
+
+GRSAI_IMAGE_SIZE_SUPPORTED_MODELS = {
+    "nano-banana-2",
+    "nano-banana-pro",
+    "nano-banana-pro-vt",
+    "nano-banana-pro-cl",
+    "nano-banana-pro-vip",
+    "nano-banana-pro-4k-vip",
+}
+
+GRSAI_GPT_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2-vip"}
+
+GRSAI_SUCCESS_STATUSES = {"success", "succeeded", "completed", "complete", "done", "finished"}
+GRSAI_FAILURE_STATUSES = {"failed", "failure", "error", "cancelled", "canceled"}
+
+GRSAI_GPT_IMAGE_ASPECT_RATIOS = {
+    "1:1": "1024x1024",
+    "16:9": "1672x941",
+    "9:16": "941x1672",
+    "4:3": "1443x1090",
+    "3:4": "1090x1443",
+    "3:2": "1536x1024",
+    "2:3": "1024x1536",
+    "5:4": "1408x1120",
+    "4:5": "1120x1408",
+    "21:9": "1920x832",
+}
+
+
+def grsai_image_endpoint(model: str) -> str:
+    """Return the GRSAI legacy endpoint matching the configured image family."""
+    return "/v1/draw/completions" if model in GRSAI_GPT_IMAGE_MODELS else "/v1/draw/nano-banana"
+
+
+def grsai_image_aspect_ratio(model: str, aspect_ratio: str | None) -> str:
+    resolved = aspect_ratio or settings.IMAGE_ASPECT_RATIO or "auto"
+    if model in GRSAI_GPT_IMAGE_MODELS:
+        return GRSAI_GPT_IMAGE_ASPECT_RATIOS.get(resolved, resolved)
+    return resolved
+
+
+def resolve_image_provider(provider: str | None = None) -> str:
+    resolved_provider = (provider or settings.IMAGE_PROVIDER or "ark").strip().lower()
+    if resolved_provider not in {"ark", "grsai"}:
+        raise ValueError(f"Unsupported image provider: {resolved_provider}")
+    return resolved_provider
+
+
+def resolve_image_model(provider: str | None = None, model: str | None = None) -> str:
+    resolved_provider = resolve_image_provider(provider)
+    if model and model.strip():
+        return model.strip()
+
+    if resolved_provider == "grsai":
+        return settings.GRSAI_IMAGE_MODEL
+
+    return settings.ARK_IMAGE_MODEL
+
+
+def get_image_provider_catalog() -> list[dict[str, Any]]:
+    return [
+        {
+            "provider": "ark",
+            "label": "Volcengine Ark",
+            "description": "使用方舟图像能力生成分镜首帧。",
+            "default_model": settings.ARK_IMAGE_MODEL,
+            "api_key_env": "ARK_API_KEY",
+            "models": [
+                {
+                    "id": settings.ARK_IMAGE_MODEL,
+                    "label": settings.ARK_IMAGE_MODEL,
+                    "description": "当前通过 ARK_IMAGE_MODEL 配置的方舟图像模型。",
+                }
+            ],
+        },
+        {
+            "provider": "grsai",
+            "label": "GRSAI Nano Banana",
+            "description": "使用 GRSAI 的 Nano Banana 系列接口生成图像。",
+            "default_model": settings.GRSAI_IMAGE_MODEL,
+            "api_key_env": "GRSAI_API_KEY",
+            "models": GRSAI_MODELS,
+        },
+    ]
+
+
+def create_image_generator(image_provider: str | None = None, model: str | None = None) -> ImageGenerator:
+    resolved_provider = resolve_image_provider(image_provider)
+    resolved_model = resolve_image_model(resolved_provider, model)
+
+    if resolved_provider == "grsai":
+        return GrsaiImageGenerator(model=resolved_model)
+
+    return ArkImageGenerator(model=resolved_model)
+
+
+def _build_image_prompt(
+    scene: Scene,
+    character_description: str | None = None,
+    image_style: str | None = None,
+) -> str:
+    prompt = scene.visual_prompt
+    resolved_character_description = character_description or settings.CHARACTER_DESCRIPTION
+    resolved_image_style = image_style if image_style is not None else settings.IMAGE_STYLE
+
+    if resolved_character_description:
+        prompt = f"【角色特征】{resolved_character_description}。\n【场景描述】{prompt}"
+
+    if resolved_image_style:
+        prompt = f"{prompt}。\n【画面风格】{resolved_image_style}"
+
+    return prompt
+
+
+def _collect_reference_sources(reference_image_path: str | None) -> list[str]:
+    if not reference_image_path:
+        return []
+
+    collected: list[str] = []
+    raw_sources = [segment.strip() for segment in reference_image_path.split(",") if segment.strip()]
+
+    for source in raw_sources:
+        if source.startswith(("http://", "https://", "data:")):
+            collected.append(source)
+            continue
+
+        path = Path(source)
+        if path.is_dir():
+            image_files = sorted(path.glob("*.png")) + sorted(path.glob("*.jpg")) + sorted(path.glob("*.jpeg"))
+            for image_file in image_files:
+                collected.append(str(image_file))
+                if len(collected) >= 10:
+                    return collected
+            continue
+
+        if path.exists():
+            collected.append(str(path))
+            if len(collected) >= 10:
+                return collected
+            continue
+
+        logger.warning("Reference image path does not exist: %s", source)
+
+    return collected[:10]
+
+
+def _encode_local_image(path: Path) -> tuple[str | None, str | None]:
+    try:
+        with open(path, "rb") as file_handle:
+            image_bytes = file_handle.read()
+    except Exception as exc:
+        logger.warning("Failed to load reference image %s: %s", path, exc)
+        return None, None
+
+    suffix = path.suffix.lower()
+    mime_type = "image/png" if suffix == ".png" else "image/jpeg"
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    return mime_type, image_b64
+
+
+def _generated_image_suffix(content: bytes) -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return ".webp"
+    return ".img"
+
+
+def _normalized_grsai_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _decode_grsai_response(response: httpx.Response, operation: str) -> dict[str, Any]:
+    """Decode regular JSON plus GRSAI event-stream/JSONL responses."""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    body = response.text.lstrip("\ufeff").strip()
+    if not body:
+        content_type = response.headers.get("content-type", "unknown")
+        raise RuntimeError(
+            f"GRSAI {operation} returned an empty response "
+            f"(status={response.status_code}, content_type={content_type})"
+        )
+
+    if body.startswith(("http://", "https://")):
+        return {"status": "succeeded", "results": [{"url": body}]}
+
+    # The GPT Image endpoint may emit multiple ``data: {...}`` events. Decode
+    # each top-level JSON value and prefer the newest event containing a URL.
+    decoder = json.JSONDecoder()
+    candidates: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(body):
+        object_start = min(
+            (index for index in (body.find("{", cursor), body.find("[", cursor)) if index >= 0),
+            default=-1,
+        )
+        if object_start < 0:
+            break
+        try:
+            value, consumed = decoder.raw_decode(body[object_start:])
+        except json.JSONDecodeError:
+            cursor = object_start + 1
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.append({"status": "succeeded", "results": value})
+        cursor = object_start + consumed
+
+    if candidates:
+        for candidate in reversed(candidates):
+            if GrsaiImageGenerator._extract_result_url(candidate, required=False):
+                return candidate
+        return candidates[-1]
+
+    content_type = response.headers.get("content-type", "unknown")
+    preview = body[:240].replace("\n", " ")
+    raise RuntimeError(
+        f"GRSAI {operation} returned an unrecognized response "
+        f"(status={response.status_code}, content_type={content_type}, body={preview})"
+    )
+
 
 class ArkImageGenerator(ImageGenerator):
-    def __init__(self):
+    def __init__(self, model: str | None = None):
+        if not settings.ARK_API_KEY:
+            raise ValueError("ARK_API_KEY is not configured")
         self.client = Ark(
             api_key=settings.ARK_API_KEY,
-            base_url=settings.ARK_BASE_URL
+            base_url=settings.ARK_BASE_URL,
         )
-        self.model = settings.ARK_IMAGE_MODEL
-        
-        # Generate a session seed for consistency if not configured
+        self.model = model or settings.ARK_IMAGE_MODEL
+
         seed_str = settings.IMAGE_SEED
         if seed_str and seed_str.strip():
             self._session_seed = int(seed_str.strip())
         else:
             self._session_seed = random.randint(1, 999999999)
-        print(f"🎲 图像生成种子 (Seed): {self._session_seed}")
-        
-        # Aspect ratio mapping
+        logger.info("Image seed initialized: %s", self._session_seed)
+
         self.aspect_ratio_sizes = {
-            "1:1": "2048x2048",    # 正方形 (4,194,304 pixels)
-            "16:9": "2560x1440",   # 横向 (3,686,400 pixels)
-            "9:16": "1440x2560",   # 竖向 (3,686,400 pixels)
-            "4:3": "2304x1728",    # 横向 4:3 (3,981,312 pixels)
-            "3:4": "1728x2304",    # 竖向 3:4 (3,981,312 pixels)
+            "1:1": "2048x2048",
+            "16:9": "2560x1440",
+            "9:16": "1440x2560",
+            "4:3": "2304x1728",
+            "3:4": "1728x2304",
         }
 
     async def generate_image(
-        self, 
-        scene: Scene, 
+        self,
+        scene: Scene,
         output_dir: str,
         reference_image_path: str | None = None,
-        seed: int | None = None
+        seed: int | None = None,
+        character_description: str | None = None,
+        image_style: str | None = None,
+        aspect_ratio: str | None = None,
     ) -> str:
         loop = asyncio.get_running_loop()
-        
-        # Get size from aspect ratio
-        size = self.aspect_ratio_sizes.get(settings.IMAGE_ASPECT_RATIO, "2048x1800")
-        
-        # Build enhanced prompt with character description prefix
-        prompt = scene.visual_prompt
-        
-        # 1. Add character description prefix for consistency
-        if settings.CHARACTER_DESCRIPTION:
-            prompt = f"【角色特征】{settings.CHARACTER_DESCRIPTION}。\n【场景描述】{prompt}"
-        
-        # 2. Add style suffix
-        if settings.IMAGE_STYLE:
-            prompt = f"{prompt}。\n【画面风格】{settings.IMAGE_STYLE}"
+        size = self.aspect_ratio_sizes.get(aspect_ratio or settings.IMAGE_ASPECT_RATIO, "2048x1800")
+        prompt = _build_image_prompt(scene, character_description, image_style)
 
         def _generate():
-            # Build request parameters
             params = {
                 "model": self.model,
                 "prompt": prompt,
                 "size": size,
-                "response_format": "b64_json"
+                "response_format": "b64_json",
             }
-            
-            # 3. Add seed for consistency (use passed seed or session seed)
-            # Note: Using extra_body to pass seed parameter
+
             current_seed = seed if seed is not None else self._session_seed
             extra_body = {
                 "seed": current_seed,
-                "watermark": False  # 去除AI生成水印
+                "watermark": False,
             }
-            
-            # 4. Add reference images if provided (支持多图融合)
+
             if reference_image_path:
                 ref_images = self._load_reference_images(reference_image_path)
                 if ref_images:
                     extra_body["reference_images"] = ref_images
                     extra_body["reference_weight"] = settings.IMAGE_STYLE_WEIGHT
-                    # Use character mode for better identity preservation
                     extra_body["reference_mode"] = "character"
-                    print(f"✅ 使用 {len(ref_images)} 张参考图 (权重: {settings.IMAGE_STYLE_WEIGHT}, 模式: character)")
-            
-            if extra_body:
-                params["extra_body"] = extra_body
-            
+                    logger.info(
+                        "Using %s reference images with weight %.2f for Ark generation",
+                        len(ref_images),
+                        settings.IMAGE_STYLE_WEIGHT,
+                    )
+
+            params["extra_body"] = extra_body
             return self.client.images.generate(**params)
-        
+
         try:
             response = await loop.run_in_executor(None, _generate)
-        except Exception as e:
-            raise RuntimeError(f"Ark Image Gen Failed: {e}")
+        except Exception as exc:
+            raise RuntimeError(f"Ark image generation failed: {exc}") from exc
 
-        # Extract Image Data
         try:
             b64_data = response.data[0].b64_json
             image_content = base64.b64decode(b64_data)
-        except Exception as e:
-            raise RuntimeError(f"Failed to parse image response: {e}. Response: {response}")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to parse Ark image response: {exc}") from exc
 
-        # Save to file
-        filename = f"{scene.id}_keyframe.png"
-        filepath = Path(output_dir) / filename
-        
-        async with aiofiles.open(filepath, "wb") as f:
-            await f.write(image_content)
-            
+        filepath = Path(output_dir) / f"{scene.id}_keyframe{_generated_image_suffix(image_content)}"
+        async with aiofiles.open(filepath, "wb") as file_handle:
+            await file_handle.write(image_content)
+
         return str(filepath)
-    
-    def _load_reference_images(self, ref_path: str) -> List[dict]:
-        """
-        Load reference images. Supports:
-        - Single image path: "references/dog.png"
-        - Multiple images (comma-separated): "references/dog1.png,references/dog2.png"
-        - Directory with images: "references/" (loads all .jpg/.png files)
-        """
-        ref_images = []
-        path = Path(ref_path)
-        
-        if path.is_dir():
-            # Load all images from directory
-            image_files = list(path.glob("*.png")) + list(path.glob("*.jpg")) + list(path.glob("*.jpeg"))
-            for img_file in image_files[:10]:  # Max 10 images
-                ref_images.append(self._encode_image(img_file))
-        elif "," in ref_path:
-            # Multiple comma-separated paths
-            for single_path in ref_path.split(","):
-                single_path = single_path.strip()
-                if Path(single_path).exists():
-                    ref_images.append(self._encode_image(Path(single_path)))
-        elif path.exists():
-            # Single image
-            ref_images.append(self._encode_image(path))
-        else:
-            print(f"⚠️  参考图不存在: {ref_path}")
-        
-        return [img for img in ref_images if img is not None]
-    
-    def _encode_image(self, path: Path) -> dict | None:
-        """Encode image to base64 format for API"""
+
+    def _load_reference_images(self, reference_image_path: str) -> list[dict[str, str]]:
+        ref_images: list[dict[str, str]] = []
+
+        for source in _collect_reference_sources(reference_image_path):
+            if source.startswith(("http://", "https://", "data:")):
+                ref_images.append({"url": source, "role": "character"})
+                continue
+
+            mime_type, image_b64 = _encode_local_image(Path(source))
+            if image_b64:
+                ref_images.append(
+                    {
+                        "url": f"data:{mime_type};base64,{image_b64}",
+                        "role": "character",
+                    }
+                )
+
+        return ref_images
+
+
+class GrsaiImageGenerator(ImageGenerator):
+    def __init__(self, model: str | None = None):
+        if not settings.GRSAI_API_KEY:
+            raise ValueError("GRSAI_API_KEY is not configured")
+
+        self.api_key = settings.GRSAI_API_KEY
+        self.base_url = settings.GRSAI_BASE_URL.rstrip("/")
+        self.model = model or settings.GRSAI_IMAGE_MODEL
+
+    async def generate_image(
+        self,
+        scene: Scene,
+        output_dir: str,
+        reference_image_path: str | None = None,
+        seed: int | None = None,
+        character_description: str | None = None,
+        image_style: str | None = None,
+        aspect_ratio: str | None = None,
+    ) -> str:
+        del seed
+
+        resolved_aspect_ratio = grsai_image_aspect_ratio(self.model, aspect_ratio)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "prompt": _build_image_prompt(scene, character_description, image_style),
+            "aspectRatio": resolved_aspect_ratio,
+            "shutProgress": True,
+        }
+
+        image_size = self._resolve_image_size() if self.model not in GRSAI_GPT_IMAGE_MODELS else None
+        if image_size:
+            payload["imageSize"] = image_size
+
+        reference_urls = self._load_reference_inputs(reference_image_path)
+        if reference_urls:
+            payload["urls"] = reference_urls
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        endpoint = grsai_image_endpoint(self.model)
+        timeout = httpx.Timeout(
+            connect=20.0,
+            read=float(settings.IMAGE_GENERATION_TIMEOUT_SECONDS),
+            write=60.0,
+            pool=60.0,
+        )
+        async with httpx.AsyncClient(base_url=self.base_url, headers=headers, timeout=timeout) as client:
+            try:
+                logger.info(
+                    "GRSAI image request: model=%s endpoint=%s aspect_ratio=%s references=%s",
+                    self.model,
+                    endpoint,
+                    resolved_aspect_ratio,
+                    len(reference_urls),
+                )
+                submit_response = await client.post(endpoint, json=payload)
+                submit_response.raise_for_status()
+                submit_data = _decode_grsai_response(submit_response, "image submit")
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else "unknown"
+                body_preview = ""
+                if exc.response is not None:
+                    response_text = exc.response.text or ""
+                    if response_text:
+                        body_preview = response_text[:300]
+                details = f"status={status_code}"
+                if body_preview:
+                    details += f", body={body_preview}"
+                raise RuntimeError(f"GRSAI image submit failed ({details})") from exc
+            except httpx.TimeoutException as exc:
+                raise RuntimeError(
+                    f"GRSAI image submit failed (timeout after {settings.IMAGE_GENERATION_TIMEOUT_SECONDS}s): {type(exc).__name__}"
+                ) from exc
+            except httpx.RequestError as exc:
+                request_url = str(exc.request.url) if exc.request is not None else self.base_url
+                raise RuntimeError(
+                    f"GRSAI image submit failed (request_error={type(exc).__name__}, url={request_url}): {exc}"
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(f"GRSAI image submit failed ({type(exc).__name__}): {exc}") from exc
+
+            task_state = self._extract_task_state(submit_data)
+            result_data = await self._wait_for_result(client, task_state)
+
+            result_url = self._extract_result_url(result_data)
         try:
-            with open(path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode("utf-8")
-            
-            # Determine MIME type
-            suffix = path.suffix.lower()
-            mime_type = "image/png" if suffix == ".png" else "image/jpeg"
-            
-            return {
-                "url": f"data:{mime_type};base64,{img_b64}",
-                "role": "character"  # 指定为角色参考图
-            }
-        except Exception as e:
-            print(f"⚠️  无法加载参考图 {path}: {e}")
+            async with httpx.AsyncClient(timeout=timeout) as download_client:
+                image_response = await download_client.get(result_url)
+                image_response.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to download GRSAI image: {exc}") from exc
+
+        filepath = Path(output_dir) / f"{scene.id}_keyframe{_generated_image_suffix(image_response.content)}"
+        async with aiofiles.open(filepath, "wb") as file_handle:
+            await file_handle.write(image_response.content)
+
+        return str(filepath)
+
+    def _resolve_image_size(self) -> str | None:
+        if self.model not in GRSAI_IMAGE_SIZE_SUPPORTED_MODELS:
             return None
+
+        configured_size = settings.GRSAI_IMAGE_SIZE.upper().strip()
+        if self.model == "nano-banana-pro-4k-vip":
+            return "4K"
+
+        if self.model == "nano-banana-pro-vip" and configured_size not in {"1K", "2K"}:
+            return "1K"
+
+        if configured_size not in {"1K", "2K", "4K"}:
+            return "1K"
+
+        return configured_size
+
+    def _load_reference_inputs(self, reference_image_path: str | None) -> list[str]:
+        reference_inputs: list[str] = []
+        for source in _collect_reference_sources(reference_image_path):
+            if source.startswith(("http://", "https://", "data:")):
+                reference_inputs.append(source)
+                continue
+
+            _, image_b64 = _encode_local_image(Path(source))
+            if image_b64:
+                reference_inputs.append(image_b64)
+
+        return reference_inputs
+
+    def _extract_task_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if "code" in payload and payload.get("code") != 0:
+            raise RuntimeError(payload.get("error") or payload.get("msg") or "GRSAI request failed")
+
+        if "status" in payload:
+            return payload
+
+        if self._extract_result_url(payload, required=False):
+            return {**payload, "status": "succeeded"}
+
+        data = payload.get("data")
+        if isinstance(data, dict):
+            if data.get("status") or data.get("id") or data.get("task_id"):
+                return data
+
+        raise RuntimeError(f"Unexpected GRSAI response: {payload}")
+
+    async def _wait_for_result(self, client: httpx.AsyncClient, task_state: dict[str, Any]) -> dict[str, Any]:
+        status = _normalized_grsai_status(task_state.get("status"))
+        if self._extract_result_url(task_state, required=False) or status in GRSAI_SUCCESS_STATUSES:
+            return task_state
+        if status in GRSAI_FAILURE_STATUSES:
+            raise RuntimeError(self._format_failure_message(task_state))
+
+        task_id = task_state.get("task_id") or task_state.get("id")
+        if not task_id:
+            raise RuntimeError(f"Missing GRSAI task id in response: {task_state}")
+
+        while True:
+            await asyncio.sleep(settings.GRSAI_RESULT_POLL_INTERVAL_SECONDS)
+
+            try:
+                result_response = await client.post("/v1/draw/result", json={"id": task_id})
+                result_response.raise_for_status()
+                result_payload = _decode_grsai_response(result_response, "result polling")
+            except Exception as exc:
+                raise RuntimeError(f"GRSAI result polling failed: {exc}") from exc
+
+            result_code = result_payload.get("code")
+            if result_code == -22:
+                logger.info("GRSAI task %s is not ready yet, retrying...", task_id)
+                continue
+            if "code" in result_payload and result_code not in {0, None}:
+                raise RuntimeError(result_payload.get("msg") or "GRSAI result query failed")
+
+            result_data = result_payload.get("data") if isinstance(result_payload.get("data"), dict) else result_payload
+            status = _normalized_grsai_status(result_data.get("status"))
+            if self._extract_result_url(result_data, required=False) or status in GRSAI_SUCCESS_STATUSES:
+                return result_data
+            if status in GRSAI_FAILURE_STATUSES:
+                raise RuntimeError(self._format_failure_message(result_data))
+
+    @staticmethod
+    def _extract_result_url(result_data: dict[str, Any], required: bool = True) -> str:
+        if isinstance(result_data.get("url"), str) and result_data["url"]:
+            return result_data["url"]
+        for key in ("results", "result", "output", "data"):
+            nested = result_data.get(key)
+            if isinstance(nested, dict):
+                nested_url = GrsaiImageGenerator._extract_result_url(nested, required=False)
+                if nested_url:
+                    return nested_url
+            if isinstance(nested, list):
+                for item in nested:
+                    if isinstance(item, dict):
+                        nested_url = GrsaiImageGenerator._extract_result_url(item, required=False)
+                        if nested_url:
+                            return nested_url
+                    elif isinstance(item, str) and item.startswith(("http://", "https://")):
+                        return item
+        if required:
+            raise RuntimeError(f"GRSAI returned no image url: {result_data}")
+        return ""
+
+    def _format_failure_message(self, result_data: dict[str, Any]) -> str:
+        failure_reason = result_data.get("failure_reason") or "error"
+        error_detail = result_data.get("error") or "Unknown error"
+        return f"GRSAI image generation failed ({failure_reason}): {error_detail}"

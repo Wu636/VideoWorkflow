@@ -63,7 +63,9 @@ async def analyze_image(file: UploadFile = File(...)):
                 style=result.get("style")
             )
         else:
-            raise HTTPException(status_code=500, detail="Failed to analyze image. Check if GLM or ARK API is configured.")
+            # Graceful degradation: analysis is optional for workflow.
+            # When GLM is unavailable, we still allow reference-image driven generation.
+            return AnalyzeResponse(character=None, style=None)
             
     except HTTPException:
         raise

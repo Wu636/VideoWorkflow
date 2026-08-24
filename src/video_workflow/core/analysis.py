@@ -1,6 +1,8 @@
 """
 Reference image analysis module.
-Uses multimodal LLMs (GLM or Doubao) to extract character description and visual style.
+Uses Ark multimodal model to extract character description and visual style.
+
+GLM fallback is intentionally disabled.
 """
 
 import asyncio
@@ -47,18 +49,18 @@ async def analyze_reference_image(image_path: str) -> dict | None:
     
     loop = asyncio.get_running_loop()
     
-    # Method 1: Try GLM first (better multimodal support)
-    if settings.GLM_API_KEY:
+    ext = image_file.suffix.lower()
+    mime_type = "image/png" if ext == ".png" else "image/jpeg"
+
+    # Only method: Ark multimodal with ARK_LLM_MODEL
+    if settings.ARK_API_KEY:
         try:
-            from zhipuai import ZhipuAI
-            client = ZhipuAI(api_key=settings.GLM_API_KEY)
-            
-            def _call_glm():
-                ext = image_file.suffix.lower()
-                mime_type = "image/png" if ext == ".png" else "image/jpeg"
-                
+            from volcenginesdkarkruntime import Ark
+            client = Ark(api_key=settings.ARK_API_KEY, base_url=settings.ARK_BASE_URL)
+
+            def _call_ark_multimodal():
                 response = client.chat.completions.create(
-                    model=settings.GLM_MODEL,
+                    model=settings.ARK_LLM_MODEL,
                     messages=[
                         {
                             "role": "user",
@@ -67,51 +69,20 @@ async def analyze_reference_image(image_path: str) -> dict | None:
                                 {"type": "text", "text": analysis_prompt}
                             ]
                         }
-                    ],
-                    stream=False
-                )
-                return response.choices[0].message.content
-            
-            logger.info(f"Analyzing image with GLM ({settings.GLM_MODEL})...")
-            result = await loop.run_in_executor(None, _call_glm)
-            
-            if result:
-                return _parse_json_result(result)
-                
-        except Exception as e:
-            logger.warning(f"GLM analysis failed: {e}, trying Doubao...")
-    
-    # Method 2: Fallback to Doubao Vision
-    if settings.ARK_API_KEY:
-        try:
-            from volcenginesdkarkruntime import Ark
-            client = Ark(api_key=settings.ARK_API_KEY, base_url=settings.ARK_BASE_URL)
-            
-            def _call_doubao():
-                response = client.chat.completions.create(
-                    model=settings.ARK_VISION_MODEL,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                                {"type": "text", "text": analysis_prompt}
-                            ]
-                        }
                     ]
                 )
                 return response.choices[0].message.content
-            
-            logger.info(f"Analyzing image with Doubao Vision ({settings.ARK_VISION_MODEL})...")
-            result = await loop.run_in_executor(None, _call_doubao)
-            
+
+            logger.info(f"Analyzing image with Ark multimodal ({settings.ARK_LLM_MODEL})...")
+            result = await loop.run_in_executor(None, _call_ark_multimodal)
+
             if result:
                 return _parse_json_result(result)
-                
+
         except Exception as e:
-            logger.warning(f"Doubao analysis failed: {e}")
-    
-    logger.error("No multimodal API configured (GLM or ARK)")
+            logger.warning(f"Ark multimodal analysis failed: {e}")
+
+    logger.error("No multimodal API configured (requires ARK_API_KEY).")
     return None
 
 

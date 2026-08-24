@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   backend:
     build:
@@ -11,10 +9,12 @@ services:
       - ./outputs:/app/outputs # Persist outputs
       - ./src:/app/src # Hot reload support (optional if mapped correctly with volume/reload)
     environment:
-      - GLM_API_KEY=${GLM_API_KEY}
-      - ARK_API_KEY=${ARK_API_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - OUTPUT_DIR=/app/outputs
+      - DATABASE_PATH=/app/outputs/video_workflow.sqlite3
+      - PROJECTS_DIR=/app/outputs/projects
+      - COMFYUI_BASE_URL=${COMFYUI_BASE_URL:-http://host.docker.internal:6006}
+      - COMFYUI_API_TOKEN=${COMFYUI_API_TOKEN:-}
+      - COMFYUI_HOURLY_RATE=${COMFYUI_HOURLY_RATE:-3.03}
     env_file:
       - .env
 
@@ -22,12 +22,14 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8001/api}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost:3002}
     ports:
       - "3002:3002"
     environment:
-      - NEXT_PUBLIC_API_URL=http://backend:8001/api
+      # This URL is consumed by the browser, so it must use the published host port.
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8001/api}
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3002}
     depends_on:
       - backend
-
-volumes:
-  outputs:

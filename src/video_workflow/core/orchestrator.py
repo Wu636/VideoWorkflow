@@ -5,35 +5,57 @@ from typing import List
 
 from src.video_workflow.config import settings
 from src.video_workflow.types import Storyboard, Scene, GenerationStatus
+from src.video_workflow.generators.base import ImageGenerator
 from src.video_workflow.generators.llm import DeepSeekGenerator, GLMGenerator, ArkLLMGenerator
-from src.video_workflow.generators.image import ArkImageGenerator
-from src.video_workflow.generators.video import ArkVideoGenerator
+from src.video_workflow.generators.image import create_image_generator
+from src.video_workflow.generators.video import create_video_generator
 
 logger = logging.getLogger(__name__)
 
+
+def _is_timeout_like_error(error: Exception) -> bool:
+    if isinstance(error, asyncio.TimeoutError):
+        return True
+    text = str(error).lower()
+    return "timeout" in text or "timed out" in text or "超时" in text
+
+def create_llm_generator(provider: str | None = None):
+    resolved = (provider or settings.LLM_PROVIDER or "deepseek").strip().lower()
+    if resolved in {"default", "auto"}:
+        resolved = settings.LLM_PROVIDER
+    if resolved == "glm":
+        return GLMGenerator()
+    if resolved in {"ark_doubao", "ark_deepseek", "ark"}:
+        return ArkLLMGenerator()
+    return DeepSeekGenerator()
+
+
 class WorkflowOrchestrator:
-    def __init__(self):
-        # Select LLM based on configuration
-        if settings.LLM_PROVIDER == "glm":
-            self.llm = GLMGenerator()
-        elif settings.LLM_PROVIDER in ("ark_doubao", "ark_deepseek", "ark"):
-            self.llm = ArkLLMGenerator()
-        else:
-            self.llm = DeepSeekGenerator()
+    def __init__(self, llm_provider: str | None = None):
+        self.llm = create_llm_generator(llm_provider)
         
-        self.image_gen = None
         self.video_gen = None
         
         self.output_dir = settings.OUTPUT_DIR
         self.output_dir.mkdir(exist_ok=True)
 
+    def _new_session_id(self) -> str:
+        from datetime import datetime
+        return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
     async def initialize(self):
         """Lazy initialization of generators that might require async setup or valid keys."""
         try:
-            self.image_gen = ArkImageGenerator()
-            self.video_gen = ArkVideoGenerator()
+            self.video_gen = create_video_generator()
         except Exception as e:
             logger.warning(f"Failed to init generators (likely missing keys): {e}")
+
+    def _build_image_generator(
+        self,
+        image_provider: str | None = None,
+        image_model: str | None = None,
+    ) -> ImageGenerator:
+        return create_image_generator(image_provider=image_provider, model=image_model)
 
     def _get_or_create_seed(self, session_dir: Path) -> int:
         """Get existing seed from session.json or generate a new one."""
@@ -72,9 +94,18 @@ class WorkflowOrchestrator:
             
         return new_seed
 
-    async def process_scene(self, scene: Scene, session_dir: Path, reference_image: str | None = None, seed: int | None = None):
+    async def process_scene(
+        self,
+        scene: Scene,
+        session_dir: Path,
+        image_gen: ImageGenerator,
+        reference_image: str | None = None,
+        seed: int | None = None,
+        character_description: str | None = None,
+        image_style: str | None = None,
+    ):
         """Pipeline for a single scene: Image -> Video"""
-        if not self.image_gen or not self.video_gen:
+        if not self.video_gen:
             logger.error("生成器未初始化")
             scene.error_message = "生成器未初始化"
             scene.image_status = GenerationStatus.FAILED
@@ -87,7 +118,14 @@ class WorkflowOrchestrator:
             image_dir = session_dir / "images"
             image_dir.mkdir(exist_ok=True)
             
-            img_path = await self.image_gen.generate_image(scene, str(image_dir), reference_image, seed=seed)
+            img_path = await image_gen.generate_image(
+                scene,
+                str(image_dir),
+                reference_image,
+                seed=seed,
+                character_description=character_description,
+                image_style=image_style,
+            )
             scene.image_path = img_path
             scene.image_status = GenerationStatus.COMPLETED
         except Exception as e:
@@ -111,10 +149,20 @@ class WorkflowOrchestrator:
             scene.video_status = GenerationStatus.FAILED
             scene.error_message = str(e)
 
-    async def run(self, topic: str, count: int = 5, reference_image: str | None = None):
+    async def run(
+        self,
+        topic: str,
+        count: int = 5,
+        reference_image: str | None = None,
+        character_description: str | None = None,
+        image_style: str | None = None,
+        image_provider: str | None = None,
+        image_model: str | None = None,
+    ):
         await self.initialize()
+        image_gen = self._build_image_generator(image_provider=image_provider, image_model=image_model)
         
-        session_id = str(int(asyncio.get_event_loop().time()))
+        session_id = self._new_session_id()
         session_dir = self.output_dir / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
         
@@ -128,7 +176,13 @@ class WorkflowOrchestrator:
         # 1. Generate Storyboard
         try:
             logger.info("正在生成分镜脚本...")
-            storyboard = await self.llm.generate_storyboard(topic, count, reference_image)
+            storyboard = await self.llm.generate_storyboard(
+                topic,
+                count,
+                reference_image,
+                character_description=character_description,
+                image_style=image_style,
+            )
             
             # Save script
             with open(session_dir / "script.json", "w") as f:
@@ -142,7 +196,15 @@ class WorkflowOrchestrator:
         
         async def _bounded_process(scene: Scene):
             async with semaphore:
-                await self.process_scene(scene, session_dir, reference_image, seed=seed)
+                await self.process_scene(
+                    scene,
+                    session_dir,
+                    image_gen,
+                    reference_image,
+                    seed=seed,
+                    character_description=character_description,
+                    image_style=image_style,
+                )
         
         tasks = [_bounded_process(scene) for scene in storyboard.scenes]
         await asyncio.gather(*tasks)
@@ -150,15 +212,40 @@ class WorkflowOrchestrator:
         logger.info("工作流执行完成。")
         return session_dir
 
-    async def run_generation(self, storyboard: Storyboard, reference_image: str | None = None):
+    async def run_generation(
+        self,
+        storyboard: Storyboard,
+        reference_image: str | None = None,
+        character_description: str | None = None,
+        image_style: str | None = None,
+        image_provider: str | None = None,
+        image_model: str | None = None,
+    ):
         """
         仅执行图像和视频生成部分（用于审阅后继续执行）- 保留向后兼容
         """
-        session_dir, _ = await self.run_image_generation(storyboard, reference_image)
+        session_dir, _ = await self.run_image_generation(
+            storyboard,
+            reference_image,
+            character_description=character_description,
+            image_style=image_style,
+            image_provider=image_provider,
+            image_model=image_model,
+        )
         await self.run_video_generation(storyboard, session_dir)
         return session_dir
 
-    async def run_image_generation(self, storyboard: Storyboard, reference_image: str | None = None, existing_session_dir: str | None = None, scene_ids: list[int] | None = None):
+    async def run_image_generation(
+        self,
+        storyboard: Storyboard,
+        reference_image: str | None = None,
+        existing_session_dir: str | None = None,
+        scene_ids: list[int] | None = None,
+        character_description: str | None = None,
+        image_style: str | None = None,
+        image_provider: str | None = None,
+        image_model: str | None = None,
+    ):
         """
         仅生成图像（支持图像审阅工作流）
         
@@ -171,12 +258,13 @@ class WorkflowOrchestrator:
         Returns: (session_dir, success_flag)
         """
         await self.initialize()
+        image_gen = self._build_image_generator(image_provider=image_provider, image_model=image_model)
         
         # Create or use existing session directory
         if existing_session_dir:
             session_dir = Path(existing_session_dir)
         else:
-            session_id = str(int(asyncio.get_event_loop().time()))
+            session_id = self._new_session_id()
             session_dir = self.output_dir / session_id
             session_dir.mkdir(parents=True, exist_ok=True)
             
@@ -192,6 +280,13 @@ class WorkflowOrchestrator:
         # Save the reviewed script
         with open(session_dir / "script.json", "w") as f:
             f.write(storyboard.model_dump_json(indent=2))
+
+        persist_lock = asyncio.Lock()
+
+        async def _persist_storyboard_snapshot():
+            async with persist_lock:
+                with open(session_dir / "script.json", "w") as f:
+                    f.write(storyboard.model_dump_json(indent=2))
         
         logger.info(f"开始生成图像 (Session: {session_dir.name})")
         if reference_image:
@@ -209,31 +304,81 @@ class WorkflowOrchestrator:
         
         async def _bounded_image_gen(scene: Scene):
             async with semaphore:
-                if not self.image_gen:
-                    logger.error("生成器未初始化")
-                    scene.image_status = GenerationStatus.FAILED
-                    return
-                
-                try:
-                    logger.info(f"正在生成场景 {scene.id} 的首帧图像...")
-                    scene.image_status = GenerationStatus.PROCESSING
-                    image_dir = session_dir / "images"
-                    image_dir.mkdir(exist_ok=True)
-                    
-                    img_path = await self.image_gen.generate_image(scene, str(image_dir), reference_image, seed=current_seed)
-                    scene.image_path = img_path
-                    scene.image_status = GenerationStatus.COMPLETED
-                except Exception as e:
-                    logger.error(f"场景 {scene.id} 图像生成失败: {e}")
-                    scene.image_status = GenerationStatus.FAILED
-                    scene.error_message = str(e)
+                logger.info(f"正在生成场景 {scene.id} 的首帧图像...")
+                scene.image_status = GenerationStatus.PROCESSING
+                scene.error_message = None
+                image_dir = session_dir / "images"
+                image_dir.mkdir(exist_ok=True)
+
+                retry_count = max(settings.IMAGE_TIMEOUT_RETRY_COUNT, 0)
+                max_attempts = 1 + retry_count
+                retry_delay = max(settings.IMAGE_TIMEOUT_RETRY_DELAY_SECONDS, 0.0)
+                last_error: Exception | None = None
+
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        if attempt > 1:
+                            logger.info(
+                                "场景 %s 图像生成第 %s/%s 次尝试（超时自动重试）",
+                                scene.id,
+                                attempt,
+                                max_attempts,
+                            )
+
+                        img_path = await asyncio.wait_for(
+                            image_gen.generate_image(
+                                scene,
+                                str(image_dir),
+                                reference_image,
+                                seed=current_seed,
+                                character_description=character_description,
+                                image_style=image_style,
+                            ),
+                            timeout=settings.IMAGE_GENERATION_TIMEOUT_SECONDS,
+                        )
+                        scene.image_path = img_path
+                        scene.image_status = GenerationStatus.COMPLETED
+                        scene.error_message = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                        is_timeout_error = _is_timeout_like_error(e)
+
+                        if is_timeout_error and attempt < max_attempts:
+                            logger.warning(
+                                "场景 %s 图像生成超时，第 %s/%s 次尝试失败，%.1f 秒后自动重试",
+                                scene.id,
+                                attempt,
+                                max_attempts,
+                                retry_delay,
+                            )
+                            if retry_delay > 0:
+                                await asyncio.sleep(retry_delay)
+                            continue
+
+                        scene.image_status = GenerationStatus.FAILED
+                        if is_timeout_error:
+                            timeout_message = (
+                                f"图像生成超时（>{settings.IMAGE_GENERATION_TIMEOUT_SECONDS}秒），"
+                                f"已自动重试{retry_count}次仍失败，请稍后重试。"
+                            )
+                            logger.error(f"场景 {scene.id} {timeout_message}")
+                            scene.error_message = timeout_message
+                        else:
+                            logger.error(f"场景 {scene.id} 图像生成失败: {e}")
+                            scene.error_message = str(e)
+                        break
+
+                if last_error and scene.image_status != GenerationStatus.COMPLETED:
+                    logger.debug("场景 %s 最终失败原因: %s", scene.id, last_error)
+
+                await _persist_storyboard_snapshot()
         
         tasks = [_bounded_image_gen(scene) for scene in scenes_to_generate]
         await asyncio.gather(*tasks)
         
         # Save updated script
-        with open(session_dir / "script.json", "w") as f:
-            f.write(storyboard.model_dump_json(indent=2))
+        await _persist_storyboard_snapshot()
         
         # Check if all succeeded
         all_success = all(scene.image_status == GenerationStatus.COMPLETED for scene in storyboard.scenes)
@@ -241,7 +386,16 @@ class WorkflowOrchestrator:
         logger.info("图像生成完成。")
         return str(session_dir), all_success
 
-    async def run_video_generation(self, storyboard: Storyboard, session_dir: str, scene_ids: list[int] | None = None):
+    async def run_video_generation(
+        self,
+        storyboard: Storyboard,
+        session_dir: str,
+        scene_ids: list[int] | None = None,
+        retry_failed_only: bool = True,
+        video_provider: str | None = None,
+        video_model: str | None = None,
+        video_aspect_ratio: str | None = None,
+    ):
         """
         仅生成视频（在图像审阅后调用）
         
@@ -251,6 +405,11 @@ class WorkflowOrchestrator:
             scene_ids: 要生成视频的场景ID列表，None表示全部生成
         """
         await self.initialize()
+        self.video_gen = create_video_generator(
+            video_provider=video_provider,
+            model=video_model,
+            aspect_ratio=video_aspect_ratio,
+        )
         session_path = Path(session_dir)
         
         logger.info(f"开始生成视频 (Session: {session_path.name})")
@@ -259,8 +418,18 @@ class WorkflowOrchestrator:
         if scene_ids:
             scenes_to_generate = [s for s in storyboard.scenes if s.id in scene_ids and s.image_path]
             logger.info(f"选择性生成视频: 场景 {scene_ids}")
+        elif retry_failed_only:
+            scenes_to_generate = [
+                s for s in storyboard.scenes
+                if s.image_path and (not s.video_path or s.video_status == GenerationStatus.FAILED)
+            ]
+            logger.info("仅重试失败/缺失视频（复用已有首帧图）")
         else:
             scenes_to_generate = [s for s in storyboard.scenes if s.image_path]
+
+        if not scenes_to_generate:
+            logger.info("没有可生成的视频分镜（已存在视频或缺少首帧图）")
+            return
         
         # Generate videos concurrently
         semaphore = asyncio.Semaphore(settings.WORKFLOW_CONCURRENCY)
@@ -275,6 +444,7 @@ class WorkflowOrchestrator:
                 try:
                     logger.info(f"正在生成场景 {scene.id} 的视频片段...")
                     scene.video_status = GenerationStatus.PROCESSING
+                    scene.error_message = None
                     video_dir = session_path / "videos"
                     video_dir.mkdir(exist_ok=True)
                     

@@ -4,11 +4,13 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Save, Sparkles, Image as ImageIcon, Loader2, Wand2 } from "lucide-react";
 import { Storyboard, Scene } from "@/types";
-import { getScript, generateImages, updateScript, reviseScript } from "@/lib/api";
+import { getScript, updateScript, reviseScript } from "@/lib/api";
 
 interface ScriptEditorProps {
     sessionId: string;
 }
+
+const PENDING_IMAGE_GENERATION_KEY = "video-workflow:pending-image-generation";
 
 export default function ScriptEditor({ sessionId }: ScriptEditorProps) {
     const router = useRouter();
@@ -67,7 +69,7 @@ export default function ScriptEditor({ sessionId }: ScriptEditorProps) {
         // Ensure we save latest changes before generating
         try {
             if (storyboard) await updateScript(sessionId, storyboard);
-            await generateImages(sessionId);
+            sessionStorage.setItem(PENDING_IMAGE_GENERATION_KEY, sessionId);
             router.push(`/workspace/${sessionId}/visuals`);
         } catch (e) {
             alert("Failed to start generation: " + e);
@@ -147,23 +149,32 @@ export default function ScriptEditor({ sessionId }: ScriptEditorProps) {
                         <div className="flex-shrink-0 w-12 h-12 rounded-full bg-blue-600/20 flex items-center justify-center text-blue-400 font-bold border border-blue-500/30">
                             {scene.id}
                         </div>
-                        <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div className="flex-1 grid grid-cols-1 md:grid-cols-3 gap-6">
                             <div className="space-y-2">
-                                <label className="text-xs font-uppercase tracking-wider text-gray-500">Narrative & Dialogue</label>
+                                <label className="text-xs font-uppercase tracking-wider text-gray-500">Narrative (Optional)</label>
                                 <textarea
                                     className="w-full h-32 input-premium p-3 text-sm resize-none focus:ring-2 focus:ring-blue-500/50 outline-none transition-all"
                                     value={scene.narrative}
                                     onChange={(e) => handleSceneChange(scene.id, 'narrative', e.target.value)}
-                                    placeholder="Enter narrative description..."
+                                    placeholder="Optional narration/dialogue. Leave empty if you only need visual storytelling."
                                 />
                             </div>
                             <div className="space-y-2">
-                                <label className="text-xs font-uppercase tracking-wider text-gray-500">Visual Prompt</label>
+                                <label className="text-xs font-uppercase tracking-wider text-gray-500">Visual Prompt (Keyframe)</label>
                                 <textarea
                                     className="w-full h-32 input-premium p-3 text-sm resize-none font-mono text-gray-300 focus:ring-2 focus:ring-purple-500/50 outline-none transition-all"
                                     value={scene.visual_prompt}
                                     onChange={(e) => handleSceneChange(scene.id, 'visual_prompt', e.target.value)}
                                     placeholder="Enter visual prompt..."
+                                />
+                            </div>
+                            <div className="space-y-2">
+                                <label className="text-xs font-uppercase tracking-wider text-gray-500">Motion Prompt (Video)</label>
+                                <textarea
+                                    className="w-full h-32 input-premium p-3 text-sm resize-none font-mono text-gray-300 focus:ring-2 focus:ring-cyan-500/50 outline-none transition-all"
+                                    value={scene.motion_prompt}
+                                    onChange={(e) => handleSceneChange(scene.id, 'motion_prompt', e.target.value)}
+                                    placeholder="Describe subject movement + camera movement for video generation..."
                                 />
                             </div>
                         </div>

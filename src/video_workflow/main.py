@@ -250,7 +250,7 @@ def main(
                 console.print(f"[red]错误：未找到 images 目录[/red]")
                 return
             
-            image_files = sorted(images_dir.glob("*_keyframe.png"))
+            image_files = sorted(images_dir.glob("*_keyframe.*"))
             if not image_files:
                 console.print(f"[red]错误：未找到首帧图像文件[/red]")
                 return
@@ -591,7 +591,7 @@ def main(
                             
                             # 显示生成的图像并让用户确认
                             images_dir = Path(session_dir) / "images"
-                            regenerated_image = images_dir / f"{scene_id}_keyframe.png"
+                            regenerated_image = Path(scene.image_path) if scene.image_path else images_dir / f"{scene_id}_keyframe.*"
                             
                             console.print(f"\n[cyan]📷 首帧图已重新生成：{regenerated_image}[/cyan]")
                             console.print("[cyan]请在文件浏览器中查看图像[/cyan]\n")
@@ -740,7 +740,7 @@ def review_images_loop(session_dir, storyboard: Storyboard, orchestrator, refere
         console.print("\n[bold cyan]═══════════════ 生成的图像 ═══════════════[/bold cyan]\n")
         
         images_dir = Path(session_dir) / "images"
-        image_files = sorted(list(images_dir.glob("*_keyframe.png")))
+        image_files = sorted(list(images_dir.glob("*_keyframe.*")))
         
         if not image_files:
             console.print("[red]未找到生成的图像！[/red]")

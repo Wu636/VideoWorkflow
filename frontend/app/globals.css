@@ -6,8 +6,8 @@
   --color-neon-green: #00ff9d;
   --color-void-black: #050505;
   --color-glass-border: rgba(255, 255, 255, 0.1);
-  --font-display: var(--font-orbitron);
-  --font-body: var(--font-outfit);
+  --font-display: "DIN Alternate", "Franklin Gothic Medium", "Arial Narrow", sans-serif;
+  --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
 }
 
 :root {
@@ -19,6 +19,98 @@ body {
   background: var(--color-void-black);
   color: white;
   overflow-x: hidden;
+}
+
+button,
+a,
+input,
+textarea,
+select {
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease, opacity 160ms ease;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+
+@layer components {
+  .studio-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg bg-cyan-300 px-4 py-2.5 text-sm font-semibold text-[#071014] hover:bg-cyan-200;
+  }
+
+  .studio-secondary {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-white/12 bg-white/4 px-4 py-2.5 text-sm text-white/75 hover:border-white/25 hover:bg-white/8 hover:text-white;
+  }
+
+  .studio-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-red-400/25 bg-red-500/8 px-4 py-2.5 text-sm text-red-200 hover:bg-red-500/15;
+  }
+
+  .studio-card {
+    @apply relative rounded-xl border border-white/8 bg-[#10131b] p-5 shadow-xl shadow-black/15 hover:border-cyan-300/25 hover:bg-[#121722];
+  }
+
+  .studio-metric {
+    @apply flex min-h-24 items-center gap-4 rounded-xl border border-white/8 bg-[#0f1219] px-5 py-4;
+  }
+
+  .studio-status {
+    @apply rounded-full border border-cyan-300/15 bg-cyan-300/8 px-2.5 py-1 text-[11px] font-medium text-cyan-200;
+  }
+
+  .studio-kicker {
+    @apply mb-1 font-mono text-[10px] font-semibold tracking-[.22em] text-cyan-300/65;
+  }
+
+  .studio-empty {
+    @apply flex min-h-72 flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-white/12 bg-white/[.02] text-white/70 hover:border-cyan-300/35 hover:bg-cyan-300/[.025];
+  }
+
+  .studio-empty span {
+    @apply text-sm text-white/35;
+  }
+
+  .studio-modal {
+    @apply fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-black/75 p-4 backdrop-blur-sm;
+  }
+
+  .studio-dialog {
+    @apply my-6 w-full max-w-3xl rounded-2xl border border-white/12 bg-[#11151e] p-6 shadow-2xl md:p-8;
+  }
+
+  .studio-label {
+    @apply mb-1.5 block text-xs font-medium text-white/50;
+  }
+
+  .studio-field input,
+  .studio-field textarea,
+  .studio-field select,
+  input.studio-input,
+  textarea.studio-input,
+  select.studio-input {
+    @apply w-full rounded-lg border border-white/10 bg-black/25 px-3 py-2.5 text-sm text-white outline-none placeholder:text-white/20 focus:border-cyan-300/45;
+  }
+
+  .studio-error {
+    @apply rounded-lg border border-red-400/20 bg-red-500/8 px-4 py-3 text-sm text-red-200;
+  }
+
+  .studio-notice {
+    @apply rounded-lg border border-cyan-300/15 bg-cyan-300/6 px-4 py-3 text-sm text-cyan-100/80;
+  }
+
+  .studio-panel {
+    @apply rounded-xl border border-white/8 bg-[#0f1219] p-5;
+  }
+
+  .studio-tab {
+    @apply flex items-center gap-2 border-b-2 border-transparent px-3 py-3 text-sm text-white/45 hover:text-white/80;
+  }
+
+  .studio-tab-active {
+    @apply border-cyan-300 text-cyan-200;
+  }
 }
 
 h1,
