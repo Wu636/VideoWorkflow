@@ -502,14 +502,18 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
     };
     const regenerateKeyframe = async () => {
         if (!editorShot || !keyframeEditor?.prompt.trim()) return;
+        const prompt = keyframeEditor.prompt.trim();
+        const suggestions = keyframeEditor.suggestions.trim();
+        const normalizedPrompt = prompt.replace(/[\s，。；：、,.!?！？:;'"“”‘’（）()【】\[\]]+/g, "").toLocaleLowerCase();
+        const normalizedSuggestions = suggestions.replace(/[\s，。；：、,.!?！？:;'"“”‘’（）()【】\[\]]+/g, "").toLocaleLowerCase();
         let completed = false;
         await action(
             `keyframe-${editorShot.id}`,
             async () => {
-                await updateShot({ ...editorShot, keyframe_prompt: keyframeEditor.prompt.trim() });
+                await updateShot({ ...editorShot, keyframe_prompt: prompt });
                 await generateKeyframes(bundle.project.id, [editorShot.id], {
                     revisionMode: keyframeEditor.revisionMode,
-                    userSuggestions: keyframeEditor.suggestions.trim(),
+                    userSuggestions: normalizedSuggestions === normalizedPrompt ? "" : suggestions,
                 });
                 completed = true;
             },
@@ -587,12 +591,12 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
                             {editorKeyframe ? <img className="h-full w-full object-contain" src={projectDownloadUrl(bundle.project.id, "asset", editorKeyframe.id)} alt={`镜头 ${editorShot.ordinal} 当前首帧`} /> : <div className="flex flex-col items-center gap-2 text-white/25"><ImageIcon size={30} /><span className="text-xs">当前还没有首帧图</span></div>}
                         </div>
                         {editorKeyframe && <button type="button" className="studio-secondary mt-3 w-full" onClick={() => setKeyframePreview({ name: `镜头 ${editorShot.ordinal} 当前首帧`, url: projectDownloadUrl(bundle.project.id, "asset", editorKeyframe.id), description: editorKeyframe.description || keyframeEditor.prompt })}><Maximize2 size={14} />查看当前原图</button>}
-                        <div className="mt-4 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] p-3 text-xs leading-5 text-cyan-50/50">人物设定、统一风格和已绑定的角色/场景参考图仍会自动附加到 Prompt；下面的模式只控制是否额外参考当前生成图。</div>
+                        <div className="mt-4 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] p-3 text-xs leading-5 text-cyan-50/50">系统只会附加本镜实际出场角色的外观设定和参考图，不再附加其他角色或声音信息；下面的模式只控制是否额外参考当前生成图。</div>
                     </div>
                     <div className="space-y-4">
                         <label><span className="studio-label">首帧图详细 Prompt（可直接修改）</span><textarea className="studio-input min-h-44 resize-y" maxLength={12000} value={keyframeEditor.prompt} onChange={(event) => setKeyframeEditor((current) => current ? { ...current, prompt: event.target.value } : current)} placeholder="描述人物、动作瞬间、环境、构图、机位、光线、色彩和材质…" /></label>
                         <div className="flex justify-end text-[11px] text-white/25">{keyframeEditor.prompt.length}/12000</div>
-                        <label><span className="studio-label">本次修改建议（可选）</span><textarea className="studio-input min-h-28 resize-y" maxLength={4000} value={keyframeEditor.suggestions} onChange={(event) => setKeyframeEditor((current) => current ? { ...current, suggestions: event.target.value } : current)} placeholder="例如：保留人物和构图，把女主表情改得更克制；门口增加逆光；去掉右侧多余人物……" /></label>
+                        <label><span className="studio-label">本次修改建议（可选，只写变化）</span><textarea className="studio-input min-h-28 resize-y" maxLength={4000} value={keyframeEditor.suggestions} onChange={(event) => setKeyframeEditor((current) => current ? { ...current, suggestions: event.target.value } : current)} placeholder="只填写相对上方 Prompt 需要改变的内容，不要重复粘贴完整 Prompt。例如：人物表情更克制；门口增加逆光；去掉右侧多余人物……" /></label>
                         <div className="flex justify-end text-[11px] text-white/25">{keyframeEditor.suggestions.length}/4000</div>
                         <div>
                             <span className="studio-label">重新生成方式</span>

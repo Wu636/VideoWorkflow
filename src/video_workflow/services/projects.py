@@ -131,13 +131,6 @@ class ProjectService:
         shots: list[Shot] = []
         sizes = ["全景", "中景", "近景", "特写", "中景"]
         for ordinal, (scene, duration) in enumerate(zip(storyboard.scenes, durations, strict=False), start=1):
-            scene_text = " ".join(
-                item for item in [scene.story_beat, scene.narrative, scene.visual_prompt, scene.dialogue] if item
-            )
-            scene_character_ids = [character.id for character in project.characters if character.name and character.name in scene_text]
-            if not scene_character_ids:
-                scene_character_ids = [character.id for character in project.characters]
-            normalized_motion = self._normalize_motion_duration(scene.motion_prompt, duration)
             speaker_id = self._resolve_dialogue_speaker_id(
                 project,
                 scene.dialogue_speaker,
@@ -145,6 +138,17 @@ class ProjectService:
                 scene.narrative,
                 scene.dialogue,
             )
+            scene_text = " ".join(
+                item for item in [scene.story_beat, scene.narrative, scene.visual_prompt, scene.dialogue] if item
+            )
+            scene_character_ids = [
+                character.id
+                for character in project.characters
+                if character.name and character.name in scene_text
+            ]
+            if speaker_id and speaker_id not in scene_character_ids:
+                scene_character_ids.append(speaker_id)
+            normalized_motion = self._normalize_motion_duration(scene.motion_prompt, duration)
             base_video_prompt = self.compile_base_video_prompt(
                 project,
                 normalized_motion,
@@ -630,7 +634,14 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
         lens: str = "",
     ) -> str:
         """Compile a still-image prompt that represents this shot's opening frame."""
-        style = project.style_bible or project.brief.visual_style
+        # A keyframe prompt needs the concise visual direction, not the full
+        # production bible (which can also contain camera, audio and video-only
+        # constraints).  The detailed bible remains available to the general
+        # storyboard and H3 prompts.
+        style = ProjectService._compact_prompt_text(
+            project.brief.visual_style or project.style_bible,
+            600,
+        )
         character_text = ProjectService.character_visual_bible(project, character_ids)
         composition = "，".join(item.strip("，。 ") for item in [shot_size, camera_angle, lens] if item)
         parts = [
@@ -642,6 +653,100 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
             "保持人物身份、脸型、发型、服装、配饰、空间关系和光影一致；画面中不出现动作过程、运镜、转场、时长、对白、配音或音效说明",
         ]
         return "。".join(part.strip("。 ") for part in parts if part)
+
+    @staticmethod
+    def keyframe_character_ids(project: Project, shot: Shot, prompt: str = "") -> list[str]:
+        """Return only characters that should condition this still image.
+
+        Older storyboards assigned every project character whenever the model
+        did not mention a name.  That made title cards and empty shots submit
+        every portrait and the entire character bible.  Explicit name/speaker
+        matches take priority; a deliberately selected subset is preserved.
+        """
+        project_ids = [character.id for character in project.characters]
+        project_id_set = set(project_ids)
+        combined_text = " ".join(
+            item
+            for item in [prompt, shot.scene_description, shot.narrative, shot.dialogue]
+            if item
+        )
+        resolved = [
+            character.id
+            for character in project.characters
+            if character.name and character.name in combined_text
+        ]
+        speaker_ids = [
+            speaker_id
+            for speaker_id in [
+                shot.dialogue_speaker_id,
+                *(turn.speaker_id for turn in shot.dialogue_turns),
+            ]
+            if speaker_id in project_id_set
+        ]
+        for speaker_id in speaker_ids:
+            if speaker_id not in resolved:
+                resolved.append(speaker_id)
+        if resolved:
+            return resolved
+
+        selected = [character_id for character_id in shot.character_ids if character_id in project_id_set]
+        if selected and set(selected) != project_id_set:
+            return selected
+
+        group_cues = ("众人", "全体", "所有人", "多人", "大家", "他们", "她们")
+        if selected and any(cue in combined_text for cue in group_cues):
+            return selected
+        return []
+
+    @staticmethod
+    def merge_keyframe_suggestions(prompt: str, suggestions: str) -> str:
+        """Append a revision instruction once, ignoring copied prompt text."""
+        base = prompt.strip()
+        revision = suggestions.strip()
+        if not revision:
+            return base
+
+        def comparable(value: str) -> str:
+            return re.sub(r"[\s，。；：、,.!?！？:;'\"“”‘’（）()【】\[\]]+", "", value).casefold()
+
+        normalized_base = comparable(base)
+        normalized_revision = comparable(revision)
+        if not normalized_revision or normalized_revision == normalized_base:
+            return base
+        return f"{base}\n\n【本次修改建议｜高优先级】{revision}".strip()
+
+    @staticmethod
+    def keyframe_reference_assets(
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+        character_ids: list[str],
+    ) -> list[Asset]:
+        """Filter inherited character portraits to this shot's visible cast."""
+        asset_map = {asset.id: asset for asset in assets}
+        allowed_character_refs = {
+            asset_id
+            for character in project.characters
+            if character.id in character_ids
+            for asset_id in character.reference_asset_ids
+        }
+        known_character_refs = {
+            asset_id
+            for character in project.characters
+            for asset_id in character.reference_asset_ids
+        }
+        selected: list[Asset] = []
+        for asset_id in shot.reference_asset_ids:
+            asset = asset_map.get(asset_id)
+            if asset is None or asset.type != AssetType.IMAGE:
+                continue
+            if asset.role == AssetRole.CHARACTER:
+                if asset.character_id and asset.character_id not in character_ids:
+                    continue
+                if asset_id in known_character_refs and asset_id not in allowed_character_refs:
+                    continue
+            selected.append(asset)
+        return selected
 
     @staticmethod
     def compile_base_video_prompt(project: Project, motion: str, narrative: str = "") -> str:
@@ -1096,8 +1201,8 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
         image_gen = create_image_generator(image_provider=image_provider, model=image_model)
         image_dir = self.project_dir(project_id) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-        fallback_reference = next(
-            (str(resolve_media_path(asset.path)) for asset in assets if asset.type == AssetType.IMAGE and asset.role in {AssetRole.CHARACTER, AssetRole.STYLE}),
+        fallback_style_reference = next(
+            (str(resolve_media_path(asset.path)) for asset in assets if asset.type == AssetType.IMAGE and asset.role == AssetRole.STYLE),
             None,
         )
         asset_map = {asset.id: asset for asset in assets}
@@ -1114,19 +1219,6 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
                     and previous_keyframe.type == AssetType.IMAGE
                 ):
                     reference_paths.append(str(resolve_media_path(previous_keyframe.path)))
-                reference_paths.extend(
-                    str(resolve_media_path(asset_map[asset_id].path))
-                    for asset_id in shot.reference_asset_ids
-                    if (
-                        asset_id in asset_map
-                        and asset_map[asset_id].type == AssetType.IMAGE
-                        and asset_id != previous_keyframe_id
-                    )
-                )
-                reference_paths = list(dict.fromkeys(reference_paths))
-                if not reference_paths and fallback_reference:
-                    reference_paths.append(fallback_reference)
-
                 effective_prompt = (
                     shot.keyframe_prompt.strip()
                     or shot.scene_description.strip()
@@ -1134,11 +1226,42 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
                 )
                 if not shot.keyframe_prompt.strip():
                     shot.keyframe_prompt = effective_prompt
-                if user_suggestions:
-                    effective_prompt = (
-                        f"{effective_prompt}\n\n"
-                        f"【本次修改建议｜高优先级】{user_suggestions}"
-                    ).strip()
+                effective_character_ids = self.keyframe_character_ids(project, shot, effective_prompt)
+                keyframe_references = self.keyframe_reference_assets(
+                    project,
+                    shot,
+                    assets,
+                    effective_character_ids,
+                )
+                reference_paths.extend(
+                    str(resolve_media_path(asset.path))
+                    for asset in keyframe_references
+                    if asset.id != previous_keyframe_id
+                )
+                reference_paths = list(dict.fromkeys(reference_paths))
+                if not reference_paths and fallback_style_reference:
+                    reference_paths.append(fallback_style_reference)
+
+                effective_prompt = self.merge_keyframe_suggestions(
+                    effective_prompt,
+                    user_suggestions,
+                )
+                character_description = self.character_visual_bible(
+                    project,
+                    effective_character_ids,
+                )
+                image_style = self._compact_prompt_text(
+                    project.brief.visual_style or project.style_bible,
+                    600,
+                )
+                logger.info(
+                    "Keyframe request: shot=%s prompt_chars=%s characters=%s references=%s revision=%s",
+                    shot.ordinal,
+                    len(effective_prompt),
+                    len(effective_character_ids),
+                    len(reference_paths),
+                    revision_mode,
+                )
 
                 shot.image_status = "processing"
                 self.store.save_shot(shot)
@@ -1159,8 +1282,8 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
                         str(attempt_dir),
                         ",".join(reference_paths) or None,
                         seed=self._stable_seed(project_id, shot.id),
-                        character_description=self.character_bible(project),
-                        image_style=project.style_bible or project.brief.visual_style,
+                        character_description=character_description,
+                        image_style=image_style,
                         aspect_ratio=project.brief.aspect_ratio,
                     )
                     path = Path(output)

@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.video_workflow.config import settings
-from src.video_workflow.domain import ProjectBrief, Shot
+from src.video_workflow.domain import Asset, AssetRole, AssetType, CharacterProfile, ProjectBrief, Shot
+from src.video_workflow.generators.image import _build_image_prompt
 from src.video_workflow.services.projects import ProjectService
 from src.video_workflow.storage import ProjectStore
 from src.video_workflow.types import Scene, Storyboard
@@ -102,6 +103,121 @@ class KeyframePromptSeparationTests(unittest.TestCase):
         self.assertEqual(generated[0].visual_prompt, "GENERIC_STORYBOARD_PROMPT")
         self.assertEqual(generated[0].keyframe_prompt, "STATIC_KEYFRAME_PROMPT")
         self.assertEqual(generated[0].video_prompt, "MINIMAX_H3_PROMPT")
+
+    def test_explicit_empty_character_description_suppresses_global_default(self) -> None:
+        scene = Scene(id=1, narrative="", visual_prompt="纯黑标题卡", motion_prompt="", duration=5)
+        previous = settings.CHARACTER_DESCRIPTION
+        settings.CHARACTER_DESCRIPTION = "不应出现的全局角色"
+        try:
+            prompt = _build_image_prompt(scene, character_description="", image_style="")
+        finally:
+            settings.CHARACTER_DESCRIPTION = previous
+
+        self.assertEqual(prompt, "纯黑标题卡")
+
+    def test_title_card_drops_legacy_all_character_references_and_duplicate_suggestion(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(title="片尾标题", story="测试", visual_style="低饱和度 3D")
+        )
+        first_asset = self.store.save_asset(
+            Asset(
+                project_id=project.id,
+                type=AssetType.IMAGE,
+                role=AssetRole.CHARACTER,
+                name="甲参考",
+                path=str(self.root / "first.png"),
+            )
+        )
+        second_asset = self.store.save_asset(
+            Asset(
+                project_id=project.id,
+                type=AssetType.IMAGE,
+                role=AssetRole.CHARACTER,
+                name="乙参考",
+                path=str(self.root / "second.png"),
+            )
+        )
+        (self.root / "first.png").write_bytes(b"first")
+        (self.root / "second.png").write_bytes(b"second")
+        project.characters = [
+            CharacterProfile(
+                name="甲",
+                description="甲的外观",
+                voice_description="甲的声音",
+                reference_asset_ids=[first_asset.id],
+            ),
+            CharacterProfile(
+                name="乙",
+                description="乙的外观",
+                voice_description="乙的声音",
+                reference_asset_ids=[second_asset.id],
+            ),
+        ]
+        self.store.save_project(project)
+        title_prompt = "画面渐暗至全黑，中央浮现白色书法字"
+        shot = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                keyframe_prompt=title_prompt,
+                character_ids=[character.id for character in project.characters],
+                reference_asset_ids=[first_asset.id, second_asset.id],
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeImageGenerator:
+            async def generate_image(
+                self,
+                scene: Scene,
+                output_dir: str,
+                reference_image_path: str | None = None,
+                **kwargs: object,
+            ) -> str:
+                captured["prompt"] = scene.visual_prompt
+                captured["references"] = reference_image_path
+                captured.update(kwargs)
+                output = Path(output_dir) / "keyframe.png"
+                output.write_bytes(b"image")
+                return str(output)
+
+        with patch(
+            "src.video_workflow.services.projects.create_image_generator",
+            return_value=FakeImageGenerator(),
+        ):
+            asyncio.run(
+                self.service.generate_keyframes(
+                    project.id,
+                    [shot.id],
+                    user_suggestions=title_prompt,
+                )
+            )
+
+        self.assertEqual(captured["prompt"], title_prompt)
+        self.assertEqual(captured["character_description"], "")
+        self.assertIsNone(captured["references"])
+        self.assertEqual(captured["image_style"], "低饱和度 3D")
+
+    def test_keyframe_uses_only_named_character_visual_details(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="单人镜头", story="测试"))
+        project.characters = [
+            CharacterProfile(name="甲", description="甲的外观", voice_description="甲的声音"),
+            CharacterProfile(name="乙", description="乙的外观", voice_description="乙的声音"),
+        ]
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            keyframe_prompt="甲站在窗边",
+            character_ids=[character.id for character in project.characters],
+        )
+
+        selected = self.service.keyframe_character_ids(project, shot, shot.keyframe_prompt)
+        description = self.service.character_visual_bible(project, selected)
+
+        self.assertEqual(selected, [project.characters[0].id])
+        self.assertIn("甲的外观", description)
+        self.assertNotIn("甲的声音", description)
+        self.assertNotIn("乙", description)
 
 
 if __name__ == "__main__":

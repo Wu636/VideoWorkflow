@@ -130,14 +130,22 @@ def _build_image_prompt(
     image_style: str | None = None,
 ) -> str:
     prompt = scene.visual_prompt
-    resolved_character_description = character_description or settings.CHARACTER_DESCRIPTION
+    # ``None`` means "use the process-level default" while an explicit empty
+    # string means "this shot has no characters".  Using ``or`` here made
+    # title cards and empty establishing shots unexpectedly inherit the global
+    # character bible.
+    resolved_character_description = (
+        settings.CHARACTER_DESCRIPTION
+        if character_description is None
+        else character_description
+    )
     resolved_image_style = image_style if image_style is not None else settings.IMAGE_STYLE
 
     if resolved_character_description:
-        prompt = f"【角色特征】{resolved_character_description}。\n【场景描述】{prompt}"
+        prompt = f"【角色特征】{resolved_character_description.rstrip('。 ')}。\n【场景描述】{prompt}"
 
     if resolved_image_style:
-        prompt = f"{prompt}。\n【画面风格】{resolved_image_style}"
+        prompt = f"{prompt.rstrip('。 ')}。\n【画面风格】{resolved_image_style}"
 
     return prompt
 
