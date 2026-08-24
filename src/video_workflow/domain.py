@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def utc_now() -> str:
@@ -182,7 +182,10 @@ class Shot(BaseModel):
     subject_motion: str = ""
     transition: str = "硬切"
     audio_design: str = ""
+    # General visual direction for the storyboard.  This intentionally stays
+    # separate from the still-image prompt used to generate the first frame.
     visual_prompt: str = ""
+    keyframe_prompt: str = ""
     # User-authored/base motion prompt. ``video_prompt`` is the compiled H3
     # prompt shown to the user and submitted to ComfyUI.
     video_prompt_source: str = ""
@@ -226,6 +229,24 @@ class Shot(BaseModel):
     version: int = 1
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_keyframe_prompt(cls, value: Any) -> Any:
+        """Give legacy shots a clean first-frame prompt without losing data.
+
+        Older records used ``visual_prompt`` for two different purposes.  Their
+        uncompiled scene description is the closest representation of the
+        intended static opening frame, so expose it as ``keyframe_prompt`` when
+        loading those records.  Once a shot is saved the new field is persisted.
+        """
+        if isinstance(value, dict) and "keyframe_prompt" not in value:
+            migrated = dict(value)
+            migrated["keyframe_prompt"] = str(
+                migrated.get("scene_description") or migrated.get("visual_prompt") or ""
+            )
+            return migrated
+        return value
 
 
 class Asset(BaseModel):

@@ -161,6 +161,7 @@ export interface Shot {
     transition: string;
     audio_design: string;
     visual_prompt: string;
+    keyframe_prompt: string;
     video_prompt_source: string;
     video_prompt: string;
     negative_prompt: string;

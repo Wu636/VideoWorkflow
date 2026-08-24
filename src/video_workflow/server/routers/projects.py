@@ -289,7 +289,7 @@ async def export_storyboard(project_id: str):
         raise _not_found("Project not found")
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["镜号", "时长", "叙事", "对白", "场景", "景别", "机位", "运镜", "主体动作", "首帧提示词", "H3提示词", "生成模式", "审核状态"])
+    writer.writerow(["镜号", "时长", "叙事", "对白", "场景", "景别", "机位", "运镜", "主体动作", "通用分镜提示词", "首帧提示词", "H3提示词", "生成模式", "审核状态"])
     storyboard_changed = False
     for shot in store.list_shots(project_id):
         writer.writerow(
@@ -304,6 +304,7 @@ async def export_storyboard(project_id: str):
                 shot.camera_motion,
                 shot.subject_motion,
                 shot.visual_prompt,
+                shot.keyframe_prompt,
                 shot.video_prompt,
                 (shot.resolved_generation_mode or shot.generation_mode).value,
                 shot.approval_status.value,

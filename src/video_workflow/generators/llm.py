@@ -85,6 +85,8 @@ def _normalize_storyboard_payload(payload: dict, include_dialogue: bool) -> dict
             scene["dialogue_speaker"] = ""
         if not scene.get("story_beat"):
             scene["story_beat"] = scene.get("visual_prompt") or scene.get("motion_prompt") or ""
+        if not isinstance(scene.get("keyframe_prompt"), str) or not scene.get("keyframe_prompt", "").strip():
+            scene["keyframe_prompt"] = scene.get("visual_prompt") or ""
 
     return payload
 
@@ -108,13 +110,13 @@ def _build_prompt_context_text(
     if resolved_character:
         prompt_suffix += (
             f"\n\n【重要！角色设定】\n主角外貌描述：{resolved_character}"
-            "\n请在所有分镜的 visual_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
+            "\n请在所有分镜的 visual_prompt、keyframe_prompt 和 narrative 中严格使用这个角色设定，不要更改或创造新角色！"
         )
 
     if resolved_style:
         prompt_suffix += (
             f"\n\n【重要！视觉风格】\n所有分镜必须保持统一的视觉风格：{resolved_style}"
-            "\n请在每个 visual_prompt 中体现这种风格，不要混用卡通、写实等不同风格！"
+            "\n请在每个 visual_prompt 和 keyframe_prompt 中体现这种风格，不要混用卡通、写实等不同风格！"
         )
     else:
         prompt_suffix += (
@@ -196,7 +198,8 @@ class DeepSeekGenerator(LLMGenerator):
             "camera_motion": "固定/推/拉/摇/移/跟/环绕",
             "transition": "硬切/叠化/匹配剪辑等",
             "audio_design": "环境声、动作音效、音乐和声音情绪",
-            "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
+            "visual_prompt": "通用分镜视觉描述，包含整镜场景、角色、视觉叙事、光影、构图和风格...",
+            "keyframe_prompt": "只描述本镜开场第一帧的静态画面：人物起始姿态、站位、表情、环境、构图、机位、光线和材质，不写运镜、动作过程、台词或声音...",
             "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
         }
     ]
@@ -212,7 +215,7 @@ class DeepSeekGenerator(LLMGenerator):
 7. 视觉风格一致：所有分镜保持统一画风，不要卡通和写实混用
 8. 每个分镜必须包含 duration 字段，取值 4-8 秒，根据动作复杂度和台词长度智能调整
 
-- visual_prompt 应当非常详细，专注于视觉表现和情绪细节。
+- visual_prompt 应当详细描述整镜的通用视觉方向；keyframe_prompt 必须单独描述视频开始前的静态首帧，二者不得复制成同一段文字。
 - motion_prompt 只描述当前单一主动作和稳定结果态，不要强塞三段动作。
 - 发言镜头必须填写 dialogue_speaker，其他人物明确保持闭嘴和静止反应。
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
@@ -251,7 +254,7 @@ class DeepSeekGenerator(LLMGenerator):
 \n【重要！必须严格遵循的规则：无台词模式】
 1. narrative 字段**严禁**包含任何角色台词！
 2. narrative 只可以写简短的动作描述、画面补充说明，或者直接留空。
-3. visual_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
+3. visual_prompt、keyframe_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
 4. 绝对不要出现角色开口说话的描述。
 """
 
@@ -365,7 +368,8 @@ class GLMGenerator(LLMGenerator):
             "camera_motion": "固定/推/拉/摇/移/跟/环绕",
             "transition": "硬切/叠化/匹配剪辑等",
             "audio_design": "环境声、动作音效、音乐和声音情绪",
-            "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
+            "visual_prompt": "通用分镜视觉描述，包含整镜场景、角色、视觉叙事、光影、构图和风格...",
+            "keyframe_prompt": "只描述本镜开场第一帧的静态画面：人物起始姿态、站位、表情、环境、构图、机位、光线和材质，不写运镜、动作过程、台词或声音...",
             "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
         }
     ]
@@ -380,7 +384,7 @@ class GLMGenerator(LLMGenerator):
 6. 视觉风格一致：所有分镜保持统一画风
 7. 每个分镜必须包含 duration 字段，取值 4-8 秒，根据动作复杂度和台词长度智能调整
 
-- visual_prompt 必须包含详细的角色描述和情绪细节，确保所有分镜中角色外观一致
+- visual_prompt 必须包含整镜的通用视觉方向；keyframe_prompt 必须单独描述静态开场首帧，并保持角色外观一致
 - motion_prompt 只描述当前单一主动作和稳定结果态，不要强塞三段动作
 - 发言镜头必须填写 dialogue_speaker，其他人物明确保持闭嘴和静止反应
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串
@@ -422,7 +426,7 @@ class GLMGenerator(LLMGenerator):
 \n【重要！必须严格遵循的规则：无台词模式】
 1. narrative 字段**严禁**包含任何角色台词！
 2. narrative 只可以写简短的动作描述、画面补充说明，或者直接留空。
-3. visual_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
+3. visual_prompt、keyframe_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
 4. 绝对不要出现角色开口说话的描述。
 """
         
@@ -674,7 +678,8 @@ class ArkLLMGenerator(LLMGenerator):
             "camera_motion": "固定/推/拉/摇/移/跟/环绕",
             "transition": "硬切/叠化/匹配剪辑等",
             "audio_design": "环境声、动作音效、音乐和声音情绪",
-            "visual_prompt": "详细的静态画面描述，包含：角色情绪状态（如'眼眶微红'而非'伤心'）、光影氛围、构图、风格...",
+            "visual_prompt": "通用分镜视觉描述，包含整镜场景、角色、视觉叙事、光影、构图和风格...",
+            "keyframe_prompt": "只描述本镜开场第一帧的静态画面：人物起始姿态、站位、表情、环境、构图、机位、光线和材质，不写运镜、动作过程、台词或声音...",
             "motion_prompt": "详细的动态描述，每个镜头只描述1-2个连贯动作，不要堆砌动作..."
         }
     ]
@@ -689,7 +694,7 @@ class ArkLLMGenerator(LLMGenerator):
 6. 视觉风格一致：所有分镜保持统一画风
 7. 每个分镜必须包含 duration 字段，取值 4-8 秒，根据动作复杂度和台词长度智能调整
 
-- visual_prompt 应当非常详细，专注于视觉表现和情绪细节。
+- visual_prompt 应当详细描述整镜的通用视觉方向；keyframe_prompt 必须单独描述视频开始前的静态首帧，二者不得复制成同一段文字。
 - motion_prompt 只描述当前单一主动作和稳定结果态，不要强塞三段动作。
 - 发言镜头必须填写 dialogue_speaker，其他人物明确保持闭嘴和静止反应。
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
@@ -731,7 +736,7 @@ class ArkLLMGenerator(LLMGenerator):
 \n【重要！必须严格遵循的规则：无台词模式】
 1. narrative 字段**严禁**包含任何角色台词！
 2. narrative 必须为 "" 空字符串，不要写旁白，不要写对白。
-3. visual_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
+3. visual_prompt、keyframe_prompt 和 motion_prompt 必须侧重纯视觉叙事，通过画面和动作传达剧情，而不是靠台词。
 4. 绝对不要出现角色开口说话的描述。
 5. 每个分镜的 motion_prompt 必须非空且至少一句完整动作+运镜描述。
 """

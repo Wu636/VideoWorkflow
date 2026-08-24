@@ -176,6 +176,14 @@ class ProjectService:
                 transition=scene.transition or "硬切",
                 audio_design=scene.audio_design,
                 visual_prompt=self.compile_visual_prompt(project, scene.visual_prompt, scene_character_ids),
+                keyframe_prompt=self.compile_keyframe_prompt(
+                    project,
+                    scene.keyframe_prompt or scene.visual_prompt,
+                    scene_character_ids,
+                    shot_size=scene.shot_size or sizes[(ordinal - 1) % len(sizes)],
+                    camera_angle=scene.camera_angle or "平视",
+                    lens=scene.lens or ("35mm 广角" if ordinal == 1 else "50mm 标准镜头"),
+                ),
                 video_prompt_source=base_video_prompt,
                 video_prompt=base_video_prompt,
                 negative_prompt=project.brief.negative_prompt,
@@ -598,6 +606,42 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
         style = project.style_bible or project.brief.visual_style
         character_text = ProjectService.character_bible(project, character_ids)
         return "，".join(item.strip("，。 ") for item in [style, character_text, description] if item)
+
+    @staticmethod
+    def character_visual_bible(project: Project, character_ids: list[str] | None = None) -> str:
+        """Return only appearance/wardrobe details suitable for image models."""
+        selected = set(character_ids) if character_ids is not None else None
+        parts: list[str] = []
+        for character in project.characters:
+            if selected is not None and character.id not in selected:
+                continue
+            details = "，".join(item for item in [character.description, character.wardrobe] if item)
+            parts.append(f"{character.name}：{details}" if details else character.name)
+        return "；".join(parts)
+
+    @staticmethod
+    def compile_keyframe_prompt(
+        project: Project,
+        description: str,
+        character_ids: list[str] | None = None,
+        *,
+        shot_size: str = "",
+        camera_angle: str = "",
+        lens: str = "",
+    ) -> str:
+        """Compile a still-image prompt that represents this shot's opening frame."""
+        style = project.style_bible or project.brief.visual_style
+        character_text = ProjectService.character_visual_bible(project, character_ids)
+        composition = "，".join(item.strip("，。 ") for item in [shot_size, camera_angle, lens] if item)
+        parts = [
+            "静态分镜首帧，只呈现本镜开场的一个清晰瞬间",
+            f"画面内容：{description.strip('，。 ')}" if description else "",
+            f"构图与机位：{composition}" if composition else "",
+            f"本镜出场角色：{character_text}" if character_text else "",
+            f"统一视觉风格：{style}" if style else "",
+            "保持人物身份、脸型、发型、服装、配饰、空间关系和光影一致；画面中不出现动作过程、运镜、转场、时长、对白、配音或音效说明",
+        ]
+        return "。".join(part.strip("。 ") for part in parts if part)
 
     @staticmethod
     def compile_base_video_prompt(project: Project, motion: str, narrative: str = "") -> str:
@@ -1083,7 +1127,13 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
                 if not reference_paths and fallback_reference:
                     reference_paths.append(fallback_reference)
 
-                effective_prompt = shot.visual_prompt.strip()
+                effective_prompt = (
+                    shot.keyframe_prompt.strip()
+                    or shot.scene_description.strip()
+                    or shot.visual_prompt.strip()
+                )
+                if not shot.keyframe_prompt.strip():
+                    shot.keyframe_prompt = effective_prompt
                 if user_suggestions:
                     effective_prompt = (
                         f"{effective_prompt}\n\n"
@@ -1246,6 +1296,7 @@ recommended_shot_count 必须不少于 {minimum}，确保任一镜头建议不�
                 duration_seconds=duration,
                 scene_description=str(scene.get("visual_prompt") or ""),
                 visual_prompt=str(scene.get("visual_prompt") or ""),
+                keyframe_prompt=str(scene.get("keyframe_prompt") or scene.get("visual_prompt") or ""),
                 subject_motion=str(scene.get("motion_prompt") or ""),
                 video_prompt_source=base_video_prompt,
                 video_prompt=base_video_prompt,

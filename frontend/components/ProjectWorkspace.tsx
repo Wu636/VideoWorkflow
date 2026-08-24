@@ -320,7 +320,8 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
                         <Field label="运镜"><input value={shot.camera_motion} onChange={(event) => patchShot(shot.id, { camera_motion: event.target.value })} /></Field>
                         <Field label="主体动作"><textarea rows={3} value={shot.subject_motion} onChange={(event) => patchShot(shot.id, { subject_motion: event.target.value })} /></Field>
                         <Field label="本镜头角色" wide><div className="grid gap-2 rounded-lg border border-white/8 p-3 sm:grid-cols-2 lg:grid-cols-3">{bundle.project.characters.length === 0 ? <span className="text-xs text-white/30">请先在“需求与角色”中建立角色。</span> : bundle.project.characters.map((character) => <label key={character.id} className="flex items-center gap-2 text-xs text-white/60"><input type="checkbox" checked={shot.character_ids.includes(character.id)} onChange={() => patchShot(shot.id, { character_ids: toggle(shot.character_ids, character.id) })} />{character.name}</label>)}</div></Field>
-                        <Field label="首帧图 Prompt" wide><textarea rows={5} value={shot.visual_prompt} onChange={(event) => patchShot(shot.id, { visual_prompt: event.target.value })} /></Field>
+                        <Field label="通用分镜 Prompt" wide><textarea rows={5} value={shot.visual_prompt} onChange={(event) => patchShot(shot.id, { visual_prompt: event.target.value })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">描述整镜的画面方向，可用于通用图像/视频模型；不会直接覆盖下面的首帧 Prompt。</span></Field>
+                        <Field label="首帧图 Prompt" wide><textarea rows={5} value={shot.keyframe_prompt} onChange={(event) => patchShot(shot.id, { keyframe_prompt: event.target.value })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">只描述视频开始时的静态画面，生成分镜图时实际使用这一项。</span></Field>
                         <Field label="MiniMax H3 Prompt" wide><textarea rows={6} value={shot.video_prompt} onChange={(event) => patchShot(shot.id, { video_prompt: event.target.value })} /></Field>
                     </div>
                     <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="studio-secondary px-3" disabled={index === 0 || !!busy} onClick={() => moveShot(index, -1)}><ChevronUp size={14} />上移</button><button className="studio-secondary px-3" disabled={index === bundle.shots.length - 1 || !!busy} onClick={() => moveShot(index, 1)}><ChevronDown size={14} />下移</button><button className="studio-danger" onClick={() => void action(`delete-${shot.id}`, () => deleteShot(bundle.project.id, shot.id), `镜头 ${shot.ordinal} 已删除`)}><Trash2 size={14} />删除</button><button className="studio-primary" disabled={busy === `shot-${shot.id}`} onClick={() => void action(`shot-${shot.id}`, () => updateShot(shot), `镜头 ${shot.ordinal} 已保存`, false).then(refresh)}>{busy === `shot-${shot.id}` ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}保存镜头</button></div>
@@ -481,7 +482,7 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
         const currentKeyframe = shot.keyframe_asset_id ? keyframeAssets.get(shot.keyframe_asset_id) : undefined;
         setKeyframeEditor({
             shotId: shot.id,
-            prompt: currentKeyframe?.description || shot.visual_prompt,
+            prompt: shot.keyframe_prompt || currentKeyframe?.description || shot.scene_description || shot.visual_prompt,
             suggestions: "",
             revisionMode: currentKeyframe ? "iterate" : "fresh",
         });
@@ -492,7 +493,7 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
         await action(
             `keyframe-prompt-${editorShot.id}`,
             async () => {
-                await updateShot({ ...editorShot, visual_prompt: keyframeEditor.prompt.trim() });
+                await updateShot({ ...editorShot, keyframe_prompt: keyframeEditor.prompt.trim() });
                 completed = true;
             },
             `镜头 ${editorShot.ordinal} 的首帧 Prompt 已保存。`,
@@ -505,7 +506,7 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
         await action(
             `keyframe-${editorShot.id}`,
             async () => {
-                await updateShot({ ...editorShot, visual_prompt: keyframeEditor.prompt.trim() });
+                await updateShot({ ...editorShot, keyframe_prompt: keyframeEditor.prompt.trim() });
                 await generateKeyframes(bundle.project.id, [editorShot.id], {
                     revisionMode: keyframeEditor.revisionMode,
                     userSuggestions: keyframeEditor.suggestions.trim(),
@@ -551,7 +552,7 @@ function ProductionPanel({ bundle, busy, error, notice, action, refresh }: { bun
                                 ? "生成失败"
                                 : "待生成";
                 const imageUrl = keyframe ? projectDownloadUrl(bundle.project.id, "asset", keyframe.id) : "";
-                const prompt = keyframe?.description || shot.visual_prompt;
+                const prompt = shot.keyframe_prompt || keyframe?.description || shot.scene_description || shot.visual_prompt;
                 return <article key={`keyframe-${shot.id}`} className="overflow-hidden rounded-xl border border-white/8 bg-black/15">
                     <div className="relative flex aspect-video items-center justify-center overflow-hidden bg-black/35">
                         {keyframe ? <button type="button" className="group h-full w-full cursor-zoom-in" title="放大查看首帧原图" onClick={() => setKeyframePreview({ name: `镜头 ${shot.ordinal} 首帧`, url: imageUrl, description: prompt })}><img className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-[1.02]" src={imageUrl} alt={`镜头 ${shot.ordinal} 首帧`} /><span className="absolute bottom-2 right-2 rounded-md bg-black/65 p-2 text-white/70 opacity-0 backdrop-blur transition-opacity group-hover:opacity-100"><Maximize2 size={14} /></span></button> : <div className="flex flex-col items-center gap-2 text-white/25"><ImageIcon size={26} /><span className="text-xs">{imageStatus}</span></div>}

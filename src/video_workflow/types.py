@@ -11,7 +11,8 @@ class GenerationStatus(str, Enum):
 class Scene(BaseModel):
     id: int = Field(..., description="Scene number")
     narrative: str = Field(..., description="Voiceover or narrative text for the scene")
-    visual_prompt: str = Field(..., description="Detailed prompt for generating the static keyframe image")
+    visual_prompt: str = Field(..., description="General visual direction for the storyboard shot")
+    keyframe_prompt: str = Field(default="", description="Static opening-frame image generation prompt")
     motion_prompt: str = Field(..., description="Prompt describing the movement/action for video generation")
     duration: int = Field(default=5, ge=4, le=12, description="Video duration in seconds (4-12)")
     story_beat: str = Field(default="", description="What happens in this shot, separate from dialogue")
