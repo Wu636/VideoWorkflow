@@ -3,6 +3,7 @@ import logging
 import time
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from src.video_workflow.logging_runtime import configure_logging
 from src.video_workflow.runtime_settings import runtime_settings
@@ -28,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 @app.middleware("http")
 async def request_log_middleware(request: Request, call_next):
+    # Quick tunnels are used only as an Ark media bridge.  Do not expose the
+    # project/settings API through the temporary public hostname.
+    host = request.headers.get("host", "").split(":", 1)[0].lower()
+    if host.endswith(".trycloudflare.com") and not request.url.path.startswith(
+        "/api/projects/seedance-assets/"
+    ):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
     started = time.monotonic()
     try:
         response = await call_next(request)

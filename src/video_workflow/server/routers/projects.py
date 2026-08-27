@@ -22,15 +22,33 @@ from src.video_workflow.config import settings
 from src.video_workflow.domain import (
     ApprovalStatus,
     AssetRole,
+    AssetType,
     CharacterProfile,
     FinalizeRequest,
+    GenerationMode,
+    JobStatus,
     Project,
     ProjectBrief,
     ProjectStatus,
     Review,
     Shot,
 )
-from src.video_workflow.integrations.comfyui import ComfyUIClient, H3WorkflowBuilder
+from src.video_workflow.integrations.comfyui import (
+    ComfyUIClient,
+    H3WorkflowBuilder,
+    h3_diffusion_model,
+    h3_text_encoder,
+    resolve_h3_model_profile,
+    resolve_h3_text_encoder_profile,
+)
+from src.video_workflow.integrations.seedance import (
+    SeedanceClient,
+    estimate_seedance_cost,
+    resolve_seedance_model,
+    seedance_catalog,
+    validate_seedance_resolution,
+    verify_seedance_asset_signature,
+)
 from src.video_workflow.h3_prompt_skills import list_h3_prompt_skills
 from src.video_workflow.media_paths import resolve_media_path
 from src.video_workflow.services.finalize import Finalizer
@@ -52,6 +70,45 @@ class StoryboardGenerateRequest(BaseModel):
     shot_count: int | None = Field(default=None, ge=1, le=500)
     count_mode: Literal["manual", "ai"] = "manual"
     user_suggestions: str = Field(default="", max_length=4000)
+    prompt_targets: list[Literal["h3", "seedance"]] | None = None
+    h3_skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
+
+
+class StyleAnalyzeRequest(BaseModel):
+    asset_ids: list[str] | None = None
+
+
+class SceneProfilesGenerateRequest(BaseModel):
+    user_suggestions: str = Field(default="", max_length=4000)
+
+
+class SceneReferenceGenerateRequest(BaseModel):
+    user_suggestions: str = Field(default="", max_length=4000)
+    image_provider: str | None = None
+    image_model: str | None = None
+
+
+class CharacterReferencesGenerateRequest(BaseModel):
+    character_ids: list[str] | None = None
+    user_suggestions: str = Field(default="", max_length=4000)
+    image_provider: str | None = None
+    image_model: str | None = None
+    reference_asset_ids: list[str] | None = None
+    appearance_profile_id: str | None = None
+
+
+class CharacterReferenceAnalyzeRequest(BaseModel):
+    character_id: str
+    reference_asset_ids: list[str] = Field(min_length=1, max_length=10)
+    appearance_profile_id: str | None = None
+    appearance_label: str = Field(default="", max_length=100)
+    user_suggestions: str = Field(default="", max_length=4000)
+
+
+class ShotReviseRequest(BaseModel):
+    user_suggestions: str = Field(min_length=1, max_length=4000)
+    prompt_targets: list[Literal["h3", "seedance"]] = Field(default_factory=list)
+    h3_skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
 
 
 class ScriptRewriteRequest(BaseModel):
@@ -67,6 +124,10 @@ class StoryboardApprovalRequest(BaseModel):
 
 class RenderRequest(BaseModel):
     shot_ids: list[str] | None = None
+    provider: Literal["comfyui_h3", "ark_seedance"] = "comfyui_h3"
+    model_id: str | None = None
+    resolution: str | None = None
+    generate_audio: bool = True
 
 
 class KeyframeRequest(BaseModel):
@@ -85,6 +146,16 @@ class H3PromptGenerateRequest(BaseModel):
     shot_ids: list[str] | None = None
     skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
     user_suggestions: str = Field(default="", max_length=4000)
+
+
+class SeedancePromptGenerateRequest(BaseModel):
+    shot_ids: list[str] | None = None
+
+
+class SeedanceEstimateRequest(BaseModel):
+    shot_ids: list[str] | None = None
+    model_id: str
+    resolution: str
 
 
 class ReorderRequest(BaseModel):
@@ -135,6 +206,29 @@ async def get_h3_prompt_skills():
     }
 
 
+@router.get("/seedance/catalog")
+async def get_seedance_catalog():
+    return seedance_catalog()
+
+
+@router.get("/seedance-assets/{asset_id}")
+async def download_seedance_asset(asset_id: str, expires: int, signature: str):
+    """Short-lived, signed media endpoint consumed by Volcengine Ark."""
+    if not verify_seedance_asset_signature(asset_id, expires, signature):
+        raise HTTPException(status_code=403, detail="Seedance asset link expired or invalid")
+    asset = store.get_asset(asset_id)
+    path = resolve_media_path(asset.path) if asset else None
+    if path is None or not path.is_file():
+        raise _not_found("Seedance asset not found")
+    guessed = mimetypes.guess_type(path.name)[0]
+    media_type = asset.mime_type if asset.mime_type != "application/octet-stream" else guessed
+    return FileResponse(
+        path,
+        media_type=media_type or "application/octet-stream",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 @router.get("/legacy/sessions")
 async def list_legacy_sessions():
     return project_service.list_legacy_sessions()
@@ -183,10 +277,14 @@ async def generate_storyboard(project_id: str, request: StoryboardGenerateReques
             request.shot_count,
             request.count_mode,
             request.user_suggestions,
+            request.prompt_targets,
+            request.h3_skill_id,
         )
         return {"shots": shots, "project": store.get_project(project_id)}
     except KeyError as exc:
         raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -199,6 +297,80 @@ async def analyze_brief(project_id: str):
         raise _not_found(str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AI 剧本分析失败: {exc}") from exc
+
+
+@router.post("/{project_id}/style/analyze")
+async def analyze_style(project_id: str, request: StyleAnalyzeRequest):
+    try:
+        return await project_service.analyze_style(project_id, request.asset_ids)
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的参考风格分析失败", project_id)
+        raise HTTPException(status_code=500, detail=f"参考风格分析失败: {exc}") from exc
+
+
+@router.post("/{project_id}/scene-profiles/generate")
+async def generate_scene_profiles(project_id: str, request: SceneProfilesGenerateRequest):
+    try:
+        return await project_service.generate_scene_profiles(project_id, request.user_suggestions)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/scene-profiles/{scene_profile_id}/reference")
+async def generate_scene_reference(
+    project_id: str,
+    scene_profile_id: str,
+    request: SceneReferenceGenerateRequest,
+):
+    try:
+        return await project_service.generate_scene_reference(
+            project_id,
+            scene_profile_id,
+            request.user_suggestions,
+            request.image_provider,
+            request.image_model,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/characters/references/analyze")
+async def analyze_character_references(project_id: str, request: CharacterReferenceAnalyzeRequest):
+    try:
+        return await project_service.analyze_character_references(
+            project_id,
+            request.character_id,
+            request.reference_asset_ids,
+            request.appearance_profile_id,
+            request.appearance_label,
+            request.user_suggestions,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/characters/references/generate")
+async def generate_character_references(project_id: str, request: CharacterReferencesGenerateRequest):
+    try:
+        return await project_service.generate_character_references(
+            project_id,
+            request.character_ids,
+            request.user_suggestions,
+            request.image_provider,
+            request.image_model,
+            request.reference_asset_ids,
+            request.appearance_profile_id,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{project_id}/brief/rewrite")
@@ -231,6 +403,106 @@ def _extract_script_text(filename: str, content: bytes) -> str:
         reader = PdfReader(io.BytesIO(content))
         return "\n".join((page.extract_text() or "").strip() for page in reader.pages).strip()
     raise ValueError("支持 TXT、Markdown、DOCX 和可提取文字的 PDF 剧本")
+
+
+_STORYBOARD_HEADER_ALIASES = {
+    "镜头标题": "title", "标题": "title", "title": "title",
+    "画面叙事": "narrative", "剧情": "narrative", "剧情内容": "narrative",
+    "分镜内容": "narrative", "镜头内容": "narrative", "内容": "narrative", "narrative": "narrative",
+    "对白": "dialogue", "台词": "dialogue", "旁白": "dialogue", "dialogue": "dialogue",
+    "发言者": "dialogue_speaker", "说话人": "dialogue_speaker", "dialogue_speaker": "dialogue_speaker",
+    "场景": "scene_description", "场景描述": "scene_description", "scene_description": "scene_description",
+    "角色": "character_names", "出场人物": "character_names", "人物": "character_names", "character_names": "character_names",
+    "景别": "shot_size", "shot_size": "shot_size",
+    "机位": "camera_angle", "角度": "camera_angle", "机位/角度": "camera_angle", "camera_angle": "camera_angle",
+    "镜头": "lens", "焦段": "lens", "镜头/焦段": "lens", "lens": "lens",
+    "运镜": "camera_motion", "camera_motion": "camera_motion",
+    "主体动作": "subject_motion", "动作": "subject_motion", "subject_motion": "subject_motion",
+    "转场": "transition", "transition": "transition",
+    "声音设计": "audio_design", "音频": "audio_design", "audio_design": "audio_design",
+    "时长": "duration_seconds", "时长(秒)": "duration_seconds", "时长（秒）": "duration_seconds", "duration": "duration_seconds", "duration_seconds": "duration_seconds",
+    "生成策略": "generation_mode", "generation_mode": "generation_mode",
+    "通用prompt": "visual_prompt", "通用分镜prompt": "visual_prompt", "visual_prompt": "visual_prompt",
+    "首帧prompt": "keyframe_prompt", "首帧图prompt": "keyframe_prompt", "keyframe_prompt": "keyframe_prompt",
+    "h3 prompt": "h3_prompt", "h3_prompt": "h3_prompt", "minimax h3 prompt": "h3_prompt",
+    "seedance prompt": "seedance_prompt", "seedance_prompt": "seedance_prompt",
+}
+
+
+def _normalize_storyboard_header(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    compact = text.replace(" ", "")
+    return _STORYBOARD_HEADER_ALIASES.get(text) or _STORYBOARD_HEADER_ALIASES.get(compact) or compact
+
+
+def _extract_storyboard_rows(filename: str, content: bytes) -> list[dict[str, str]]:
+    suffix = Path(filename).suffix.lower()
+    raw_rows: list[list[Any]] = []
+    if suffix == ".csv":
+        decoded = ""
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                decoded = content.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not decoded:
+            raise ValueError("CSV 编码无法识别，请另存为 UTF-8 CSV")
+        raw_rows = list(csv.reader(io.StringIO(decoded)))
+    elif suffix in {".xlsx", ".xlsm"}:
+        from openpyxl import load_workbook
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        sheet = workbook.active
+        raw_rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+    else:
+        raise ValueError("分镜表支持 CSV、XLSX 和 XLSM 文件")
+    raw_rows = [row for row in raw_rows if any(str(value or "").strip() for value in row)]
+    if len(raw_rows) < 2:
+        raise ValueError("分镜表至少需要一行表头和一行分镜数据")
+    headers = [_normalize_storyboard_header(value) for value in raw_rows[0]]
+    rows: list[dict[str, str]] = []
+    for raw in raw_rows[1:]:
+        row = {
+            header: str(raw[index] or "").strip()
+            for index, header in enumerate(headers)
+            if header and index < len(raw) and str(raw[index] or "").strip()
+        }
+        if row:
+            rows.append(row)
+    return rows
+
+
+@router.post("/{project_id}/storyboard/import")
+async def import_storyboard(
+    project_id: str,
+    file: UploadFile = File(...),
+    user_suggestions: str = Form(""),
+    prompt_targets: str = Form("h3,seedance"),
+    h3_skill_id: str = Form("h3-prompt-writing"),
+):
+    project_service.require_project(project_id)
+    filename = Path(file.filename or "storyboard.csv").name
+    content = await file.read(20 * 1024 * 1024 + 1)
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="分镜表请控制在 20MB 以内")
+    try:
+        rows = _extract_storyboard_rows(filename, content)
+        targets = [item.strip() for item in prompt_targets.split(",") if item.strip() in {"h3", "seedance"}]
+        shots = await project_service.import_storyboard(
+            project_id,
+            rows,
+            user_suggestions,
+            targets,
+            h3_skill_id,
+        )
+        return {"shots": shots, "project": store.get_project(project_id), "imported_rows": len(rows)}
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 导入分镜表失败", project_id)
+        raise HTTPException(status_code=500, detail=f"导入分镜表失败: {exc}") from exc
 
 
 @router.post("/{project_id}/script/upload")
@@ -337,15 +609,31 @@ async def export_storyboard(project_id: str):
 async def update_shot(project_id: str, shot_id: str, shot: Shot):
     if shot.id != shot_id or shot.project_id != project_id:
         raise HTTPException(status_code=400, detail="Shot identity mismatch")
-    existing = store.get_shot(shot_id)
-    if existing is None:
+    if store.get_shot(shot_id) is None:
         raise _not_found("Shot not found")
-    if shot.video_prompt != existing.video_prompt:
-        shot.video_prompt_source = shot.video_prompt
-    shot.version += 1
-    saved = store.save_shot(shot)
-    project_service.invalidate_storyboard(project_id)
-    return saved
+    try:
+        return project_service.update_shot(project_id, shot)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/shots/{shot_id}/ai-revise")
+async def revise_shot(project_id: str, shot_id: str, request: ShotReviseRequest):
+    try:
+        return await project_service.revise_shot_with_ai(
+            project_id,
+            shot_id,
+            request.user_suggestions,
+            request.prompt_targets,
+            request.h3_skill_id,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的镜头 %s 单镜重做失败", project_id, shot_id)
+        raise HTTPException(status_code=500, detail=f"单镜 AI 重做失败: {exc}") from exc
 
 
 @router.post("/{project_id}/shots")
@@ -369,7 +657,7 @@ async def create_blank_shot(project_id: str):
         ordinal=len(shots) + 1,
         title=f"镜头 {len(shots) + 1}",
         h3_turbo=False,
-        h3_steps=20,
+        h3_steps=25,
     )
     store.save_shot(shot)
     project_service.invalidate_storyboard(project_id)
@@ -424,6 +712,7 @@ async def delete_asset(project_id: str, asset_id: str):
         raise _not_found("Asset not found")
     if not store.delete_asset(asset_id):
         raise _not_found("Asset not found")
+    storyboard_changed = False
     for shot in store.list_shots(project_id):
         changed = False
         if asset_id in shot.reference_asset_ids:
@@ -445,6 +734,15 @@ async def delete_asset(project_id: str, asset_id: str):
     for character in project.characters:
         if asset_id in character.reference_asset_ids:
             character.reference_asset_ids = [item for item in character.reference_asset_ids if item != asset_id]
+            character_changed = True
+    if project.style_profile and asset_id in project.style_profile.reference_asset_ids:
+        project.style_profile.reference_asset_ids = [
+            item for item in project.style_profile.reference_asset_ids if item != asset_id
+        ]
+        character_changed = True
+    for profile in project.scene_profiles:
+        if asset_id in profile.reference_asset_ids:
+            profile.reference_asset_ids = [item for item in profile.reference_asset_ids if item != asset_id]
             character_changed = True
     if character_changed:
         store.save_project(project)
@@ -474,6 +772,36 @@ async def generate_keyframes(project_id: str, request: KeyframeRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/{project_id}/shots/{shot_id}/keyframe/upload")
+async def upload_keyframe(project_id: str, shot_id: str, file: UploadFile = File(...)):
+    shot = store.get_shot(shot_id)
+    if shot is None or shot.project_id != project_id:
+        raise _not_found("Shot not found")
+    filename = Path(file.filename or "keyframe.png").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+        raise HTTPException(status_code=400, detail="仅支持 PNG/JPG/WebP/BMP 格式的首帧图片")
+    content = await file.read(20 * 1024 * 1024 + 1)
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="首帧图片请控制在 20MB 以内")
+    image_dir = project_service.project_dir(project_id) / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    destination = image_dir / f"{shot.id}-upload-{uuid4().hex}{suffix}"
+    destination.write_bytes(content)
+    asset = project_service.register_existing_asset(
+        project_id,
+        destination,
+        role=AssetRole.KEYFRAME,
+        name=f"镜头 {shot.ordinal} 首帧（本地上传）",
+        description=shot.keyframe_prompt or "",
+    )
+    shot.keyframe_asset_id = asset.id
+    shot.image_path = str(destination)
+    shot.image_status = "completed"
+    shot.version += 1
+    return store.save_shot(shot)
+
+
 @router.post("/{project_id}/h3-prompts/generate")
 async def generate_h3_prompts(project_id: str, request: H3PromptGenerateRequest):
     try:
@@ -490,6 +818,76 @@ async def generate_h3_prompts(project_id: str, request: H3PromptGenerateRequest)
     except Exception as exc:
         logger.exception("项目 %s 的 H3 Prompt Skill 生成失败", project_id)
         raise HTTPException(status_code=500, detail=f"H3 Prompt 生成失败: {exc}") from exc
+
+
+@router.post("/{project_id}/seedance-prompts/generate")
+async def generate_seedance_prompts(project_id: str, request: SeedancePromptGenerateRequest):
+    try:
+        return project_service.generate_seedance_prompts(project_id, request.shot_ids)
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/seedance/estimate")
+async def estimate_seedance(project_id: str, request: SeedanceEstimateRequest):
+    try:
+        project = project_service.require_project(project_id)
+        shots = store.list_shots(project_id)
+        if request.shot_ids is not None:
+            selected = set(request.shot_ids)
+            shots = [shot for shot in shots if shot.id in selected]
+        if not shots:
+            raise ValueError("请至少选择一个镜头")
+        model = resolve_seedance_model(request.model_id)
+        resolution = validate_seedance_resolution(model.id, request.resolution)
+        assets = store.list_assets(project_id)
+        estimates = []
+        for shot in shots:
+            refs = project_service.seedance_reference_assets(shot, assets)
+            estimates.append(
+                estimate_seedance_cost(
+                    model.id,
+                    resolution,
+                    project.brief.aspect_ratio,
+                    [shot.duration_seconds],
+                    has_video_input=any(asset.type == AssetType.VIDEO for asset in refs),
+                )
+            )
+        total_tokens = sum(int(item["estimated_tokens"]) for item in estimates)
+        total_cost = sum(float(item["estimated_yuan"]) for item in estimates)
+        total_billed = sum(int(item["billed_duration_seconds"]) for item in estimates)
+        result = dict(estimates[0])
+        result.update(
+            {
+                "shot_count": len(estimates),
+                "requested_duration_seconds": round(sum(shot.duration_seconds for shot in shots), 3),
+                "billed_duration_seconds": total_billed,
+                "estimated_tokens": total_tokens,
+                "unit_price_per_million_tokens": round(total_cost * 1_000_000 / total_tokens, 4) if total_tokens else 0,
+                "estimated_yuan": round(total_cost, 4),
+                "estimated_yuan_per_second": round(
+                    sum(float(item["estimated_yuan_per_second"]) * int(item["billed_duration_seconds"]) for item in estimates) / total_billed,
+                    4,
+                ) if total_billed else 0,
+                "estimated_yuan_per_task": round(sum(float(item["estimated_yuan_per_task"]) for item in estimates) / len(estimates), 4),
+                "has_video_input": any(bool(item["has_video_input"]) for item in estimates),
+                "note": "已逐镜按是否包含参考视频使用对应单价估算；最终以方舟任务 usage 与账单为准。",
+            }
+        )
+        return result
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{project_id}/seedance/preflight")
+async def seedance_preflight(project_id: str, model_id: str | None = None, resolution: str | None = None):
+    project_service.require_project(project_id)
+    try:
+        return await SeedanceClient().preflight(model_id, resolution)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _safe_archive_component(value: str, fallback: str) -> str:
@@ -562,6 +960,14 @@ async def plan_render(project_id: str):
 @router.post("/{project_id}/render")
 async def enqueue_render(project_id: str, request: RenderRequest):
     try:
+        if request.provider == "ark_seedance":
+            return render_queue.enqueue_seedance(
+                project_id,
+                request.shot_ids,
+                model_id=request.model_id,
+                resolution=request.resolution,
+                generate_audio=request.generate_audio,
+            )
         return render_queue.enqueue(project_id, request.shot_ids)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -581,6 +987,27 @@ async def cancel_job(project_id: str, job_id: str):
     return await render_queue.cancel(job_id)
 
 
+@router.delete("/{project_id}/jobs/{job_id}")
+async def delete_job(project_id: str, job_id: str):
+    job = store.get_job(job_id)
+    if job is None or job.project_id != project_id:
+        raise _not_found("Job not found")
+    if job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
+        raise HTTPException(status_code=409, detail="任务仍在进行中，请先取消后再删除")
+    store.delete_job(job_id)
+    if job.shot_id:
+        shot = store.get_shot(job.shot_id)
+        if shot:
+            remaining = [item for item in store.list_jobs(project_id) if item.shot_id == job.shot_id]
+            if remaining:
+                latest = max(remaining, key=lambda item: item.updated_at)
+                shot.video_status = "failed" if latest.status == JobStatus.FAILED else latest.status.value
+            else:
+                shot.video_status = "pending"
+            store.save_shot(shot)
+    return {"deleted": True}
+
+
 @router.get("/{project_id}/comfyui/preflight")
 async def comfyui_preflight(project_id: str):
     project_service.require_project(project_id)
@@ -588,8 +1015,21 @@ async def comfyui_preflight(project_id: str):
     builder = H3WorkflowBuilder()
     try:
         system = await client.health()
-        preflight = await client.preflight(builder.preflight_requirements())
-        return {"online": True, "system": system, **preflight}
+        model_profile = resolve_h3_model_profile(None)
+        text_encoder_profile = resolve_h3_text_encoder_profile(None)
+        selected_models = [
+            h3_diffusion_model(model_profile, GenerationMode.I2V),
+            h3_diffusion_model(model_profile, GenerationMode.R2V),
+            h3_text_encoder(text_encoder_profile),
+        ]
+        preflight = await client.preflight(builder.preflight_requirements(selected_models))
+        return {
+            "online": True,
+            "system": system,
+            "model_profile": model_profile,
+            "text_encoder_profile": text_encoder_profile,
+            **preflight,
+        }
     except Exception as exc:
         return {"online": False, "ok": False, "error": str(exc)}
 
@@ -623,7 +1063,7 @@ async def finalize_project(project_id: str, request: FinalizeRequest):
 
 
 @router.get("/{project_id}/download/{kind}/{item_id}")
-async def download_project_file(project_id: str, kind: str, item_id: str):
+async def download_project_file(project_id: str, kind: str, item_id: str, inline: bool = False):
     if kind == "asset":
         item = store.get_asset(item_id)
         path = resolve_media_path(item.path) if item and item.project_id == project_id else None
@@ -640,7 +1080,10 @@ async def download_project_file(project_id: str, kind: str, item_id: str):
         raise HTTPException(status_code=400, detail="Invalid file kind")
     if path is None or not path.exists():
         raise _not_found("File not found")
-    return FileResponse(path, filename=path.name)
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    if inline:
+        return FileResponse(path, media_type=media_type)
+    return FileResponse(path, filename=path.name, media_type=media_type)
 
 
 @public_router.get("/{token}")

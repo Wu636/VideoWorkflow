@@ -47,6 +47,16 @@ export interface ProjectBrief {
     delivery_notes: string;
 }
 
+export interface CharacterAppearanceProfile {
+    id: string;
+    label: string;
+    time_context: string;
+    description: string;
+    wardrobe: string;
+    reference_asset_ids: string[];
+    approved: boolean;
+}
+
 export interface CharacterProfile {
     id: string;
     name: string;
@@ -55,6 +65,37 @@ export interface CharacterProfile {
     voice_description: string;
     tts_voice: string;
     reference_asset_ids: string[];
+    appearance_profiles: CharacterAppearanceProfile[];
+}
+
+export interface StyleProfile {
+    name: string;
+    medium: string;
+    palette: string;
+    lighting: string;
+    camera_language: string;
+    composition: string;
+    texture: string;
+    motion_language: string;
+    analysis_summary: string;
+    negative_constraints: string;
+    reference_asset_ids: string[];
+    approved: boolean;
+}
+
+export interface StyleAnalysisDraft extends StyleProfile {
+    confidence: number;
+    observations: string[];
+}
+
+export interface SceneProfile {
+    id: string;
+    name: string;
+    description: string;
+    continuity_notes: string;
+    reference_asset_ids: string[];
+    source_shot_ids: string[];
+    approved: boolean;
 }
 
 export interface Project {
@@ -62,8 +103,14 @@ export interface Project {
     status: ProjectStatus;
     brief: ProjectBrief;
     style_bible: string;
+    style_profile: StyleProfile | null;
+    scene_consistency_mode: "off" | "optional" | "strict";
+    scene_profiles: SceneProfile[];
+    preferred_prompt_targets: ("h3" | "seedance")[];
     characters: CharacterProfile[];
     ai_recommended_shot_count: number | null;
+    storyboard_count_mode: "manual" | "ai";
+    manual_shot_count: number | null;
     review_token: string;
     storyboard_version: number;
     created_at: string;
@@ -162,7 +209,12 @@ export interface Shot {
     dialogue_turns: { speaker_id: string | null; text: string }[];
     duration_seconds: number;
     scene_description: string;
+    scene_profile_id: string | null;
+    use_scene_profile: boolean;
+    continuity_mode: "independent" | "same_scene" | "continuous";
+    continuity_source_shot_id: string | null;
     character_ids: string[];
+    character_appearance_ids: Record<string, string>;
     shot_size: string;
     camera_angle: string;
     lens: string;
@@ -177,6 +229,15 @@ export interface Shot {
     h3_prompt_skill_id: string;
     h3_prompt_skill_version: string;
     h3_prompt_skill_output: string;
+    seedance_prompt: string;
+    seedance_prompt_version: string;
+    content_revision: number;
+    keyframe_prompt_source_revision: number;
+    h3_prompt_source_revision: number;
+    seedance_prompt_source_revision: number;
+    keyframe_revision_suggestion_draft: string;
+    keyframe_revision_last_suggestion: string;
+    keyframe_revision_mode: "fresh" | "iterate";
     negative_prompt: string;
     generation_mode: GenerationMode;
     resolved_generation_mode: GenerationMode | null;
@@ -193,6 +254,8 @@ export interface Shot {
     h3_width: number | null;
     h3_height: number | null;
     h3_turbo: boolean;
+    h3_model_profile: "default" | "pruned_int8" | "pruned_fp8" | "full_int8" | "pruned_bf16" | "full_bf16";
+    h3_text_encoder_profile: "default" | "nvfp4" | "int8" | "bf16";
     h3_steps: number;
     h3_scheduler: "simple" | "sgm_uniform" | "karras" | "exponential" | "ddim_uniform" | "beta" | "normal" | "linear_quadratic" | "kl_optimal";
     h3_denoise: number;
@@ -247,6 +310,45 @@ export interface RenderJob {
     started_at: string | null;
     completed_at: string | null;
     updated_at: string;
+}
+
+export interface SeedanceModelOption {
+    id: string;
+    label: string;
+    description: string;
+    price_per_million_tokens: number;
+    video_input_price_per_million_tokens: number;
+    resolutions: string[];
+    example_720p_yuan_per_second: number;
+    example_720p_yuan_per_task: number;
+}
+
+export interface SeedanceCatalog {
+    default_model: string;
+    default_resolution: string;
+    models: SeedanceModelOption[];
+    ratios: string[];
+    configured: boolean;
+    pricing_source: string;
+    prompt_guide: string;
+}
+
+export interface SeedanceEstimate {
+    model_id: string;
+    resolution: string;
+    ratio: string;
+    width: number;
+    height: number;
+    shot_count: number;
+    requested_duration_seconds: number;
+    billed_duration_seconds: number;
+    estimated_tokens: number;
+    unit_price_per_million_tokens: number;
+    estimated_yuan: number;
+    estimated_yuan_per_second: number;
+    estimated_yuan_per_task: number;
+    has_video_input: boolean;
+    note: string;
 }
 
 export interface Review {

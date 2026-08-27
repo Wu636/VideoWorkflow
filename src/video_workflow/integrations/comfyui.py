@@ -32,6 +32,59 @@ H3_SCHEDULERS = {
     "kl_optimal",
 }
 
+H3_DIFFUSION_MODELS: dict[str, dict[GenerationMode, str]] = {
+    "pruned_int8": {
+        GenerationMode.I2V: "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        GenerationMode.R2V: "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    },
+    "pruned_fp8": {
+        GenerationMode.I2V: "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+        GenerationMode.R2V: "minimax_h3_ref2va_pruned_fp8_scaled.safetensors",
+    },
+    "full_int8": {
+        GenerationMode.I2V: "minimax_h3_fl2va_int8_convrot.safetensors",
+        GenerationMode.R2V: "minimax_h3_ref2va_int8_convrot.safetensors",
+    },
+    "pruned_bf16": {
+        GenerationMode.I2V: "minimax_h3_fl2va_pruned_bf16.safetensors",
+        GenerationMode.R2V: "minimax_h3_ref2va_pruned_bf16.safetensors",
+    },
+    "full_bf16": {
+        GenerationMode.I2V: "minimax_h3_fl2va_bf16.safetensors",
+        GenerationMode.R2V: "minimax_h3_ref2va_bf16.safetensors",
+    },
+}
+
+H3_TEXT_ENCODERS = {
+    "nvfp4": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "int8": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+    "bf16": "qwen3vl_32b_minimax_h3_bf16.safetensors",
+}
+
+
+def resolve_h3_model_profile(profile: str | None) -> str:
+    selected = profile if profile and profile != "default" else settings.H3_MODEL_PROFILE
+    if selected not in H3_DIFFUSION_MODELS:
+        raise ComfyUIError(f"未知 H3 diffusion 模型档位: {selected}")
+    return selected
+
+
+def resolve_h3_text_encoder_profile(profile: str | None) -> str:
+    selected = profile if profile and profile != "default" else settings.H3_TEXT_ENCODER_PROFILE
+    if selected not in H3_TEXT_ENCODERS:
+        raise ComfyUIError(f"未知 H3 文本编码器档位: {selected}")
+    return selected
+
+
+def h3_diffusion_model(profile: str | None, mode: GenerationMode) -> str:
+    if mode not in {GenerationMode.I2V, GenerationMode.R2V}:
+        raise ComfyUIError(f"H3 模型档位不支持生成模式: {mode}")
+    return H3_DIFFUSION_MODELS[resolve_h3_model_profile(profile)][mode]
+
+
+def h3_text_encoder(profile: str | None) -> str:
+    return H3_TEXT_ENCODERS[resolve_h3_text_encoder_profile(profile)]
+
 
 class ComfyUIError(RuntimeError):
     pass
@@ -60,6 +113,8 @@ class H3WorkflowRequest:
     low_vram: bool = False
     shift_video: float = 12.0
     shift_audio: float = 3.0
+    diffusion_model: str | None = None
+    text_encoder_model: str | None = None
 
 
 def h3_frames_for_seconds(seconds: float) -> int:
@@ -105,6 +160,11 @@ class H3WorkflowBuilder:
             self._attach_references(workflow, request)
         else:
             raise ComfyUIError(f"Unsupported H3 generation mode: {request.mode}")
+
+        if request.diffusion_model:
+            workflow["1"]["inputs"]["unet_name"] = request.diffusion_model
+        if request.text_encoder_model:
+            workflow["2"]["inputs"]["clip_name"] = request.text_encoder_model
 
         workflow["8"]["inputs"].update(
             prompt=request.prompt,
@@ -172,7 +232,12 @@ class H3WorkflowBuilder:
         if not request.reference_images and not request.reference_videos and not request.reference_audios:
             raise ComfyUIError("R2V requires at least one reference image, video, or audio")
 
-    def preflight_requirements(self) -> dict[str, list[str]]:
+    def preflight_requirements(
+        self,
+        selected_models: list[str] | None = None,
+        *,
+        require_turbo: bool = False,
+    ) -> dict[str, list[str]]:
         workflows = [self._load(Path(self.i2v_path)), self._load(Path(self.r2v_path))]
         node_types = sorted({node["class_type"] for workflow in workflows for node in workflow.values()})
         # These nodes are injected only when an R2V shot contains video/audio refs,
@@ -185,7 +250,7 @@ class H3WorkflowBuilder:
                 inputs = node.get("inputs", {})
                 for key in ("unet_name", "clip_name", "vae_name"):
                     value = inputs.get(key)
-                    if isinstance(value, str):
+                    if isinstance(value, str) and (selected_models is None or key == "vae_name"):
                         model_names.append(value)
                 # The acceleration LoRA is needed only by the optional Turbo
                 # preview profile.  Native 20-step final rendering deliberately
@@ -194,6 +259,11 @@ class H3WorkflowBuilder:
                 lora_name = inputs.get("lora_name")
                 if isinstance(lora_name, str):
                     optional_model_names.append(lora_name)
+        if selected_models is not None:
+            model_names.extend(selected_models)
+        if require_turbo:
+            model_names.extend(optional_model_names)
+            optional_model_names = []
         return {
             "nodes": node_types,
             "models": sorted(set(model_names)),
@@ -252,6 +322,15 @@ class ComfyUIClient:
         optional_models = requirements.get("optional_models", [])
         missing_models = [name for name in required_models if name not in available_strings]
         missing_optional_models = [name for name in optional_models if name not in available_strings]
+
+        def loader_models(node_name: str, input_name: str) -> list[str]:
+            try:
+                definition = object_info[node_name]["input"]["required"][input_name]
+                options = definition[0]
+            except (KeyError, IndexError, TypeError):
+                return []
+            return sorted({value for value in options if isinstance(value, str)}) if isinstance(options, list) else []
+
         return {
             "ok": not missing_nodes and not missing_models,
             "missing_nodes": missing_nodes,
@@ -259,6 +338,8 @@ class ComfyUIClient:
             "required_models": required_models,
             "missing_optional_models": missing_optional_models,
             "optional_models": optional_models,
+            "available_diffusion_models": loader_models("UNETLoader", "unet_name"),
+            "available_text_encoders": loader_models("CLIPLoader", "clip_name"),
         }
 
     async def upload_input(self, path: Path, remote_name: str | None = None) -> str:

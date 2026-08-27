@@ -5,6 +5,12 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8001:8001"
+    # Quick-tunnel hostnames can be negatively cached as NXDOMAIN by local
+    # router/ISP resolvers right after a tunnel restart; public resolvers keep
+    # the Seedance asset readability check reliable.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     volumes:
       - ./outputs:/app/outputs # Persist outputs
       - ./src:/app/src # Hot reload support (optional if mapped correctly with volume/reload)

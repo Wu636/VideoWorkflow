@@ -14,7 +14,7 @@ class Scene(BaseModel):
     visual_prompt: str = Field(..., description="General visual direction for the storyboard shot")
     keyframe_prompt: str = Field(default="", description="Static opening-frame image generation prompt")
     motion_prompt: str = Field(..., description="Prompt describing the movement/action for video generation")
-    duration: int = Field(default=5, ge=4, le=12, description="Video duration in seconds (4-12)")
+    duration: int = Field(default=5, ge=4, le=15, description="Video duration in seconds (4-15)")
     story_beat: str = Field(default="", description="What happens in this shot, separate from dialogue")
     dialogue: str = Field(default="", description="Spoken dialogue or voiceover")
     dialogue_speaker: str = Field(default="", description="Exact character name who speaks; empty for narration or silence")

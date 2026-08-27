@@ -43,6 +43,18 @@ class GenerationMode(str, Enum):
     R2V = "r2v"
 
 
+class SceneConsistencyMode(str, Enum):
+    OFF = "off"
+    OPTIONAL = "optional"
+    STRICT = "strict"
+
+
+class ShotContinuityMode(str, Enum):
+    INDEPENDENT = "independent"
+    SAME_SCENE = "same_scene"
+    CONTINUOUS = "continuous"
+
+
 class AssetType(str, Enum):
     IMAGE = "image"
     VIDEO = "video"
@@ -103,6 +115,18 @@ class ProjectBrief(BaseModel):
         return max(32, round(value / 32) * 32)
 
 
+class CharacterAppearanceProfile(BaseModel):
+    """A reusable look for one character at a specific story period/state."""
+
+    id: str = Field(default_factory=lambda: new_id("appearance"))
+    label: str = "默认形象"
+    time_context: str = ""
+    description: str = ""
+    wardrobe: str = ""
+    reference_asset_ids: list[str] = Field(default_factory=list)
+    approved: bool = False
+
+
 class CharacterProfile(BaseModel):
     id: str = Field(default_factory=lambda: new_id("character"))
     name: str
@@ -111,6 +135,37 @@ class CharacterProfile(BaseModel):
     voice_description: str = ""
     tts_voice: str = ""
     reference_asset_ids: list[str] = Field(default_factory=list)
+    appearance_profiles: list[CharacterAppearanceProfile] = Field(default_factory=list)
+
+
+class StyleProfile(BaseModel):
+    name: str = ""
+    medium: str = ""
+    palette: str = ""
+    lighting: str = ""
+    camera_language: str = ""
+    composition: str = ""
+    texture: str = ""
+    motion_language: str = ""
+    analysis_summary: str = ""
+    negative_constraints: str = ""
+    reference_asset_ids: list[str] = Field(default_factory=list)
+    approved: bool = False
+
+
+class StyleAnalysisDraft(StyleProfile):
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    observations: list[str] = Field(default_factory=list)
+
+
+class SceneProfile(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("scene"))
+    name: str
+    description: str = ""
+    continuity_notes: str = ""
+    reference_asset_ids: list[str] = Field(default_factory=list)
+    source_shot_ids: list[str] = Field(default_factory=list)
+    approved: bool = False
 
 
 class Project(BaseModel):
@@ -118,8 +173,16 @@ class Project(BaseModel):
     status: ProjectStatus = ProjectStatus.BRIEF_DRAFT
     brief: ProjectBrief
     style_bible: str = ""
+    style_profile: StyleProfile | None = None
+    scene_consistency_mode: SceneConsistencyMode = SceneConsistencyMode.OFF
+    scene_profiles: list[SceneProfile] = Field(default_factory=list)
+    preferred_prompt_targets: list[Literal["h3", "seedance"]] = Field(
+        default_factory=lambda: ["h3", "seedance"]
+    )
     characters: list[CharacterProfile] = Field(default_factory=list)
     ai_recommended_shot_count: int | None = Field(default=None, ge=1, le=500)
+    storyboard_count_mode: Literal["manual", "ai"] = "ai"
+    manual_shot_count: int | None = Field(default=None, ge=1, le=500)
     review_token: str = Field(default_factory=lambda: new_id("review"))
     storyboard_version: int = 1
     created_at: str = Field(default_factory=utc_now)
@@ -174,7 +237,15 @@ class Shot(BaseModel):
     dialogue_turns: list[DialogueTurn] = Field(default_factory=list)
     duration_seconds: float = Field(default=5.0, ge=0.25, le=15.0)
     scene_description: str = ""
+    scene_profile_id: str | None = None
+    use_scene_profile: bool = False
+    continuity_mode: ShotContinuityMode = ShotContinuityMode.INDEPENDENT
+    continuity_source_shot_id: str | None = None
     character_ids: list[str] = Field(default_factory=list)
+    # character_id -> appearance_profile_id. Empty means use the character's
+    # base/default look. This lets one person age, change body state or wardrobe
+    # across a long story without creating duplicate identities.
+    character_appearance_ids: dict[str, str] = Field(default_factory=dict)
     shot_size: str = "中景"
     camera_angle: str = "平视"
     lens: str = "标准镜头"
@@ -193,6 +264,18 @@ class Shot(BaseModel):
     h3_prompt_skill_id: str = "h3-prompt-writing"
     h3_prompt_skill_version: str = ""
     h3_prompt_skill_output: str = ""
+    # Seedance uses its own Chinese, numbered-material prompt grammar.  Keep it
+    # separate from the MiniMax H3 prompt so switching providers never destroys
+    # either approved version.
+    seedance_prompt: str = ""
+    seedance_prompt_version: str = ""
+    content_revision: int = 1
+    keyframe_prompt_source_revision: int = 1
+    h3_prompt_source_revision: int = 0
+    seedance_prompt_source_revision: int = 0
+    keyframe_revision_suggestion_draft: str = ""
+    keyframe_revision_last_suggestion: str = ""
+    keyframe_revision_mode: Literal["fresh", "iterate"] = "fresh"
     negative_prompt: str = ""
     generation_mode: GenerationMode = GenerationMode.AUTO
     resolved_generation_mode: GenerationMode | None = None
@@ -211,6 +294,10 @@ class Shot(BaseModel):
     # True preserves existing 4-step jobs.  The quality preset explicitly
     # switches this off and uses the official native 20-step path.
     h3_turbo: bool = True
+    h3_model_profile: Literal[
+        "default", "pruned_int8", "pruned_fp8", "full_int8", "pruned_bf16", "full_bf16"
+    ] = "default"
+    h3_text_encoder_profile: Literal["default", "nvfp4", "int8", "bf16"] = "default"
     h3_steps: int = Field(default=4, ge=1, le=100)
     h3_scheduler: Literal[
         "simple",

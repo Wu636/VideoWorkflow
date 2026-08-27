@@ -198,6 +198,11 @@ class ProjectStore:
             cursor = conn.execute("DELETE FROM assets WHERE id=?", (asset_id,))
             return cursor.rowcount > 0
 
+    def delete_job(self, job_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute("DELETE FROM render_jobs WHERE id=?", (job_id,))
+            return cursor.rowcount > 0
+
     def save_job(self, job: RenderJob) -> RenderJob:
         job.updated_at = utc_now()
         with self._lock, self._connect() as conn:

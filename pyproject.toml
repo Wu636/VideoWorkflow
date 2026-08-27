@@ -21,7 +21,8 @@ dependencies = [
     "zhipuai>=2.0.0",
     "python-docx>=1.1.0",
     "pypdf>=5.0.0",
-    "edge-tts>=7.2.8"
+    "edge-tts>=7.2.8",
+    "openpyxl>=3.1.0"
 ]
 requires-python = ">=3.10"
 readme = "README.md"

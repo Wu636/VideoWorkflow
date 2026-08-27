@@ -81,6 +81,8 @@ brew install ffmpeg
 LLM_PROVIDER=ark
 ARK_API_KEY=你的方舟Key
 ARK_LLM_MODEL=你的模型或推理接入点
+SEEDANCE_DEFAULT_MODEL=doubao-seedance-2-0-mini-260615
+SEEDANCE_DEFAULT_RESOLUTION=720p
 
 IMAGE_PROVIDER=ark
 ARK_IMAGE_MODEL=doubao-seedream-4-5-251128
@@ -102,6 +104,13 @@ NEXT_PUBLIC_APP_URL=https://你的工作台域名
 ```
 
 仅在本机制作时保留默认 `localhost` 即可。
+
+### Seedance 2.0 逐镜生成
+
+进入项目的“视频生成”页后：选择 `Seedance 2.0 API` → 勾选镜头 → 选择
+2.0 / Fast / Mini 与清晰度 → “编译所选 Prompt” → 核对实时费用 → 提交。
+系统按镜头把任务写入本地持久队列，后台向方舟异步提交、轮询并下载 MP4；重启工作台后仍可继续查询。
+Seedance Prompt 与 H3 Prompt 分开保存，素材编号严格按实际发送的 `图片1`、`视频1`、`音频1` 顺序生成。
 
 MiniMax H3 必须使用已经实测通过的文件：
 

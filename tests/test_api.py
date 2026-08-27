@@ -7,8 +7,9 @@ import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from openpyxl import Workbook
 
-from src.video_workflow.domain import AssetRole, Delivery, Shot
+from src.video_workflow.domain import AssetRole, Delivery, JobStatus, JobType, RenderJob, Shot
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
@@ -34,6 +35,28 @@ class ProjectApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         router.store, router.project_service, router.render_queue, router.finalizer = self.old
         self.temp.cleanup()
+
+    def test_extract_storyboard_rows_from_xlsx(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["镜头标题", "剧情内容", "时长(秒)", "Seedance Prompt"])
+        sheet.append(["开场", "人物推门进入", 6, "固定中景，人物缓慢进入"])
+        payload = io.BytesIO()
+        workbook.save(payload)
+
+        rows = router._extract_storyboard_rows("客户分镜.xlsx", payload.getvalue())
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "title": "开场",
+                    "narrative": "人物推门进入",
+                    "duration_seconds": "6",
+                    "seedance_prompt": "固定中景，人物缓慢进入",
+                }
+            ],
+        )
 
     def test_project_shot_asset_and_public_review_flow(self) -> None:
         response = self.client.post(
@@ -199,6 +222,76 @@ class ProjectApiTests(unittest.TestCase):
         )
         self.assertEqual(empty.status_code, 400, empty.text)
         self.assertIn("没有可导出", empty.json()["detail"])
+
+
+    def test_render_job_delete_requires_terminal_status(self) -> None:
+        response = self.client.post(
+            "/api/projects",
+            json={"title": "删除任务", "story": "删除渲染任务记录", "target_duration_seconds": 10},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        project_id = response.json()["id"]
+
+        shot = Shot(project_id=project_id, ordinal=1, narrative="镜头叙事", duration_seconds=5)
+        router.store.save_shot(shot)
+        completed_job = router.store.save_job(
+            RenderJob(project_id=project_id, shot_id=shot.id, type=JobType.VIDEO, status=JobStatus.COMPLETED)
+        )
+        running_job = router.store.save_job(
+            RenderJob(project_id=project_id, shot_id=shot.id, type=JobType.VIDEO, status=JobStatus.RUNNING)
+        )
+
+        response = self.client.delete(f"/api/projects/{project_id}/jobs/{running_job.id}")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("进行中", response.json()["detail"])
+
+        response = self.client.delete(f"/api/projects/{project_id}/jobs/{completed_job.id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["deleted"])
+        self.assertIsNone(router.store.get_job(completed_job.id))
+        # running job remains -> video_status follows the latest remaining job
+        self.assertEqual(router.store.get_shot(shot.id).video_status, "running")
+
+        running_job.status = JobStatus.FAILED
+        router.store.save_job(running_job)
+        response = self.client.delete(f"/api/projects/{project_id}/jobs/{running_job.id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        # no job left for the shot -> back to pending
+        self.assertEqual(router.store.get_shot(shot.id).video_status, "pending")
+
+        response = self.client.delete(f"/api/projects/{project_id}/jobs/{running_job.id}")
+        self.assertEqual(response.status_code, 404)
+
+    def test_keyframe_upload_replaces_shot_binding(self) -> None:
+        project = self.client.post(
+            "/api/projects",
+            json={"title": "首帧上传测试", "story": "一个镜头", "target_duration_seconds": 5},
+        ).json()
+        project_id = project["id"]
+        shot = router.store.save_shot(Shot(project_id=project_id, ordinal=1, title="开场"))
+
+        response = self.client.post(
+            f"/api/projects/{project_id}/shots/{shot.id}/keyframe/upload",
+            files={"file": ("local-frame.png", b"fake-png-content", "image/png")},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        updated = response.json()
+        self.assertEqual(updated["image_status"], "completed")
+        self.assertTrue(updated["keyframe_asset_id"])
+        asset = router.store.get_asset(updated["keyframe_asset_id"])
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset.role, AssetRole.KEYFRAME)
+        self.assertIn("本地上传", asset.name)
+        reloaded = router.store.get_shot(shot.id)
+        self.assertEqual(reloaded.keyframe_asset_id, asset.id)
+        self.assertTrue(Path(reloaded.image_path).exists())
+
+        bad = self.client.post(
+            f"/api/projects/{project_id}/shots/{shot.id}/keyframe/upload",
+            files={"file": ("notes.txt", b"not an image", "text/plain")},
+        )
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("仅支持", bad.json()["detail"])
 
 
 if __name__ == "__main__":

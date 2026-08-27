@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     ARK_BASE_URL: str = "https://ark.cn-beijing.volces.com/api/v3"
     
     # Models
-    ARK_VIDEO_MODEL: str = "doubao-seedance-1-5-pro"  # 豆宝-Seedance-1.5-pro
+    ARK_VIDEO_MODEL: str = "doubao-seedance-2-0-260128"
     ARK_IMAGE_MODEL: str = "doubao-seedream-4-5-251128"  # 豆宝-Seedream-4.5
     ARK_VISION_MODEL: str = "doubao-seed-1-6-251015"  # 豆包多模态（用于参考图分析）
 
@@ -63,6 +63,16 @@ class Settings(BaseSettings):
     IMAGE_TIMEOUT_RETRY_COUNT: int = 1
     IMAGE_TIMEOUT_RETRY_DELAY_SECONDS: float = 1.5
     VIDEO_GENERATION_TIMEOUT_SECONDS: int = 900
+    SEEDANCE_DEFAULT_MODEL: str = "doubao-seedance-2-0-mini-260615"
+    SEEDANCE_DEFAULT_RESOLUTION: str = "480p"
+    SEEDANCE_POLL_INTERVAL_SECONDS: float = 10.0
+    SEEDANCE_JOB_TIMEOUT_SECONDS: int = 3600
+    SEEDANCE_INLINE_ASSET_MAX_MB: int = 25
+    # Ark video generation only accepts remotely downloadable HTTP(S) media.
+    # Point this at the public origin/tunnel that exposes the signed
+    # /api/projects/seedance-assets/* endpoint below.
+    SEEDANCE_PUBLIC_ASSET_BASE_URL: str | None = None
+    SEEDANCE_ASSET_URL_TTL_SECONDS: int = 86400
     OUTPUT_DIR: Path = Path("outputs")
 
     # Project workspace / durable state
@@ -86,6 +96,11 @@ class Settings(BaseSettings):
     H3_DEFAULT_HEIGHT: int = 768
     H3_DEFAULT_FPS: float = 24.0
     H3_DEFAULT_REF_IMAGE_SIZE: str = "match"
+    # Model defaults can be overridden per shot.  pruned_int8 + nvfp4 is the
+    # low-memory baseline; higher precision profiles require CPU offload or a
+    # larger/multi-GPU host and are intentionally never selected implicitly.
+    H3_MODEL_PROFILE: str = "pruned_int8"
+    H3_TEXT_ENCODER_PROFILE: str = "nvfp4"
     H3_AUTO_SEGMENT_COMPLEX_SHOTS: bool = True
     H3_MAX_SEGMENT_SECONDS: float = 7.0
     H3_POSTPROCESS_AUDIO: bool = True
