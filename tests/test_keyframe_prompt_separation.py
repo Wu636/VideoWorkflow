@@ -99,9 +99,12 @@ class KeyframePromptSeparationTests(unittest.TestCase):
         ):
             generated = asyncio.run(self.service.generate_keyframes(project.id, [shot.id]))
 
-        self.assertEqual(captured["prompt"], "STATIC_KEYFRAME_PROMPT")
+        self.assertIn("【首帧画面】STATIC_KEYFRAME_PROMPT", str(captured["prompt"]))
+        self.assertIn("不生成任何可读文字", str(captured["prompt"]))
+        self.assertNotIn("GENERIC_STORYBOARD_PROMPT", str(captured["prompt"]))
+        self.assertNotIn("MINIMAX_H3_PROMPT", str(captured["prompt"]))
         self.assertEqual(generated[0].visual_prompt, "GENERIC_STORYBOARD_PROMPT")
-        self.assertEqual(generated[0].keyframe_prompt, "STATIC_KEYFRAME_PROMPT")
+        self.assertEqual(generated[0].keyframe_prompt, captured["prompt"])
         self.assertEqual(generated[0].video_prompt, "MINIMAX_H3_PROMPT")
 
     def test_explicit_empty_character_description_suppresses_global_default(self) -> None:
@@ -193,10 +196,14 @@ class KeyframePromptSeparationTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(captured["prompt"], title_prompt)
+        self.assertNotIn(title_prompt, str(captured["prompt"]))
+        self.assertIn("预留干净无字信息区", str(captured["prompt"]))
+        self.assertNotIn("【本次修改建议", str(captured["prompt"]))
+        self.assertIn("【风格锚点】低饱和度 3D", str(captured["prompt"]))
+        self.assertIn("文字统一后期叠加", str(captured["prompt"]))
         self.assertEqual(captured["character_description"], "")
         self.assertIsNone(captured["references"])
-        self.assertEqual(captured["image_style"], "低饱和度 3D")
+        self.assertEqual(captured["image_style"], "")
 
     def test_keyframe_uses_only_named_character_visual_details(self) -> None:
         project = self.service.create_project(ProjectBrief(title="单人镜头", story="测试"))

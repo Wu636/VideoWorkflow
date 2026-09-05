@@ -9,6 +9,8 @@ from typing import Any, Literal
 from pydantic import TypeAdapter
 
 from src.video_workflow.config import settings
+from src.video_workflow.integrations.atlas_h3 import ATLAS_MODEL_ID as ATLAS_H3_MODEL_LABEL
+from src.video_workflow.integrations.metaso_h3 import METASO_H3_MODEL_ID
 
 
 @dataclass(frozen=True)
@@ -22,15 +24,22 @@ class RuntimeField:
 
 
 RUNTIME_FIELDS = (
-    RuntimeField("LLM_PROVIDER", "llm", "分镜生成模型", "用于生成完整分镜表。", options=("deepseek", "glm", "ark", "ark_doubao", "ark_deepseek")),
-    RuntimeField("BRIEF_ANALYSIS_PROVIDER", "llm", "剧本分析模型", "auto 表示沿用分镜模型，遇到参考图时切到视觉模型。", options=("auto", "deepseek", "glm", "ark", "ark_doubao", "ark_deepseek")),
-    RuntimeField("SHOT_COUNT_PROVIDER", "llm", "镜头数建议模型", "auto 表示沿用剧本分析模型。", options=("auto", "deepseek", "glm", "ark", "ark_doubao", "ark_deepseek")),
-    RuntimeField("REFERENCE_ANALYSIS_PROVIDER", "llm", "参考图理解模型", "auto 按方舟视觉 → GLM → 剧本模型选择已配置服务。", options=("auto", "glm", "ark", "ark_doubao")),
+    RuntimeField("LLM_PROVIDER", "llm", "分镜生成模型", "用于生成完整分镜表。", options=("deepseek", "glm", "openlux", "ark", "ark_doubao", "ark_deepseek")),
+    RuntimeField("BRIEF_ANALYSIS_PROVIDER", "llm", "剧本分析模型", "auto 表示沿用分镜模型，遇到参考图时优先使用同一多模态服务。", options=("auto", "deepseek", "glm", "openlux", "ark", "ark_doubao", "ark_deepseek")),
+    RuntimeField("SHOT_COUNT_PROVIDER", "llm", "镜头数建议模型", "auto 表示沿用剧本分析模型。", options=("auto", "deepseek", "glm", "openlux", "ark", "ark_doubao", "ark_deepseek")),
+    RuntimeField("REFERENCE_ANALYSIS_PROVIDER", "llm", "参考图理解模型", "auto 优先沿用已选择的 OpenLux 多模态模型，再按方舟视觉 → GLM 选择。", options=("auto", "openlux", "glm", "ark", "ark_doubao")),
     RuntimeField("DEEPSEEK_API_KEY", "llm", "DeepSeek API Key", secret=True),
     RuntimeField("DEEPSEEK_BASE_URL", "llm", "DeepSeek Base URL"),
     RuntimeField("DEEPSEEK_MODEL", "llm", "DeepSeek 模型"),
     RuntimeField("GLM_API_KEY", "llm", "智谱 GLM API Key", secret=True),
     RuntimeField("GLM_MODEL", "llm", "GLM 视觉模型"),
+    RuntimeField("OPENLUX_API_KEY", "llm", "OpenLux API Key", "在 OpenLux 控制台创建；用于 GPT、Claude、Gemini、DeepSeek 等模型。", secret=True),
+    RuntimeField("OPENLUX_BASE_URL", "llm", "OpenLux Base URL", "官方 OpenAI 兼容地址，默认 https://api.openlux.ai/v1。"),
+    RuntimeField("OPENLUX_MODEL", "llm", "OpenLux 文本/分镜模型", "可填 OpenLux 模型广场中的模型 ID，例如 claude-sonnet-5、claude-opus-5、gpt-5.6-sol、gpt-5.5。"),
+    RuntimeField("OPENLUX_VISION_MODEL", "llm", "OpenLux 多模态模型", "用于参考图分析、人物形象补全和带图分镜；默认 gpt-5.6-sol。"),
+    RuntimeField("OPENLUX_REQUEST_TIMEOUT_SECONDS", "llm", "OpenLux 单次请求超时（秒）", "旗舰模型可能需要数分钟；默认 900 秒。程序不会自动产生第二次付费请求。"),
+    RuntimeField("OPENLUX_STREAM", "llm", "OpenLux 流式长连接", "建议开启。持续接收增量结果，降低代理或网关因长时间无数据而断开连接的概率。"),
+    RuntimeField("OPENLUX_SAVE_RAW_RESPONSES", "llm", "保存 OpenLux 原始响应", "建议开启。模型一旦返回就先落盘，后续 JSON 校验失败仍可恢复已经付费的结果。"),
     RuntimeField("ARK_API_KEY", "llm", "火山方舟 API Key", secret=True),
     RuntimeField("ARK_BASE_URL", "llm", "火山方舟 Base URL"),
     RuntimeField("ARK_LLM_MODEL", "llm", "方舟文本模型"),
@@ -58,6 +67,35 @@ RUNTIME_FIELDS = (
     RuntimeField("ARK_VIDEO_MODEL", "video", "旧版方舟视频模型"),
     RuntimeField("GRSAI_VIDEO_MODEL", "video", "GRSAI 视频模型"),
     RuntimeField("COMFYUI_BASE_URL", "comfyui", "ComfyUI 地址", "MiniMax H3 服务器的外网或内网地址。"),
+    RuntimeField(
+        "H3_PROVIDER", "comfyui", "H3 生成通道",
+        "comfyui_h3 走自部署 ComfyUI；atlas_h3 与 metaso_h3 分别走两条线上 MiniMax H3 API。",
+        options=("comfyui_h3", "metaso_h3", "atlas_h3"),
+    ),
+    RuntimeField("ATLASCLOUD_API_KEY", "comfyui", "Atlas Cloud API Key", "https://console.atlascloud.ai 获取；仅 atlas_h3 通道需要。", secret=True),
+    RuntimeField("ATLASCLOUD_BASE_URL", "comfyui", "Atlas Cloud Base URL"),
+    RuntimeField(
+        "H3_ATLAS_RESOLUTION", "comfyui", "Atlas H3 分辨率",
+        "Atlas 通道提交时使用的分辨率，手动选择，不随项目尺寸自动映射。",
+        options=("768P", "1080P"),
+    ),
+    RuntimeField(
+        "H3_ATLAS_RATIO", "comfyui", "Atlas H3 画面比例",
+        "adaptive 表示让模型自行决定；成片会缩放回项目分辨率。",
+        options=("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+    ),
+    RuntimeField("ATLASCLOUD_JOB_TIMEOUT_SECONDS", "comfyui", "Atlas 单任务超时（秒）"),
+    RuntimeField("METASO_H3_API_KEY", "comfyui", "MetaSo H3 API Key", "MetaSo 控制台 H3 API 密钥；仅 metaso_h3 通道使用。", secret=True),
+    RuntimeField("METASO_H3_BASE_URL", "comfyui", "MetaSo H3 Base URL", "默认 https://metaso.cn/api/minimax。"),
+    RuntimeField("METASO_H3_RESOLUTION", "comfyui", "MetaSo H3 分辨率", "768P 是默认基础生成档；需要更高细节时可选择 2K。", options=("768P", "2K")),
+    RuntimeField(
+        "METASO_H3_RATIO", "comfyui", "MetaSo H3 画面比例",
+        "adaptive 表示由模型结合参考素材决定；成片会缩放回项目分辨率。",
+        options=("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+    ),
+    RuntimeField("METASO_H3_CONTEXT_IR_ENABLED", "comfyui", "MetaSo Context IR", "默认关闭；开启后网关会按次收取额外的素材理解费用。"),
+    RuntimeField("METASO_H3_POLL_INTERVAL_SECONDS", "comfyui", "MetaSo 轮询间隔（秒）"),
+    RuntimeField("METASO_H3_JOB_TIMEOUT_SECONDS", "comfyui", "MetaSo 单任务超时（秒）"),
     RuntimeField("COMFYUI_API_TOKEN", "comfyui", "ComfyUI API Token", secret=True),
     RuntimeField("COMFYUI_REQUEST_TIMEOUT_SECONDS", "comfyui", "请求超时（秒）"),
     RuntimeField("COMFYUI_POLL_INTERVAL_SECONDS", "comfyui", "轮询间隔（秒）"),
@@ -77,7 +115,7 @@ RUNTIME_FIELDS = (
     ),
     RuntimeField("H3_AUTO_SEGMENT_COMPLEX_SHOTS", "comfyui", "复杂长镜头自动续帧拆段", "开启后，超过稳定时长或包含多动作的镜头会拆成短段连续生成，再自动拼回一条视频。"),
     RuntimeField("H3_MAX_SEGMENT_SECONDS", "comfyui", "单段高稳定时长（秒）", "建议 6–8 秒；越短越稳，但会增加生成次数。"),
-    RuntimeField("H3_AUDIO_MODE", "audio", "成片音频策略", "clean_tts 会丢弃 H3 波浪噪声音轨并覆盖独立对白；mute 输出干净静音；native 保留 H3 原声。", options=("clean_tts", "mute", "native")),
+    RuntimeField("H3_AUDIO_MODE", "audio", "成片音频策略", "native 默认保留 H3 原声；需要独立配音版时再主动选择 clean_tts；mute 输出静音版。", options=("native", "clean_tts", "mute")),
     RuntimeField("TTS_PROVIDER", "audio", "对白语音服务", "edge 为免密钥的在线普通话语音；disabled 仅输出静音。", options=("edge", "disabled")),
     RuntimeField("TTS_DEFAULT_FEMALE_VOICE", "audio", "默认女声 Voice ID"),
     RuntimeField("TTS_DEFAULT_MALE_VOICE", "audio", "默认男声 Voice ID"),
@@ -180,6 +218,9 @@ class RuntimeSettingsManager:
     def _llm_info(provider: str, *, vision: bool = False) -> tuple[str, str, bool]:
         if provider == "glm":
             return "智谱 GLM", settings.GLM_MODEL, bool(settings.GLM_API_KEY)
+        if provider == "openlux":
+            model = settings.OPENLUX_VISION_MODEL if vision else settings.OPENLUX_MODEL
+            return "OpenLux", model, bool(settings.OPENLUX_API_KEY)
         if provider in {"ark", "ark_doubao", "ark_deepseek"}:
             return "火山方舟", settings.ARK_VISION_MODEL if vision else settings.ARK_LLM_MODEL, bool(settings.ARK_API_KEY)
         return "DeepSeek", settings.DEEPSEEK_MODEL, bool(settings.DEEPSEEK_API_KEY)
@@ -195,12 +236,14 @@ class RuntimeSettingsManager:
             {"value": "auto", "label": "自动选择"},
             {"value": "deepseek", "label": "DeepSeek"},
             {"value": "glm", "label": "智谱 GLM"},
+            {"value": "openlux", "label": "OpenLux（GPT / Claude / Gemini）"},
             {"value": "ark", "label": "火山方舟（默认端点）"},
             {"value": "ark_doubao", "label": "火山方舟（豆包/通用端点）"},
             {"value": "ark_deepseek", "label": "火山方舟（DeepSeek 端点）"},
         ]
         vision_options = [
             {"value": "auto", "label": "自动选择"},
+            {"value": "openlux", "label": "OpenLux 多模态"},
             {"value": "glm", "label": "智谱 GLM"},
             {"value": "ark", "label": "火山方舟视觉（默认端点）"},
             {"value": "ark_doubao", "label": "火山方舟视觉"},
@@ -211,7 +254,16 @@ class RuntimeSettingsManager:
         brief_label, brief_model, brief_ready = self._llm_info(brief_effective)
         vision_selected = settings.REFERENCE_ANALYSIS_PROVIDER
         if vision_selected == "auto":
-            vision_effective = "ark_doubao" if settings.ARK_API_KEY else "glm" if settings.GLM_API_KEY else brief_effective
+            if brief_effective == "openlux" and settings.OPENLUX_API_KEY:
+                vision_effective = "openlux"
+            elif settings.ARK_API_KEY:
+                vision_effective = "ark_doubao"
+            elif settings.GLM_API_KEY:
+                vision_effective = "glm"
+            elif settings.OPENLUX_API_KEY:
+                vision_effective = "openlux"
+            else:
+                vision_effective = brief_effective
         else:
             vision_effective = vision_selected
         vision_label, vision_model, vision_ready = self._llm_info(vision_effective, vision=True)
@@ -230,6 +282,27 @@ class RuntimeSettingsManager:
             video_label, video_model, video_ready = "火山方舟视频", settings.ARK_VIDEO_MODEL, bool(settings.ARK_API_KEY)
         else:
             video_label, video_model, video_ready = "GRSAI", settings.GRSAI_VIDEO_MODEL, bool(settings.GRSAI_API_KEY)
+
+        h3_selected = settings.H3_PROVIDER if settings.H3_PROVIDER in {"comfyui_h3", "metaso_h3", "atlas_h3"} else "comfyui_h3"
+        if h3_selected == "metaso_h3":
+            h3_label = "MetaSo MiniMax H3 API"
+            h3_model = f"{METASO_H3_MODEL_ID} · {settings.METASO_H3_RESOLUTION} · {settings.METASO_H3_RATIO}"
+            h3_ready = bool(settings.METASO_H3_API_KEY)
+            h3_priority = ["MetaSo 线上 API（选中时）", f"Context IR：{'开启' if settings.METASO_H3_CONTEXT_IR_ENABLED else '关闭'}"]
+        elif h3_selected == "atlas_h3":
+            h3_label = "Atlas Cloud MiniMax H3 API"
+            h3_model = f"{ATLAS_H3_MODEL_LABEL} · {settings.H3_ATLAS_RESOLUTION} · {settings.H3_ATLAS_RATIO}"
+            h3_ready = bool(settings.ATLASCLOUD_API_KEY)
+            h3_priority = ["Atlas Cloud 线上 API（选中时）"]
+        else:
+            h3_label = "MiniMax H3 / ComfyUI"
+            h3_model = f"{settings.H3_MODEL_PROFILE} + {settings.H3_TEXT_ENCODER_PROFILE}"
+            h3_ready = bool(settings.COMFYUI_BASE_URL)
+            h3_priority = [
+                "自部署 ComfyUI（选中时）",
+                f"Diffusion：{settings.H3_MODEL_PROFILE}",
+                f"文本编码器：{settings.H3_TEXT_ENCODER_PROFILE}",
+            ]
 
         return [
             {
@@ -255,7 +328,7 @@ class RuntimeSettingsManager:
                 "id": "reference_vision", "label": "角色参考图理解", "setting_key": "REFERENCE_ANALYSIS_PROVIDER",
                 "selected": vision_selected, "options": vision_options, "effective_label": vision_label,
                 "model": vision_model, "configured": vision_ready,
-                "priority": ["火山方舟视觉（已配置时）", "智谱 GLM（备用）", "剧本模型文本描述（兜底）"],
+                "priority": ["OpenLux（分镜模型已选且配置时）", "火山方舟视觉（备用）", "智谱 GLM（备用）", "剧本模型文本描述（兜底）"],
                 "description": "读取角色参考图外貌、服饰与固定视觉特征。",
             },
             {
@@ -278,25 +351,44 @@ class RuntimeSettingsManager:
                 "description": "走官方异步视频 API；按项目所选镜头生成，使用独立 Seedance 全模态 Prompt。",
             },
             {
-                "id": "h3_video", "label": "项目视频片段生成", "setting_key": None,
-                "selected": "comfyui_h3", "options": [], "effective_label": "MiniMax H3 / ComfyUI",
-                "model": f"{settings.H3_MODEL_PROFILE} + {settings.H3_TEXT_ENCODER_PROFILE}", "configured": bool(settings.COMFYUI_BASE_URL),
-                "priority": [f"Diffusion：{settings.H3_MODEL_PROFILE}", f"文本编码器：{settings.H3_TEXT_ENCODER_PROFILE}", "本地持久队列"],
-                "description": "固定走自部署 H3；此处显示默认模型，逐镜可覆盖并冻结到任务快照。",
+                "id": "h3_video", "label": "项目视频片段生成", "setting_key": "H3_PROVIDER",
+                "selected": h3_selected,
+                "options": [
+                    {"value": "comfyui_h3", "label": "自部署 ComfyUI（本地 GPU）"},
+                    {"value": "metaso_h3", "label": "MetaSo MiniMax H3 API（按量付费）"},
+                    {"value": "atlas_h3", "label": "Atlas Cloud 线上 API（按量付费）"},
+                ],
+                "effective_label": h3_label,
+                "model": h3_model,
+                "configured": h3_ready,
+                "priority": h3_priority,
+                "description": "三条通道共用分镜、对白、原声保留与断点续轮询管线；MetaSo/Atlas 在 15 秒内整段生成，超过才续帧分段，成片自动缩放回项目分辨率。",
             },
             {
-                "id": "dialogue_audio", "label": "对白生成与 H3 杂音替换", "setting_key": "H3_AUDIO_MODE",
+                "id": "dialogue_audio", "label": "H3 原声与可选配音替换", "setting_key": "H3_AUDIO_MODE",
                 "selected": settings.H3_AUDIO_MODE,
                 "options": [
-                    {"value": "clean_tts", "label": "独立 TTS 干净对白（推荐）"},
+                    {"value": "native", "label": "保留 H3 原声（默认）"},
+                    {"value": "clean_tts", "label": "主动替换为独立 TTS"},
                     {"value": "mute", "label": "移除原声并静音"},
-                    {"value": "native", "label": "保留 H3 原声"},
                 ],
                 "effective_label": "Edge TTS + FFmpeg" if settings.H3_AUDIO_MODE == "clean_tts" else "FFmpeg 静音轨" if settings.H3_AUDIO_MODE == "mute" else "MiniMax H3 原声",
                 "model": settings.TTS_PROVIDER if settings.H3_AUDIO_MODE == "clean_tts" else settings.H3_AUDIO_MODE,
                 "configured": settings.H3_AUDIO_MODE != "clean_tts" or settings.TTS_PROVIDER in {"edge", "disabled"},
-                "priority": ["角色专属 voice ID", "按声音描述选择男/女默认音色", "任一对白失败即阻止交付并换 Seed 重试"],
-                "description": "默认丢弃 H3 宽带波浪噪声音轨，用明确发言者的独立普通话对白覆盖；画面流直接复制，不二次压画质。",
+                "priority": (
+                    ["保留 H3 自带人声、环境音与动作音效", "需要配音版时再手动选择 clean_tts"]
+                    if settings.H3_AUDIO_MODE == "native"
+                    else ["保留一份 H3 原声备份", "按明确发言者生成独立普通话音轨", "画面流直接复制"]
+                    if settings.H3_AUDIO_MODE == "clean_tts"
+                    else ["保留一份 H3 原声备份", "输出静音交付版"]
+                ),
+                "description": (
+                    "默认直接交付 MiniMax H3 原声音轨，不执行 TTS 覆盖。"
+                    if settings.H3_AUDIO_MODE == "native"
+                    else "仅在主动选择后生成独立 TTS 替换版；原始 H3 音轨会保存在同目录备份中。"
+                    if settings.H3_AUDIO_MODE == "clean_tts"
+                    else "主动选择后输出静音版；原始 H3 音轨会保存在同目录备份中。"
+                ),
             },
             {
                 "id": "legacy_video", "label": "旧版工作台视频生成", "setting_key": "VIDEO_PROVIDER",

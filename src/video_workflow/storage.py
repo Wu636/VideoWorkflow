@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -14,6 +15,7 @@ from src.video_workflow.domain import (
     Delivery,
     JobStatus,
     Project,
+    ProductionSeries,
     RenderJob,
     Review,
     Shot,
@@ -60,6 +62,13 @@ class ProjectStore:
             updated_at TEXT NOT NULL,
             data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS production_series (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            data TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS shots (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -69,6 +78,17 @@ class ProjectStore:
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_shots_project ON shots(project_id, ordinal);
+        CREATE TABLE IF NOT EXISTS h3_prompt_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id TEXT NOT NULL,
+            shot_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            UNIQUE(shot_id, fingerprint),
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_h3_history_shot ON h3_prompt_history(project_id, shot_id, id);
         CREATE TABLE IF NOT EXISTS assets (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -145,9 +165,36 @@ class ProjectStore:
             cursor = conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
             return cursor.rowcount > 0
 
+    def save_series(self, series: ProductionSeries) -> ProductionSeries:
+        series.updated_at = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO production_series(id,name,created_at,updated_at,data)
+                VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,updated_at=excluded.updated_at,data=excluded.data""",
+                (series.id, series.name, series.created_at, series.updated_at, self._dump(series)),
+            )
+        return series
+
+    def get_series(self, series_id: str) -> ProductionSeries | None:
+        with self._connect() as conn:
+            return self._load(
+                conn.execute("SELECT data FROM production_series WHERE id=?", (series_id,)).fetchone(),
+                ProductionSeries,
+            )
+
+    def list_series(self) -> list[ProductionSeries]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT data FROM production_series ORDER BY updated_at DESC").fetchall()
+        return [ProductionSeries.model_validate_json(row["data"]) for row in rows]
+
     def replace_shots(self, project_id: str, shots: Iterable[Shot]) -> list[Shot]:
         items = list(shots)
         with self._lock, self._connect() as conn:
+            for row in conn.execute("SELECT data FROM shots WHERE project_id=?", (project_id,)).fetchall():
+                self._archive_h3_prompt(conn, Shot.model_validate_json(row["data"]))
+            for shot in items:
+                self._archive_h3_prompt(conn, shot)
             conn.execute("DELETE FROM shots WHERE project_id=?", (project_id,))
             conn.executemany(
                 "INSERT INTO shots(id,project_id,ordinal,updated_at,data) VALUES(?,?,?,?,?)",
@@ -158,6 +205,10 @@ class ProjectStore:
     def save_shot(self, shot: Shot) -> Shot:
         shot.updated_at = utc_now()
         with self._lock, self._connect() as conn:
+            existing = self._load(conn.execute("SELECT data FROM shots WHERE id=?", (shot.id,)).fetchone(), Shot)
+            if existing is not None:
+                self._archive_h3_prompt(conn, existing)
+            self._archive_h3_prompt(conn, shot)
             conn.execute(
                 """INSERT INTO shots(id,project_id,ordinal,updated_at,data) VALUES(?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal,
@@ -165,6 +216,74 @@ class ProjectStore:
                 (shot.id, shot.project_id, shot.ordinal, shot.updated_at, self._dump(shot)),
             )
         return shot
+
+    def insert_shot(self, shot: Shot, after_shot_id: str | None = None) -> Shot:
+        """Insert one shot and renumber the tail in a single transaction."""
+        shot.updated_at = utc_now()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT data FROM shots WHERE project_id=? ORDER BY ordinal",
+                (shot.project_id,),
+            ).fetchall()
+            existing = [Shot.model_validate_json(row["data"]) for row in rows]
+            if after_shot_id is None:
+                ordinal = len(existing) + 1
+            else:
+                anchor = next((item for item in existing if item.id == after_shot_id), None)
+                if anchor is None:
+                    raise KeyError(f"Shot not found: {after_shot_id}")
+                ordinal = anchor.ordinal + 1
+            shot.ordinal = ordinal
+            for current in reversed(existing):
+                if current.ordinal < ordinal:
+                    continue
+                self._archive_h3_prompt(conn, current)
+                current.ordinal += 1
+                current.updated_at = utc_now()
+                conn.execute(
+                    "UPDATE shots SET ordinal=?,updated_at=?,data=? WHERE id=?",
+                    (current.ordinal, current.updated_at, self._dump(current), current.id),
+                )
+            self._archive_h3_prompt(conn, shot)
+            conn.execute(
+                "INSERT INTO shots(id,project_id,ordinal,updated_at,data) VALUES(?,?,?,?,?)",
+                (shot.id, shot.project_id, shot.ordinal, shot.updated_at, self._dump(shot)),
+            )
+        return shot
+
+    @staticmethod
+    def _archive_h3_prompt(conn: sqlite3.Connection, shot: Shot) -> None:
+        if not shot.h3_prompt_skill_output.strip():
+            return
+        payload = {
+            "shot_id": shot.id,
+            "ordinal": shot.ordinal,
+            "prompt": shot.h3_prompt_skill_output,
+            "video_prompt": shot.video_prompt,
+            "source_revision": shot.h3_prompt_source_revision,
+            "skill_id": shot.h3_prompt_skill_id,
+            "skill_version": shot.h3_prompt_skill_version,
+            "director_version": shot.h3_director_version,
+        }
+        data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        fingerprint = hashlib.sha256(data.encode("utf-8")).hexdigest()
+        conn.execute(
+            """INSERT OR IGNORE INTO h3_prompt_history(project_id,shot_id,fingerprint,created_at,data)
+            VALUES(?,?,?,?,?)""",
+            (shot.project_id, shot.id, fingerprint, utc_now(), data),
+        )
+
+    def archive_h3_prompt(self, shot: Shot) -> None:
+        with self._lock, self._connect() as conn:
+            self._archive_h3_prompt(conn, shot)
+
+    def list_h3_prompt_history(self, project_id: str, shot_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,created_at,data FROM h3_prompt_history WHERE project_id=? AND shot_id=? ORDER BY id DESC",
+                (project_id, shot_id),
+            ).fetchall()
+        return [{**json.loads(row["data"]), "id": row["id"], "created_at": row["created_at"]} for row in rows]
 
     def get_shot(self, shot_id: str) -> Shot | None:
         with self._connect() as conn:

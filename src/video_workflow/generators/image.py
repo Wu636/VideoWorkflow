@@ -5,6 +5,7 @@ import logging
 import random
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import aiofiles
 import httpx
@@ -15,6 +16,51 @@ from src.video_workflow.generators.base import ImageGenerator
 from src.video_workflow.types import Scene
 
 logger = logging.getLogger(__name__)
+
+
+class ImageDownloadError(RuntimeError):
+    """The provider already generated an image; retry retrieval, not generation."""
+
+
+class ImageGenerationError(RuntimeError):
+    """The provider explicitly reported terminal generation failure."""
+
+
+async def download_generated_image(url: str, output_dir: str, scene_id: int = 1) -> str:
+    """Download with bounded retries, redirects and a direct-route fallback.
+
+    Only the unauthenticated result download uses the fallback. API credentials
+    are never attached to CDN requests and TLS verification remains enabled.
+    """
+    if urlparse(url).scheme not in {"http", "https"}:
+        raise ImageDownloadError("图像结果地址格式错误")
+    folder = Path(output_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    last_error = ""
+    timeout = httpx.Timeout(connect=10, read=60, write=20, pool=20)
+    for attempt, trust_env in enumerate((True, False, False)):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=trust_env) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+            content = response.content
+            if not (content.startswith(b"\x89PNG\r\n\x1a\n") or content.startswith(b"\xff\xd8\xff")
+                    or (content.startswith(b"RIFF") and content[8:12] == b"WEBP")):
+                raise ValueError("返回内容不是有效的 PNG/JPEG/WebP 图像")
+            path = folder / f"{scene_id}_keyframe{_generated_image_suffix(content)}"
+            temporary = path.with_suffix(path.suffix + ".part")
+            async with aiofiles.open(temporary, "wb") as handle:
+                await handle.write(content)
+            temporary.replace(path)
+            return str(path)
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = type(exc).__name__
+            if isinstance(exc, httpx.HTTPStatusError):
+                last_error += f" HTTP {exc.response.status_code}"
+            logger.warning("Image download attempt %s failed: host=%s error=%s", attempt + 1, urlparse(url).hostname, last_error)
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+    raise ImageDownloadError(f"服务商已出图，但图片下载失败（{last_error}）；结果地址已保留，请重试下载，无需重新生成")
 
 GRSAI_MODELS: list[dict[str, str]] = [
     {"id": "gpt-image-2", "label": "gpt-image-2", "description": "GPT Image 2，适合中文提示词与角色构图"},
@@ -459,21 +505,40 @@ class GrsaiImageGenerator(ImageGenerator):
                 raise RuntimeError(f"GRSAI image submit failed ({type(exc).__name__}): {exc}") from exc
 
             task_state = self._extract_task_state(submit_data)
+            self._save_result_checkpoint(output_dir, {"model": self.model, "scene_id": scene.id, "task_state": task_state})
             result_data = await self._wait_for_result(client, task_state)
-
             result_url = self._extract_result_url(result_data)
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as download_client:
-                image_response = await download_client.get(result_url)
-                image_response.raise_for_status()
-        except Exception as exc:
-            raise RuntimeError(f"Failed to download GRSAI image: {exc}") from exc
+            self._save_result_checkpoint(output_dir, {"model": self.model, "scene_id": scene.id, "task_state": task_state, "result_url": result_url})
+        return await download_generated_image(result_url, output_dir, scene.id)
 
-        filepath = Path(output_dir) / f"{scene.id}_keyframe{_generated_image_suffix(image_response.content)}"
-        async with aiofiles.open(filepath, "wb") as file_handle:
-            await file_handle.write(image_response.content)
+    @staticmethod
+    def _save_result_checkpoint(output_dir: str, data: dict[str, Any]) -> None:
+        folder = Path(output_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        temporary = folder / "grsai_result.json.part"
+        temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(folder / "grsai_result.json")
 
-        return str(filepath)
+    @staticmethod
+    async def resume_image(output_dir: str) -> str:
+        """Resume a recorded result; this method never submits a generation."""
+        checkpoint = Path(output_dir) / "grsai_result.json"
+        if not checkpoint.is_file():
+            raise ValueError("没有已保存的服务商结果，请从服务商后台下载图片后上传绑定")
+        data = json.loads(checkpoint.read_text(encoding="utf-8"))
+        result_url = data.get("result_url")
+        if not result_url:
+            generator = GrsaiImageGenerator(model=data.get("model"))
+            async with httpx.AsyncClient(
+                base_url=generator.base_url,
+                headers={"Authorization": f"Bearer {generator.api_key}"},
+                timeout=60,
+            ) as client:
+                result = await generator._wait_for_result(client, data["task_state"])
+            result_url = generator._extract_result_url(result)
+            data["result_url"] = result_url
+            generator._save_result_checkpoint(output_dir, data)
+        return await download_generated_image(result_url, output_dir, int(data.get("scene_id", 1)))
 
     def _resolve_image_size(self) -> str | None:
         if self.model not in GRSAI_IMAGE_SIZE_SUPPORTED_MODELS:
@@ -526,13 +591,16 @@ class GrsaiImageGenerator(ImageGenerator):
         if self._extract_result_url(task_state, required=False) or status in GRSAI_SUCCESS_STATUSES:
             return task_state
         if status in GRSAI_FAILURE_STATUSES:
-            raise RuntimeError(self._format_failure_message(task_state))
+            raise ImageGenerationError(self._format_failure_message(task_state))
 
         task_id = task_state.get("task_id") or task_state.get("id")
         if not task_id:
             raise RuntimeError(f"Missing GRSAI task id in response: {task_state}")
 
+        deadline = asyncio.get_running_loop().time() + settings.IMAGE_GENERATION_TIMEOUT_SECONDS
         while True:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("GRSAI 结果查询超时；任务记录已保留，请稍后取回结果，不必重新生图")
             await asyncio.sleep(settings.GRSAI_RESULT_POLL_INTERVAL_SECONDS)
 
             try:
@@ -554,7 +622,7 @@ class GrsaiImageGenerator(ImageGenerator):
             if self._extract_result_url(result_data, required=False) or status in GRSAI_SUCCESS_STATUSES:
                 return result_data
             if status in GRSAI_FAILURE_STATUSES:
-                raise RuntimeError(self._format_failure_message(result_data))
+                raise ImageGenerationError(self._format_failure_message(result_data))
 
     @staticmethod
     def _extract_result_url(result_data: dict[str, Any], required: bool = True) -> str:

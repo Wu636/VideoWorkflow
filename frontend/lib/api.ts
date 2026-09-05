@@ -9,10 +9,12 @@ import type {
     Project,
     ProjectBrief,
     ProjectBundle,
+    ProductionSeries,
     ProjectAnalysisDraft,
     ScriptRewriteDraft,
     SeedanceCatalog,
     SeedanceEstimate,
+    SeedanceMaterialDiagnostics,
     RuntimeLogRecord,
     RuntimeSettingsPayload,
     RenderJob,
@@ -65,9 +67,13 @@ export async function listProjects(): Promise<Project[]> {
 }
 
 export async function createProject(brief: Partial<ProjectBrief> & Pick<ProjectBrief, "title" | "story">): Promise<Project> {
+    return api<Project>("/projects", { method: "POST", body: JSON.stringify(normalizeProjectBrief(brief)) });
+}
+
+function normalizeProjectBrief(brief: Partial<ProjectBrief> & Pick<ProjectBrief, "title" | "story">): ProjectBrief {
     const portrait = brief.aspect_ratio === "9:16";
     const square = brief.aspect_ratio === "1:1";
-    const payload: ProjectBrief = {
+    return {
         title: brief.title,
         client_name: brief.client_name || "",
         story: brief.story,
@@ -83,7 +89,28 @@ export async function createProject(brief: Partial<ProjectBrief> & Pick<ProjectB
         negative_prompt: brief.negative_prompt || "",
         delivery_notes: brief.delivery_notes || "",
     };
-    return api<Project>("/projects", { method: "POST", body: JSON.stringify(payload) });
+}
+
+export async function listProductionSeries(): Promise<ProductionSeries[]> {
+    return api<ProductionSeries[]>("/projects/series");
+}
+
+export async function saveProjectAsSeries(projectId: string, name = "", description = ""): Promise<{ series: ProductionSeries; project: Project }> {
+    return api(`/projects/${projectId}/series`, {
+        method: "POST",
+        body: JSON.stringify({ name, description }),
+    });
+}
+
+export async function createSeriesEpisode(
+    seriesId: string,
+    brief: Partial<ProjectBrief> & Pick<ProjectBrief, "title" | "story">,
+    characterIds: string[],
+): Promise<Project> {
+    return api(`/projects/series/${seriesId}/episodes`, {
+        method: "POST",
+        body: JSON.stringify({ brief: normalizeProjectBrief(brief), character_ids: characterIds }),
+    });
 }
 
 export async function getProject(projectId: string): Promise<ProjectBundle> {
@@ -128,10 +155,10 @@ export async function generateStoryboard(
     });
 }
 
-export async function analyzeProjectStyle(projectId: string, assetIds?: string[]): Promise<StyleAnalysisDraft> {
+export async function analyzeProjectStyle(projectId: string, assetIds?: string[], apply = true): Promise<StyleAnalysisDraft> {
     return api(`/projects/${projectId}/style/analyze`, {
         method: "POST",
-        body: JSON.stringify({ asset_ids: assetIds || null }),
+        body: JSON.stringify({ asset_ids: assetIds || null, apply }),
     });
 }
 
@@ -142,10 +169,49 @@ export async function generateSceneProfiles(projectId: string, userSuggestions =
     });
 }
 
-export async function generateSceneReference(projectId: string, sceneProfileId: string, userSuggestions = ""): Promise<Asset> {
+export interface ApplySceneProfilesResult {
+    applied_count: number;
+    shot_ids: string[];
+    shot_ordinals: number[];
+    scene_count: number;
+    h3_preserved_count: number;
+    keyframes_preserved_count: number;
+}
+
+export async function applySceneProfiles(projectId: string, sceneProfileIds?: string[]): Promise<ApplySceneProfilesResult> {
+    return api(`/projects/${projectId}/scene-profiles/apply`, {
+        method: "POST",
+        body: JSON.stringify({ scene_profile_ids: sceneProfileIds || null }),
+    });
+}
+
+export async function getSceneReferencePrompt(projectId: string, sceneProfileId: string): Promise<{ prompt: string; default_prompt: string; profile: SceneProfile }> {
+    return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference-prompt`);
+}
+
+export async function previewSceneReferencePrompt(projectId: string, profile: SceneProfile): Promise<{ prompt: string }> {
+    return api(`/projects/${projectId}/scene-profiles/${profile.id}/reference-prompt`, {
+        method: "POST",
+        body: JSON.stringify({ ...profile, expected_version: profile.version }),
+    });
+}
+
+export async function updateSceneProfile(projectId: string, profile: SceneProfile): Promise<SceneProfile> {
+    return api(`/projects/${projectId}/scene-profiles/${profile.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ expected_version: profile.version, name: profile.name, description: profile.description,
+            continuity_notes: profile.continuity_notes, reference_prompt: profile.reference_prompt }),
+    });
+}
+
+export async function retrySceneReferenceDownload(projectId: string, sceneProfileId: string): Promise<Asset> {
+    return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference/retry-download`, { method: "POST" });
+}
+
+export async function generateSceneReference(projectId: string, sceneProfileId: string, prompt: string, expectedVersion: number): Promise<Asset> {
     return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference`, {
         method: "POST",
-        body: JSON.stringify({ user_suggestions: userSuggestions }),
+        body: JSON.stringify({ prompt, expected_version: expectedVersion }),
     });
 }
 
@@ -172,6 +238,32 @@ export async function generateCharacterReferencesWithOptions(
             user_suggestions: options.userSuggestions || "",
             reference_asset_ids: options.referenceAssetIds || null,
             appearance_profile_id: options.appearanceProfileId || null,
+        }),
+    });
+}
+
+export interface MissingCharacterReferencesResult {
+    assets: Asset[];
+    generated_character_ids: string[];
+    character_count: number;
+    missing_count: number;
+    message: string;
+}
+
+export async function generateMissingCharacterReferences(
+    projectId: string,
+    options: {
+        mode: "script_style" | "complete_missing";
+        userSuggestions?: string;
+        referenceAssetIds?: string[];
+    },
+): Promise<MissingCharacterReferencesResult> {
+    return api(`/projects/${projectId}/characters/references/generate-missing`, {
+        method: "POST",
+        body: JSON.stringify({
+            mode: options.mode,
+            user_suggestions: options.userSuggestions || "",
+            reference_asset_ids: options.referenceAssetIds || null,
         }),
     });
 }
@@ -262,6 +354,17 @@ export async function updateShot(shot: Shot): Promise<Shot> {
     });
 }
 
+export async function updateKeyframePrompt(
+    projectId: string,
+    shotId: string,
+    patch: Pick<Shot, "keyframe_prompt"> & Partial<Pick<Shot, "keyframe_revision_suggestion_draft" | "keyframe_revision_mode">>,
+): Promise<Shot> {
+    return api<Shot>(`/projects/${projectId}/shots/${shotId}/keyframe-prompt`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+    });
+}
+
 export async function reviseShotWithAi(
     projectId: string,
     shotId: string,
@@ -273,6 +376,23 @@ export async function reviseShotWithAi(
         method: "POST",
         body: JSON.stringify({ user_suggestions: userSuggestions, prompt_targets: promptTargets, h3_skill_id: h3SkillId }),
     });
+}
+
+export async function insertShotWithAi(
+    projectId: string,
+    afterShotId: string | null,
+    userSuggestions: string,
+    promptTargets: ("h3" | "seedance")[],
+    h3SkillId = "h3-prompt-writing",
+): Promise<Shot> {
+    return api(`/projects/${projectId}/shots/insert-ai`, {
+        method: "POST",
+        body: JSON.stringify({ after_shot_id: afterShotId, user_suggestions: userSuggestions, prompt_targets: promptTargets, h3_skill_id: h3SkillId }),
+    });
+}
+
+export async function getSeedanceMaterials(projectId: string, shotId: string): Promise<SeedanceMaterialDiagnostics> {
+    return api(`/projects/${projectId}/shots/${shotId}/seedance-materials`);
 }
 
 export async function createShot(projectId: string, shot: Shot): Promise<Shot> {
@@ -328,7 +448,7 @@ export async function generateKeyframes(
     });
 }
 
-export async function getH3PromptSkills(): Promise<{ default_skill_id: string; skills: H3PromptSkill[] }> {
+export async function getH3PromptSkills(): Promise<{ default_skill_id: string; director_version: string; skills: H3PromptSkill[] }> {
     return api("/projects/h3-prompt-skills");
 }
 
@@ -406,7 +526,7 @@ export async function planRender(projectId: string): Promise<Shot[]> {
 }
 
 export async function enqueueRender(projectId: string, shotIds?: string[], options: {
-    provider?: "comfyui_h3" | "ark_seedance";
+    provider?: "comfyui_h3" | "metaso_h3" | "atlas_h3" | "ark_seedance";
     modelId?: string;
     resolution?: string;
     generateAudio?: boolean;

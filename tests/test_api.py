@@ -5,15 +5,16 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
-from src.video_workflow.domain import AssetRole, Delivery, JobStatus, JobType, RenderJob, Shot
+from src.video_workflow.domain import AssetRole, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, Shot, StyleProfile
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
-from src.video_workflow.services.projects import ProjectService
+from src.video_workflow.services.projects import H3_DIRECTOR_VERSION, KeyframeBusyError, ProjectService
 from src.video_workflow.services.render_queue import RenderQueue
 from src.video_workflow.storage import ProjectStore
 
@@ -35,6 +36,192 @@ class ProjectApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         router.store, router.project_service, router.render_queue, router.finalizer = self.old
         self.temp.cleanup()
+
+    def test_series_routes_create_template_and_episode(self) -> None:
+        source = self.client.post("/api/projects", json={
+            "title": "张小差科普",
+            "story": "第一集",
+            "visual_style": "统一二维插画",
+        })
+        self.assertEqual(source.status_code, 200, source.text)
+        source_id = source.json()["id"]
+        saved = self.client.post(
+            f"/api/projects/{source_id}/series",
+            json={"name": "张小差安全系列", "description": "社区安全科普"},
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+        series_id = saved.json()["series"]["id"]
+        listed = self.client.get("/api/projects/series")
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()[0]["id"], series_id)
+        episode = self.client.post(
+            f"/api/projects/series/{series_id}/episodes",
+            json={
+                "brief": {"title": "电动车入户充电", "story": "张小差劝阻王大爷"},
+                "character_ids": [],
+            },
+        )
+        self.assertEqual(episode.status_code, 200, episode.text)
+        self.assertEqual(episode.json()["series_id"], series_id)
+        self.assertEqual(episode.json()["episode_number"], 2)
+        self.assertEqual(episode.json()["brief"]["visual_style"], "统一二维插画")
+
+    def test_scene_editor_preview_patch_and_conflict(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="场景编辑", story="奶奶在客厅"))
+        profile = SceneProfile(name="客厅", description="普通家居灯光")
+        project.scene_profiles = [profile]
+        router.store.save_project(project)
+        base = f"/api/projects/{project.id}/scene-profiles/{profile.id}"
+        preview = self.client.get(base + "/reference-prompt")
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("普通家居灯光", preview.json()["prompt"])
+        payload = {"expected_version": 1, "name": "奶奶家", "description": "窗光", "continuity_notes": "保留桌椅", "reference_prompt": "EXACT USER PROMPT"}
+        preview = self.client.post(base + "/reference-prompt", json=payload)
+        self.assertEqual(preview.status_code, 200)
+        self.assertIn("窗光", preview.json()["prompt"])
+        self.assertEqual(router.store.get_project(project.id).scene_profiles[0].name, "客厅")
+        saved = self.client.patch(base, json=payload)
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(self.client.get(base + "/reference-prompt").json()["prompt"], "EXACT USER PROMPT")
+        self.assertEqual(self.client.patch(base, json=payload).status_code, 409)
+        self.assertEqual(self.client.patch(base, json={**payload, "expected_version": 2, "name": " "}).status_code, 400)
+        self.assertEqual(self.client.post(base + "/reference", json={"prompt": "old", "expected_version": 1}).status_code, 409)
+        self.assertEqual(self.client.get(f"/api/projects/wrong/scene-profiles/{profile.id}/reference-prompt").status_code, 404)
+        with patch.object(router.project_service, "generate_scene_reference", new=AsyncMock(side_effect=RuntimeError("服务商已出图，下载失败"))):
+            failed = self.client.post(base + "/reference", json={"prompt": "custom", "expected_version": 2})
+            self.assertEqual(failed.status_code, 502)
+            self.assertIn("下载失败", failed.json()["detail"])
+        self.assertEqual(self.client.post(base + "/reference/retry-download").status_code, 400)
+
+    def test_keyframe_prompt_patch_preserves_other_prompt_fields(self) -> None:
+        project = self.client.post("/api/projects", json={"title": "首帧局部保存", "story": "人物开门"}).json()
+        shot = router.store.save_shot(Shot(
+            project_id=project["id"], ordinal=1,
+            h3_prompt_skill_output="saved H3", video_prompt="saved H3",
+            video_prompt_source="saved H3", seedance_prompt="saved Seedance",
+        ))
+        url = f"/api/projects/{project['id']}/shots/{shot.id}/keyframe-prompt"
+        response = self.client.patch(url, json={
+            "keyframe_prompt": "  新首帧 Prompt  ",
+            "keyframe_revision_suggestion_draft": "增加逆光",
+            "keyframe_revision_mode": "iterate",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        saved = self.client.get(f"/api/projects/{project['id']}").json()["shots"][0]
+        self.assertEqual(saved["keyframe_prompt"], "新首帧 Prompt")
+        self.assertEqual(saved["keyframe_revision_suggestion_draft"], "增加逆光")
+        self.assertEqual(saved["keyframe_revision_mode"], "iterate")
+        self.assertEqual(saved["h3_prompt_skill_output"], "saved H3")
+        self.assertEqual(saved["video_prompt"], "saved H3")
+        self.assertEqual(saved["video_prompt_source"], "saved H3")
+        self.assertEqual(saved["seedance_prompt"], "saved Seedance")
+        self.assertGreater(saved["version"], shot.version)
+        self.assertEqual(self.client.patch(url, json={"keyframe_prompt": " "}).status_code, 400)
+        self.assertEqual(self.client.patch(url, json={"keyframe_prompt": "x" * 12001}).status_code, 422)
+        self.assertEqual(self.client.patch(url, json={"keyframe_prompt": "x", "keyframe_revision_mode": "bad"}).status_code, 422)
+        self.assertEqual(self.client.patch(
+            f"/api/projects/another-project/shots/{shot.id}/keyframe-prompt",
+            json={"keyframe_prompt": "x"},
+        ).status_code, 404)
+
+    def test_conflicting_keyframe_operations_return_409_without_writing(self) -> None:
+        project = self.client.post("/api/projects", json={"title": "首帧防重", "story": "人物开门"}).json()
+        shot = router.store.save_shot(Shot(project_id=project["id"], ordinal=1, keyframe_prompt="保留首帧"))
+        with patch.object(router.project_service, "ensure_keyframe_idle", side_effect=KeyframeBusyError("本镜首帧正在生成")):
+            response = self.client.patch(
+                f"/api/projects/{project['id']}/shots/{shot.id}/keyframe-prompt",
+                json={"keyframe_prompt": "重复修改"},
+            )
+            self.assertEqual(response.status_code, 409, response.text)
+            response = self.client.post(f"/api/projects/{project['id']}/keyframes/generate", json={"shot_ids": [shot.id]})
+            self.assertEqual(response.status_code, 409, response.text)
+            response = self.client.post(
+                f"/api/projects/{project['id']}/shots/{shot.id}/keyframe/upload",
+                files={"file": ("image.png", b"image", "image/png")},
+            )
+            self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(router.store.get_shot(shot.id).keyframe_prompt, "保留首帧")
+        self.assertEqual(router.store.list_assets(project["id"]), [])
+
+    def test_keyframe_upload_preserves_prompt_saved_during_file_read(self) -> None:
+        project = self.client.post("/api/projects", json={"title": "上传并发", "story": "人物开门"}).json()
+        shot = router.store.save_shot(Shot(project_id=project["id"], ordinal=1))
+
+        async def read_upload(_file, _size=-1):
+            latest = router.store.get_shot(shot.id)
+            latest.h3_prompt_skill_output = "new H3 during upload"
+            latest.video_prompt = "new H3 during upload"
+            router.store.save_shot(latest)
+            return b"image"
+
+        with patch("starlette.datastructures.UploadFile.read", new=read_upload):
+            response = self.client.post(
+                f"/api/projects/{project['id']}/shots/{shot.id}/keyframe/upload",
+                files={"file": ("image.png", b"image", "image/png")},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        saved = router.store.get_shot(shot.id)
+        self.assertEqual(saved.h3_prompt_skill_output, "new H3 during upload")
+        self.assertEqual(saved.video_prompt, "new H3 during upload")
+        self.assertEqual(saved.image_status, "completed")
+        self.assertIsNotNone(saved.keyframe_asset_id)
+
+    def test_deleting_style_asset_keeps_generated_h3_through_refresh_and_keyframes(self) -> None:
+        project_id = self.client.post("/api/projects", json={"title": "保留付费 Prompt", "story": "人物开门"}).json()["id"]
+        style = self.client.post(f"/api/projects/{project_id}/assets", data={"role": "style", "name": "旧风格图"},
+                                 files={"file": ("style.png", b"style", "image/png")}).json()
+        project = router.store.get_project(project_id)
+        project.style_profile = StyleProfile(name="手绘", reference_asset_ids=[style["id"]], approved=True)
+        router.store.save_project(project)
+        shot = router.store.save_shot(Shot(project_id=project_id, ordinal=1, narrative="人物开门", keyframe_prompt="门前"))
+        output = "integrated_multimodal_description: A person opens the door.\noverall_soundscape: Room tone.\nnon_diegetic_music: None."
+
+        class LLM:
+            async def generate_json(self, *args, **kwargs):
+                return {"video_prompt": output}
+
+        class ImageGenerator:
+            async def generate_image(self, scene, output_dir, *args, **kwargs):
+                path = Path(output_dir) / "image.png"
+                path.write_bytes(b"image")
+                return str(path)
+
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=LLM()):
+            generated = self.client.post(f"/api/projects/{project_id}/h3-prompts/generate", json={"shot_ids": [shot.id]})
+        self.assertEqual(generated.status_code, 200, generated.text)
+        deleted = self.client.delete(f"/api/projects/{project_id}/assets/{style['id']}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        with patch("src.video_workflow.services.projects.create_image_generator", return_value=ImageGenerator()):
+            image = self.client.post(f"/api/projects/{project_id}/keyframes/generate", json={"shot_ids": [shot.id]})
+        self.assertEqual(image.status_code, 200, image.text)
+        for _ in range(3):
+            bundle = self.client.get(f"/api/projects/{project_id}").json()
+            saved = bundle["shots"][0]
+            self.assertEqual(saved["h3_prompt_skill_output"], output)
+            self.assertEqual(saved["video_prompt"], output)
+            self.assertEqual(saved["h3_director_version"], H3_DIRECTOR_VERSION)
+            self.assertLess(saved["h3_prompt_source_revision"], saved["content_revision"])
+            self.assertEqual(saved["image_status"], "completed")
+            self.assertTrue(saved["keyframe_asset_id"])
+            self.assertNotIn("旧风格图", saved["seedance_prompt"])
+            self.assertNotIn(style["id"], [asset["id"] for asset in bundle["assets"]])
+        planned = router.project_service.plan_shot(project_id, shot.id)
+        self.assertEqual(planned.video_prompt, output)
+        history = self.client.get(f"/api/projects/{project_id}/shots/{shot.id}/h3-prompt-history")
+        self.assertEqual(history.status_code, 200)
+        self.assertEqual(len(history.json()), 1)
+        self.assertEqual(history.json()[0]["prompt"], output)
+
+    def test_stale_shot_form_returns_conflict_instead_of_overwriting_prompt(self) -> None:
+        project_id = self.client.post("/api/projects", json={"title": "旧页面防覆盖", "story": "人物开门"}).json()["id"]
+        shot = router.store.save_shot(Shot(project_id=project_id, ordinal=1, video_prompt="旧模板"))
+        stale = shot.model_dump(mode="json")
+        shot.video_prompt = shot.h3_prompt_skill_output = "newly generated English prompt"
+        shot.version += 1
+        router.store.save_shot(shot)
+        response = self.client.put(f"/api/projects/{project_id}/shots/{shot.id}", json=stale)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(router.store.get_shot(shot.id).video_prompt, "newly generated English prompt")
 
     def test_extract_storyboard_rows_from_xlsx(self) -> None:
         workbook = Workbook()

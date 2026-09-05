@@ -14,16 +14,20 @@ import httpx
 
 from src.video_workflow.config import settings
 from src.video_workflow.domain import (
+    Asset,
     AssetRole,
+    AssetType,
     CharacterAppearanceProfile,
     CharacterProfile,
     GenerationMode,
     JobStatus,
     ProjectBrief,
     SceneProfile,
+    SeedanceReferenceMode,
     Shot,
     ShotContinuityMode,
     StyleProfile,
+    VoiceEvent,
 )
 from src.video_workflow.integrations.comfyui import (
     ComfyUIClient,
@@ -42,7 +46,7 @@ from src.video_workflow.generators.image import (
 )
 from src.video_workflow.generators.llm import _build_user_suggestions_text
 from src.video_workflow.media_paths import resolve_media_path
-from src.video_workflow.services.projects import ProjectService
+from src.video_workflow.services.projects import ProjectService, _normalize_project_analysis_payload
 from src.video_workflow.services.render_queue import RenderQueue
 from src.video_workflow.services.audio import DialogueAudioService
 from src.video_workflow.storage import ProjectStore
@@ -63,6 +67,83 @@ class ProjectAndWorkflowTests(unittest.TestCase):
     def tearDown(self) -> None:
         settings.PROJECTS_DIR, settings.OUTPUT_DIR = self.previous
         self.temp.cleanup()
+
+    def test_series_episode_inherits_style_selected_cast_and_reference_files(self) -> None:
+        source = self.service.create_project(ProjectBrief(
+            title="张小差安全科普",
+            story="第一集",
+            visual_style="中式奇幻轻喜剧插画",
+            negative_prompt="禁止写实摄影",
+        ))
+        style_path = self.root / "style.png"
+        character_path = self.root / "zhang.png"
+        style_path.write_bytes(b"series-style")
+        character_path.write_bytes(b"series-character")
+        style_asset = self.store.save_asset(Asset(
+            project_id=source.id,
+            type=AssetType.IMAGE,
+            role=AssetRole.STYLE,
+            name="系列画风",
+            path=str(style_path),
+        ))
+        zhang = CharacterProfile(name="张小差", reference_asset_ids=[])
+        character_asset = self.store.save_asset(Asset(
+            project_id=source.id,
+            type=AssetType.IMAGE,
+            role=AssetRole.CHARACTER,
+            name="张小差四视图",
+            path=str(character_path),
+            character_id=zhang.id,
+        ))
+        zhang.reference_asset_ids = [character_asset.id]
+        source.characters = [zhang, CharacterProfile(name="本集路人")]
+        source.style_bible = "固定线稿、材质和角色比例"
+        source.style_profile = StyleProfile(
+            name="安全科普系列",
+            medium="数字手绘",
+            reference_asset_ids=[style_asset.id],
+            approved=True,
+        )
+        self.store.save_project(source)
+
+        series, source = self.service.save_project_as_series(source.id, "张小差科普宇宙")
+        self.assertEqual(source.episode_number, 1)
+        self.assertTrue(all(Path(asset.path).is_file() for asset in series.assets))
+        self.assertNotIn(style_asset.id, series.style_profile.reference_asset_ids)
+
+        inherited_character_id = next(item.id for item in series.characters if item.name == "张小差")
+        episode = self.service.create_series_episode(
+            series.id,
+            ProjectBrief(title="电动车入户充电", story="张小差遇见王大爷"),
+            [inherited_character_id],
+        )
+        episode_assets = self.store.list_assets(episode.id)
+        self.assertEqual(episode.episode_number, 2)
+        self.assertIn("数字手绘", episode.brief.visual_style)
+        self.assertIn("固定线稿", source.style_bible)
+        self.assertIn("逐集场景规则", episode.style_bible)
+        self.assertIn("数字手绘", episode.style_bible)
+        self.assertEqual(episode.brief.negative_prompt, source.brief.negative_prompt)
+        self.assertEqual([item.name for item in episode.characters], ["张小差"])
+        self.assertNotEqual(episode.characters[0].id, zhang.id)
+        self.assertEqual(len(episode.characters[0].reference_asset_ids), 1)
+        self.assertTrue(all(Path(asset.path).is_file() for asset in episode_assets))
+        self.assertTrue(all(asset.project_id == episode.id for asset in episode_assets))
+        self.assertEqual(
+            next(asset.character_id for asset in episode_assets if asset.role == AssetRole.CHARACTER),
+            episode.characters[0].id,
+        )
+        episode.characters.append(CharacterProfile(name="王大爷"))
+        self.store.save_project(episode)
+        refreshed_series, _ = self.service.save_project_as_series(episode.id)
+        self.assertEqual(
+            {item.name for item in refreshed_series.characters},
+            {"张小差", "本集路人", "王大爷"},
+        )
+        self.assertEqual(
+            next(item.id for item in refreshed_series.characters if item.name == "张小差"),
+            inherited_character_id,
+        )
 
     def test_duration_mapping_and_workflow_builders(self) -> None:
         self.assertEqual(_generated_image_suffix(b"\xff\xd8\xff\xe0"), ".jpg")
@@ -373,6 +454,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             ) -> str:
                 captured["reference_images"] = reference_images
                 captured["seed"] = kwargs.get("seed")
+                captured["aspect_ratio"] = kwargs.get("aspect_ratio")
+                captured["prompt"] = _scene.visual_prompt
                 latest = self_test.service.require_project(project.id)
                 latest.ai_recommended_shot_count = 77
                 self_test.store.save_project(latest)
@@ -389,6 +472,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                 self.service.generate_character_references(
                     project.id,
                     [character.id],
+                    user_suggestions="眼神更锐利，衣料增加磨损细节",
                     reference_asset_ids=[reference.id],
                     appearance_profile_id=appearance.id,
                 )
@@ -400,6 +484,10 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             captured["seed"],
             self.service._stable_seed(project.id, character.id, appearance.id),
         )
+        self.assertEqual(captured["aspect_ratio"], "16:9")
+        self.assertIn("左侧约占画面三分之一：大尺寸正脸近照", str(captured["prompt"]))
+        self.assertIn("全身正面、标准侧面、全身背面", str(captured["prompt"]))
+        self.assertIn("眼神更锐利，衣料增加磨损细节", str(captured["prompt"]))
         saved_project = self.service.require_project(project.id)
         saved_character = next(item for item in saved_project.characters if item.id == character.id)
         saved_appearance = next(
@@ -409,7 +497,123 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertTrue(saved_appearance.approved)
         self.assertEqual(saved_appearance.reference_asset_ids, [reference.id, assets[0].id])
 
-    def test_manual_storyboard_count_replans_instead_of_truncating(self) -> None:
+    def test_missing_character_references_are_created_from_script_and_style(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(
+                title="剧本生成人设",
+                story="阿青带着弟弟小满穿过雨夜车站。",
+                visual_style="低饱和电影写实，冷雨暖灯",
+            )
+        )
+        style_path = self.root / "style.png"
+        style_path.write_bytes(b"style")
+        style_asset = self.service.register_existing_asset(project.id, style_path, AssetRole.STYLE, "客户风格图")
+        project.style_profile = StyleProfile(
+            name="冷雨电影写实",
+            reference_asset_ids=[style_asset.id],
+            analysis_summary="低饱和冷雨暖灯",
+            approved=True,
+        )
+        self.store.save_project(project)
+        image_calls: list[dict[str, object]] = []
+
+        class FakeLLM:
+            async def generate_json(self, _system: str, _prompt: str, reference_images: list[str] | None = None):
+                return {
+                    "visual_style": "冷雨电影写实", "pacing": "克制", "audience": "大众",
+                    "style_bible": "冷雨暖灯", "negative_prompt": "身份漂移", "delivery_notes": "",
+                    "recommended_shot_count": 4, "shot_count_reason": "四个叙事节点",
+                    "characters": [
+                        {"character_id": None, "name": "阿青", "description": "二十多岁短发女性", "wardrobe": "深蓝雨衣", "voice_description": "沉稳", "reference_observations": "按剧本推断"},
+                        {"character_id": None, "name": "小满", "description": "十岁男孩", "wardrobe": "黄色雨衣", "voice_description": "稚嫩", "reference_observations": "按剧本推断"},
+                    ],
+                    "analysis_notes": [],
+                }
+
+        class FakeImageGenerator:
+            async def generate_image(self, scene: Scene, output_dir: str, reference_images: str | None, **kwargs: object) -> str:
+                image_calls.append({"prompt": scene.visual_prompt, "references": reference_images, "style": kwargs.get("image_style"), "aspect_ratio": kwargs.get("aspect_ratio")})
+                output = Path(output_dir) / f"character-{len(image_calls)}.png"
+                output.write_bytes(f"character-{len(image_calls)}".encode())
+                return str(output)
+
+        with (
+            patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()),
+            patch("src.video_workflow.services.projects.create_image_generator", return_value=FakeImageGenerator()),
+        ):
+            result = asyncio.run(self.service.generate_missing_character_references(
+                project.id,
+                mode="script_style",
+                user_suggestions="所有角色保持统一雨衣材质，脸型必须有区分",
+            ))
+
+        saved = self.service.require_project(project.id)
+        self.assertEqual(result["missing_count"], 2)
+        self.assertEqual(len(result["assets"]), 2)
+        self.assertEqual([character.name for character in saved.characters], ["阿青", "小满"])
+        self.assertTrue(all(character.reference_asset_ids for character in saved.characters))
+        self.assertTrue(all(call["references"] == str(style_path.resolve()) for call in image_calls))
+        self.assertTrue(all("项目剧情依据：阿青带着弟弟小满" in str(call["prompt"]) for call in image_calls))
+        self.assertTrue(all("禁止复制参考图人物身份" in str(call["prompt"]) for call in image_calls))
+        self.assertTrue(all("所有角色保持统一雨衣材质" in str(call["prompt"]) for call in image_calls))
+        self.assertTrue(all("全身正面、标准侧面、全身背面" in str(call["prompt"]) for call in image_calls))
+        self.assertTrue(all(call["aspect_ratio"] == "16:9" for call in image_calls))
+        self.assertTrue(all(style_asset.id not in character.reference_asset_ids for character in saved.characters))
+
+    def test_partial_character_references_guide_missing_cast_without_identity_binding(self) -> None:
+        first = CharacterProfile(name="姐姐", description="成年女性", wardrobe="深蓝外套")
+        second = CharacterProfile(name="弟弟", description="少年", wardrobe="黄色外套")
+        third = CharacterProfile(name="站长", description="中年男性", wardrobe="铁路制服")
+        project = self.service.create_project(ProjectBrief(title="部分人设补齐", story="姐姐带弟弟向站长问路。", visual_style="电影写实"))
+        reference_path = self.root / "sister.png"
+        reference_path.write_bytes(b"sister")
+        reference = self.service.register_existing_asset(project.id, reference_path, AssetRole.CHARACTER, "姐姐参考")
+        first.reference_asset_ids = [reference.id]
+        project.characters = [first, second, third]
+        self.store.save_project(project)
+        image_calls: list[dict[str, object]] = []
+
+        class FakeLLM:
+            async def generate_json(self, _system: str, _prompt: str, reference_images: list[str] | None = None):
+                return {
+                    "visual_style": "电影写实", "pacing": "自然", "audience": "大众",
+                    "style_bible": "统一写实", "negative_prompt": "身份漂移", "delivery_notes": "",
+                    "recommended_shot_count": 4, "shot_count_reason": "完整覆盖剧情",
+                    "characters": [
+                        {"character_id": first.id, "name": "姐姐", "description": first.description, "wardrobe": first.wardrobe, "voice_description": "", "reference_observations": "按参考图"},
+                        {"character_id": second.id, "name": "弟弟", "description": second.description, "wardrobe": second.wardrobe, "voice_description": "", "reference_observations": "按剧本"},
+                        {"character_id": third.id, "name": "站长", "description": third.description, "wardrobe": third.wardrobe, "voice_description": "", "reference_observations": "按剧本"},
+                    ],
+                    "analysis_notes": [],
+                }
+
+        class FakeImageGenerator:
+            async def generate_image(self, scene: Scene, output_dir: str, reference_images: str | None, **_kwargs: object) -> str:
+                image_calls.append({"prompt": scene.visual_prompt, "references": reference_images})
+                output = Path(output_dir) / f"missing-{len(image_calls)}.png"
+                output.write_bytes(f"missing-{len(image_calls)}".encode())
+                return str(output)
+
+        with (
+            patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()),
+            patch("src.video_workflow.services.projects.create_image_generator", return_value=FakeImageGenerator()),
+        ):
+            result = asyncio.run(self.service.generate_missing_character_references(
+                project.id,
+                mode="complete_missing",
+                reference_asset_ids=[reference.id],
+            ))
+
+        saved_by_name = {character.name: character for character in self.service.require_project(project.id).characters}
+        self.assertEqual(result["missing_count"], 2)
+        self.assertEqual(len(result["assets"]), 2)
+        self.assertTrue(all(call["references"] == str(reference_path.resolve()) for call in image_calls))
+        self.assertEqual(saved_by_name["姐姐"].reference_asset_ids, [reference.id])
+        self.assertNotIn(reference.id, saved_by_name["弟弟"].reference_asset_ids)
+        self.assertNotIn(reference.id, saved_by_name["站长"].reference_asset_ids)
+        self.assertTrue(all("禁止复制参考图人物身份" in str(call["prompt"]) for call in image_calls))
+
+    def test_manual_storyboard_count_mismatch_is_not_retried_or_truncated(self) -> None:
         project = self.service.create_project(
             ProjectBrief(title="固定十镜", story="一百五十秒人物传记", target_duration_seconds=150)
         )
@@ -418,14 +622,14 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         class FakeLLM:
             async def generate_storyboard(self, **kwargs: object) -> Storyboard:
                 calls.append(str(kwargs.get("user_suggestions") or ""))
-                count = 19 if len(calls) == 1 else 10
+                count = 19
                 return Storyboard(
                     topic="测试",
                     scenes=[
                         Scene(
                             id=index,
-                            narrative=(f"错误的十九镜段落 {index}" if count == 19 else f"完整重构段落 {index}"),
-                            story_beat=("完整结局" if count == 10 and index == 10 else ""),
+                            narrative=f"错误的十九镜段落 {index}",
+                            story_beat="",
                             visual_prompt=f"重构画面 {index}",
                             motion_prompt="人物做一个连续的小动作",
                             duration=15,
@@ -439,17 +643,12 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                 self.llm = FakeLLM()
 
         with patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator):
-            shots = asyncio.run(self.service.generate_storyboard(project.id, 10, "manual"))
+            with self.assertRaisesRegex(ValueError, "没有自动再次调用"):
+                asyncio.run(self.service.generate_storyboard(project.id, 10, "manual"))
 
-        self.assertEqual(len(calls), 2)
-        self.assertIn("上一次返回了 19 个分镜", calls[1])
-        self.assertEqual(len(shots), 10)
-        self.assertEqual([shot.ordinal for shot in shots], list(range(1, 11)))
-        self.assertEqual(shots[-1].narrative, "完整结局")
-        self.assertNotIn("错误的十九镜段落", " ".join(shot.narrative for shot in shots))
-        saved_project = self.service.require_project(project.id)
-        self.assertEqual(saved_project.storyboard_count_mode, "manual")
-        self.assertEqual(saved_project.manual_shot_count, 10)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("严格 10 个分镜", calls[0])
+        self.assertEqual(self.store.list_shots(project.id), [])
 
     def test_manual_storyboard_count_mismatch_preserves_existing_storyboard(self) -> None:
         project = self.service.create_project(
@@ -488,10 +687,10 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                 self.llm = FakeLLM()
 
         with patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator):
-            with self.assertRaisesRegex(ValueError, "连续 3 次未遵守严格 5 镜要求"):
+            with self.assertRaisesRegex(ValueError, "没有自动再次调用"):
                 asyncio.run(self.service.generate_storyboard(project.id, 5, "manual"))
 
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 1)
         saved = self.store.list_shots(project.id)
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0].id, existing.id)
@@ -556,6 +755,127 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertIn("浅青色短袄", prompt)
         self.assertNotIn("成年男子", prompt)
 
+    def test_shot_cast_sync_matches_bracket_aliases_and_all_character_references(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="群像匹配", story="多人电力试炼"))
+        lin = CharacterProfile(name="林砚")
+        glasses = CharacterProfile(name="戴眼镜男生（未具名）")
+        monitor = CharacterProfile(name="女试炼者A（胡浩监护人）")
+        unrelated = CharacterProfile(name="张峰")
+        project.characters = [lin, glasses, monitor, unrelated]
+        for character in project.characters:
+            path = self.root / f"{character.id}.png"
+            path.write_bytes(character.name.encode("utf-8"))
+            asset = self.service.register_existing_asset(
+                project.id,
+                path,
+                AssetRole.CHARACTER,
+                f"{character.name}参考",
+            )
+            asset.character_id = character.id
+            self.store.save_asset(asset)
+            character.reference_asset_ids = [asset.id]
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            title="林砚听戴眼镜男生解释",
+            scene_description="林砚与戴眼镜的男生站在一起，女试炼者A在后方观察",
+            character_ids=[lin.id],
+            reference_asset_ids=[lin.reference_asset_ids[0]],
+        )
+
+        self.service.synchronize_shot_cast(project, shot)
+
+        self.assertEqual(shot.character_ids, [lin.id, glasses.id, monitor.id])
+        self.assertEqual(
+            shot.reference_asset_ids,
+            [lin.reference_asset_ids[0], glasses.reference_asset_ids[0], monitor.reference_asset_ids[0]],
+        )
+        keyframe_ids = self.service.keyframe_character_ids(project, shot, shot.scene_description)
+        self.assertEqual(keyframe_ids, [lin.id, glasses.id, monitor.id])
+        seedance_prompt = self.service.compile_seedance_prompt(
+            project,
+            shot,
+            self.store.list_assets(project.id),
+        )
+        self.assertIn("定义为“戴眼镜男生（未具名）”", seedance_prompt)
+        self.assertIn("定义为“女试炼者A（胡浩监护人）”", seedance_prompt)
+        self.assertNotIn("定义为“张峰”", seedance_prompt)
+
+    def test_storyboard_uses_explicit_scene_character_names_as_cast_source(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(title="显式角色数组", story="两个角色在车站交谈", target_duration_seconds=8)
+        )
+        first = CharacterProfile(name="阿青")
+        second = CharacterProfile(name="小满（成年期）")
+        project.characters = [first, second]
+        self.store.save_project(project)
+
+        class FakeLLM:
+            async def generate_storyboard(self, **_: object) -> Storyboard:
+                return Storyboard(
+                    topic="车站",
+                    scenes=[
+                        Scene(
+                            id=1,
+                            narrative="两人站在月台",
+                            visual_prompt="两位角色同框，但画面文字不重复姓名",
+                            motion_prompt="两人轻轻点头",
+                            character_names=["阿青", "小满"],
+                            duration=8,
+                        )
+                    ],
+                )
+
+        class FakeOrchestrator:
+            def __init__(self, *_: object, **__: object) -> None:
+                self.llm = FakeLLM()
+
+        with patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator):
+            shots = asyncio.run(self.service.generate_storyboard(project.id, 1, "manual"))
+
+        self.assertEqual(shots[0].character_ids, [first.id, second.id])
+
+    def test_storyboard_preserves_unregistered_character_names_as_recoverable_draft(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(title="角色校验", story="阿青在车站等待", target_duration_seconds=8)
+        )
+        project.characters = [CharacterProfile(name="阿青")]
+        self.store.save_project(project)
+        calls = 0
+
+        class FakeLLM:
+            async def generate_storyboard(self, **_: object) -> Storyboard:
+                nonlocal calls
+                calls += 1
+                return Storyboard(
+                    topic="车站",
+                    scenes=[
+                        Scene(
+                            id=1,
+                            narrative="短发男生在车站等待",
+                            visual_prompt="短发男生近景",
+                            motion_prompt="短发男生抬头",
+                            character_names=["短发男生"],
+                            duration=8,
+                        )
+                    ],
+                )
+
+        class FakeOrchestrator:
+            def __init__(self, *_: object, **__: object) -> None:
+                self.llm = FakeLLM()
+
+        with patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator):
+            shots = asyncio.run(self.service.generate_storyboard(project.id, 1, "manual"))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(shots), 1)
+        self.assertEqual(shots[0].character_ids, [])
+        saved_project = self.service.require_project(project.id)
+        self.assertTrue(saved_project.storyboard_warnings)
+        self.assertIn("短发男生", saved_project.storyboard_warnings[0])
+
     def test_style_activation_refreshes_all_downstream_prompts(self) -> None:
         project = self.service.create_project(ProjectBrief(title="style", story="story"))
         shot = Shot(
@@ -587,6 +907,108 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertIn("手工黏土定格动画", refreshed.seedance_prompt)
         self.assertEqual(refreshed.h3_prompt_source_revision, refreshed.content_revision)
         self.assertEqual(refreshed.seedance_prompt_source_revision, refreshed.content_revision)
+
+    def test_asset_prompt_refresh_drops_deleted_style_reference(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="删除风格图", story="人物走入房间"))
+        style_path = self.root / "style.png"
+        style_path.write_bytes(b"style")
+        style_asset = self.service.register_existing_asset(project.id, style_path, AssetRole.STYLE, "已删除风格图")
+        project.style_profile = StyleProfile(
+            name="旧风格",
+            medium="电影写实",
+            reference_asset_ids=[style_asset.id],
+            approved=True,
+        )
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="人物走入房间",
+            scene_description="办公室",
+            subject_motion="人物推门进入",
+            seedance_prompt="旧缓存 @图片1（已删除风格图）",
+            h3_prompt_skill_output="旧付费 H3",
+            h3_director_version="h3-director-v3",
+        )
+        self.store.save_shot(shot)
+
+        self.store.delete_asset(style_asset.id)
+        project.style_profile.reference_asset_ids = []
+        self.store.save_project(project)
+        self.service.refresh_shot_prompt_caches(project.id)
+
+        refreshed = self.service.require_shot(shot.id)
+        self.assertNotIn("已删除风格图", refreshed.seedance_prompt)
+        self.assertEqual(refreshed.h3_prompt_skill_output, "旧付费 H3")
+        self.assertEqual(refreshed.h3_director_version, "h3-director-v3")
+        self.assertLess(refreshed.h3_prompt_source_revision, refreshed.content_revision)
+        self.assertEqual(refreshed.content_revision, 2)
+
+    def test_storyboard_defaults_to_local_seedance_compile_without_h3_call(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="默认 Prompt", story="人物抬头", target_duration_seconds=6))
+
+        class FakeLLM:
+            async def generate_storyboard(self, **_: object) -> Storyboard:
+                return Storyboard(scenes=[Scene(event="人物抬头看向光源", opening_state="人物站在窗边", duration=6)])
+
+        class FakeOrchestrator:
+            def __init__(self, *_: object, **__: object) -> None:
+                self.llm = FakeLLM()
+
+        with (
+            patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator),
+            patch.object(self.service, "generate_h3_prompts", side_effect=AssertionError("H3 should be on demand")),
+        ):
+            shots = asyncio.run(self.service.generate_storyboard(project.id, 1, "manual"))
+
+        self.assertEqual(self.service.require_project(project.id).preferred_prompt_targets, ["seedance"])
+        self.assertEqual(shots[0].h3_prompt_skill_output, "")
+        self.assertTrue(shots[0].seedance_prompt)
+
+    def test_style_reference_analysis_can_atomically_fill_project_style(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(
+                title="风格参考回填",
+                story="电力检修员在高压线路旁作业",
+                negative_prompt="不要字幕",
+            )
+        )
+        reference = self.root / "style-reference.png"
+        reference.write_bytes(b"image")
+        asset = self.service.register_existing_asset(project.id, reference, AssetRole.STYLE, "客户风格图")
+
+        class FakeLLM:
+            async def generate_json(self, _system: str, _prompt: str, reference_images: list[str] | None = None):
+                self.reference_images = reference_images
+                return {
+                    "name": "冷峻工业电影写实",
+                    "medium": "高细节电影级 3D 写实",
+                    "palette": "低饱和蓝灰主色，安全橙点缀",
+                    "lighting": "阴天漫射冷光与轮廓侧光",
+                    "camera_language": "中长焦、中近景、稳定缓推",
+                    "composition": "人物位于三分线，电网结构形成纵深",
+                    "texture": "防护服织物与金属设备纹理清晰",
+                    "motion_language": "克制连续动作，少量稳定跟拍",
+                    "analysis_summary": "全项目保持冷峻工业电影写实，不改变人物与设备材质规则。",
+                    "negative_constraints": "避免卡通化、霓虹色、设备结构变形",
+                    "confidence": 0.91,
+                    "observations": ["画面整体为蓝灰冷色", "人物防护服和电网金属具有写实纹理"],
+                }
+
+        fake = FakeLLM()
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=fake):
+            draft = asyncio.run(self.service.analyze_style(project.id, [asset.id], apply=True))
+
+        saved = self.service.require_project(project.id)
+        self.assertTrue(draft.approved)
+        self.assertIsNotNone(saved.style_profile)
+        self.assertTrue(saved.style_profile.approved)
+        self.assertEqual(saved.style_profile.reference_asset_ids, [asset.id])
+        self.assertIn("冷峻工业电影写实", saved.brief.visual_style)
+        self.assertIn("【镜头语言】中长焦、中近景、稳定缓推", saved.style_bible)
+        self.assertIn("不要字幕", saved.brief.negative_prompt)
+        self.assertIn("设备结构变形", saved.brief.negative_prompt)
+        self.assertEqual(fake.reference_images, [str(reference.resolve())])
 
     def test_optional_scene_profile_and_seedance_tail_continuity(self) -> None:
         project = self.service.create_project(ProjectBrief(title="continuity", story="三分钟谈话"))
@@ -620,14 +1042,14 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         without_scene = self.service.seedance_reference_assets(second, assets, project)
         self.assertNotIn(scene_asset.id, [asset.id for asset in without_scene])
         self.assertEqual(self.service.continuity_input_asset_id(project, second), tail_asset.id)
-        self.assertEqual(self.service.seedance_first_frame_asset_id(project, second, assets), tail_asset.id)
+        self.assertIsNone(self.service.seedance_first_frame_asset_id(project, second, assets))
 
         second.use_scene_profile = True
         with_scene = self.service.seedance_reference_assets(second, assets, project)
-        self.assertEqual([asset.id for asset in with_scene], [tail_asset.id])
+        self.assertEqual([asset.id for asset in with_scene], [tail_asset.id, scene_asset.id])
         prompt = self.service.compile_seedance_prompt(project, second, assets)
         self.assertIn("图片1是上一镜真实尾帧", prompt)
-        self.assertNotIn("图片2", prompt)
+        self.assertIn("图片2", prompt)
 
     def test_single_shot_ai_redo_locks_only_identity_ordinal_and_duration(self) -> None:
         project = self.service.create_project(ProjectBrief(title="redo", story="原剧情"))
@@ -672,6 +1094,119 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(revised.scene_description, "雨夜街道")
         self.assertEqual(revised.dialogue, "新的对白")
         self.assertGreater(revised.content_revision, shot.content_revision)
+
+    def test_ai_insert_adds_only_one_shot_and_atomically_renumbers_tail(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="补镜", story="前因后果"))
+        scene_profile = SceneProfile(name="地府大厅", description="幽蓝地府办事大厅", continuity_notes="柜台和排队护栏固定")
+        project.scene_profiles = [scene_profile]
+        self.store.save_project(project)
+        first = self.store.save_shot(Shot(project_id=project.id, ordinal=1, title="原镜一", narrative="起因"))
+        second = self.store.save_shot(Shot(project_id=project.id, ordinal=2, title="原镜二", narrative="原结尾", video_path="kept.mp4"))
+
+        class FakeLLM:
+            async def generate_json(self, *_: object, **__: object) -> dict[str, object]:
+                return {
+                    "title": "地府排队反转",
+                    "duration_seconds": 8,
+                    "event": "镜头切回地府大厅，人挤人的队伍一直延伸到远处",
+                    "opening_state": "地府大厅大全景，密集人群沿护栏排队",
+                    "scene_profile_name": "地府大厅",
+                    "character_names": [],
+                    "shot_size": "大全景",
+                    "camera_angle": "高机位",
+                    "lens": "24mm广角",
+                    "camera_motion": "缓慢后拉",
+                    "subject_motion": "队伍不断向画面深处延伸",
+                    "visual_beats": [
+                        {"start_seconds": 0, "end_seconds": 4, "purpose": "揭示", "subject_action": "前景人群挪动", "camera_motion": "缓慢后拉"},
+                        {"start_seconds": 4, "end_seconds": 8, "purpose": "反转", "subject_action": "露出看不到尽头的队伍", "camera_motion": "固定镜头"},
+                    ],
+                    "voice_events": [],
+                }
+
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()):
+            inserted = asyncio.run(
+                self.service.insert_shot_with_ai(project.id, first.id, "插一个地府人挤人排队的结尾反转", [])
+            )
+
+        shots = self.store.list_shots(project.id)
+        self.assertEqual([shot.id for shot in shots], [first.id, inserted.id, second.id])
+        self.assertEqual([shot.ordinal for shot in shots], [1, 2, 3])
+        self.assertEqual(shots[2].video_path, "kept.mp4")
+        self.assertEqual(inserted.title, "地府排队反转")
+        self.assertTrue(inserted.use_scene_profile)
+        self.assertEqual(inserted.scene_profile_id, scene_profile.id)
+        refreshed = self.service.require_project(project.id)
+        self.assertIn(inserted.id, refreshed.scene_profiles[0].source_shot_ids)
+
+    def test_changing_seedance_reference_mode_recompiles_material_numbers(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="参考策略", story="角色稍后入画"))
+        character = CharacterProfile(name="张小差", wardrobe="炭黑工装", reference_asset_ids=["character-ref"])
+        project.characters = [character]
+        self.store.save_project(project)
+        (self.root / "keyframe.png").write_bytes(b"keyframe")
+        (self.root / "character.png").write_bytes(b"character")
+        keyframe = self.service.register_existing_asset(
+            project.id,
+            self.root / "keyframe.png",
+            AssetRole.KEYFRAME,
+            name="首帧",
+        )
+        character_ref = self.service.register_existing_asset(
+            project.id,
+            self.root / "character.png",
+            AssetRole.CHARACTER,
+            name="张小差四视图",
+        )
+        character_ref.character_id = character.id
+        self.store.save_asset(character_ref)
+        project = self.service.require_project(project.id)
+        project.characters[0].reference_asset_ids = [character_ref.id]
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="张小差随后从墙里钻出",
+            scene_description="空墙和客厅",
+            keyframe_prompt="【首帧画面】空墙和客厅",
+            character_ids=[character.id],
+            keyframe_asset_id=keyframe.id,
+            reference_asset_ids=[character_ref.id],
+            seedance_reference_mode=SeedanceReferenceMode.STRICT_FIRST_FRAME,
+        )
+        shot.seedance_prompt = self.service.compile_seedance_prompt(project, shot, self.store.list_assets(project.id))
+        shot.seedance_prompt_version = "seedance-2.0-director-v6"
+        saved = self.store.save_shot(shot)
+        original_revision = saved.content_revision
+
+        incoming = saved.model_copy(deep=True)
+        incoming.seedance_reference_mode = SeedanceReferenceMode.MULTIMODAL_REFERENCE
+        updated = self.service.update_shot(project.id, incoming)
+
+        self.assertEqual(updated.content_revision, original_revision)
+        self.assertIn("张小差四视图", updated.seedance_prompt)
+        self.assertIn("@图片2", updated.seedance_prompt)
+
+    def test_seedance_multimodal_startup_migration_updates_legacy_shots_once(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="旧项目", story="旧分镜"))
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="旧镜头",
+            seedance_reference_mode=SeedanceReferenceMode.STRICT_FIRST_FRAME,
+            seedance_prompt="旧版提示词",
+            seedance_prompt_version="seedance-2.0-director-v5",
+        )
+        self.store.save_shot(shot)
+
+        first = self.service.migrate_all_seedance_shots_to_multimodal()
+        migrated = self.service.require_shot(shot.id)
+        second = self.service.migrate_all_seedance_shots_to_multimodal()
+
+        self.assertEqual(first, {"project_count": 1, "shot_count": 1})
+        self.assertEqual(second, {"project_count": 0, "shot_count": 0})
+        self.assertEqual(migrated.seedance_reference_mode, SeedanceReferenceMode.MULTIMODAL_REFERENCE)
+        self.assertEqual(migrated.seedance_prompt_version, "seedance-2.0-director-v6")
 
     def test_comfyui_submit_uses_canonical_uuid_prompt_id(self) -> None:
         captured: dict[str, object] = {}
@@ -768,11 +1303,16 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(planned.dialogue_speaker_id, speaker.id)
         self.assertIn("唯一发言者明确为C同志", planned.video_prompt)
         self.assertIn("秦绍辉全程闭嘴", planned.video_prompt)
-        segments = self.service.h3_segment_plan(project, planned, [])
+        previous_auto_segment = settings.H3_AUTO_SEGMENT_COMPLEX_SHOTS
+        settings.H3_AUTO_SEGMENT_COMPLEX_SHOTS = True
+        try:
+            segments = self.service.h3_segment_plan(project, planned, [])
+        finally:
+            settings.H3_AUTO_SEGMENT_COMPLEX_SHOTS = previous_auto_segment
         self.assertEqual(len(segments), 3)
         self.assertEqual(sum(bool(segment["has_dialogue"]) for segment in segments), 1)
         self.assertAlmostEqual(sum(float(segment["duration"]) for segment in segments), 11.5, places=2)
-        self.assertTrue(all("不出现任何字幕" in str(segment["prompt"]) for segment in segments))
+        self.assertTrue(all("不得把对白或旁白自动转成字幕" in str(segment["prompt"]) for segment in segments))
         silent_segments = [segment for segment in segments if not segment["has_dialogue"]]
         self.assertTrue(silent_segments)
         self.assertTrue(all("全程嘴唇闭合" in str(segment["prompt"]) for segment in silent_segments))
@@ -782,6 +1322,99 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(speaking_segment["speaker_id"], speaker.id)
         self.assertIn("唯一发言者明确为C同志", str(speaking_segment["prompt"]))
         self.assertIn("秦绍辉全程闭嘴", str(speaking_segment["prompt"]))
+
+    def test_spoken_dialogue_text_keeps_colon_ending_fragments(self) -> None:
+        # Real dialogue fragments ending with a colon must survive; only short
+        # speaker labels such as “秦绍辉同志：” may be stripped.
+        self.assertEqual(ProjectService.spoken_dialogue_text("登入高危电力副本："), "登入高危电力副本：")
+        self.assertEqual(ProjectService.spoken_dialogue_text("秦绍辉同志：请把手机放好。"), "请把手机放好。")
+        self.assertEqual(ProjectService.spoken_dialogue_text("旁白：欢迎试炼者"), "欢迎试炼者")
+        self.assertEqual(ProjectService.spoken_dialogue_text("【旁白】：欢迎试炼者"), "欢迎试炼者")
+
+    def test_segment_plan_merges_punctuation_only_fragments(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="副本", story="系统播报任务"))
+        speaker = CharacterProfile(name="系统", voice_description="电子合成音")
+        project.characters = [speaker]
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="系统播报副本任务",
+            dialogue="欢迎试炼者073，登入高危电力副本：城郊老旧线路杆上抢修。",
+            duration_seconds=15.0,
+            subject_motion="起势：系统播报；发展：人物抬头；收束：人物出发",
+            character_ids=[speaker.id],
+        )
+        self.store.save_shot(shot)
+        segments = self.service.h3_segment_plan(project, shot, [])
+        self.assertGreaterEqual(len(segments), 2)
+        for segment in segments:
+            text = str(segment["dialogue"]).strip("，。！？!?；;、 ")
+            self.assertTrue(text, segment["dialogue"])
+            self.assertTrue(ProjectService.spoken_dialogue_text(str(segment["dialogue"])))
+
+    def test_hosted_segment_plan_keeps_15s_shot_single(self) -> None:
+        # Hosted APIs render up to 15 continuous seconds per call, so the same
+        # shot that ComfyUI splits into dialogue segments must stay one piece.
+        project = self.service.create_project(ProjectBrief(title="副本", story="系统播报任务"))
+        speaker = CharacterProfile(name="系统", voice_description="电子合成音")
+        project.characters = [speaker]
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="系统播报副本任务",
+            dialogue="欢迎试炼者073，登入高危电力副本：城郊老旧线路杆上抢修。",
+            duration_seconds=15.0,
+            subject_motion="起势：系统播报；发展：人物抬头；收束：人物出发",
+            character_ids=[speaker.id],
+        )
+        self.store.save_shot(shot)
+        segments = self.service.h3_segment_plan(project, shot, [], max_segment_seconds=15.0)
+        self.assertEqual(len(segments), 1)
+        self.assertAlmostEqual(float(segments[0]["duration"]), 15.0, places=2)
+        self.assertIn("欢迎试炼者073", str(segments[0]["dialogue"]))
+        self.assertIn("城郊老旧线路杆上抢修", str(segments[0]["dialogue"]))
+
+    def test_hosted_h3_clean_tts_reads_same_source_system_voice_events(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="系统播报", story="系统发布规则"))
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="系统发布精简规则",
+            dialogue="",
+            duration_seconds=15.0,
+            voice_events=[
+                VoiceEvent(
+                    kind="system_vo",
+                    speaker_name="系统",
+                    text="进入高危电力副本。",
+                    start_seconds=1.5,
+                    end_seconds=4.0,
+                ),
+                VoiceEvent(
+                    kind="system_vo",
+                    speaker_name="系统",
+                    text="双人登杆，一人作业，一人监护。",
+                    start_seconds=4.2,
+                    end_seconds=8.0,
+                ),
+            ],
+        )
+
+        segments = self.service.h3_segment_plan(
+            project,
+            shot,
+            [],
+            max_segment_seconds=15.0,
+        )
+
+        self.assertEqual(len(segments), 1)
+        self.assertTrue(segments[0]["has_dialogue"])
+        self.assertIn("进入高危电力副本", str(segments[0]["dialogue"]))
+        self.assertIn("一人监护", str(segments[0]["dialogue"]))
+        self.assertEqual(segments[0]["speaker_id"], None)
+        self.assertEqual(len(segments[0]["voice_events"]), 2)
 
     def test_dialogue_r2v_keeps_group_composition_and_binds_clean_audio(self) -> None:
         project = self.service.create_project(ProjectBrief(title="三人中景", story="D介绍秦绍辉"))
@@ -837,7 +1470,14 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(prompt.count("</d>"), 1)
         self.assertIn("禁止重复台词", prompt)
         self.assertIn("Do not change to a single-person close-up", prompt)
-        segments = self.service.h3_segment_plan(project, shot, [keyframe, qin, d_ref, c_ref])
+        previous_audio = (settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE, settings.TTS_PROVIDER)
+        settings.H3_POSTPROCESS_AUDIO = True
+        settings.H3_AUDIO_MODE = "clean_tts"
+        settings.TTS_PROVIDER = "edge"
+        try:
+            segments = self.service.h3_segment_plan(project, shot, [keyframe, qin, d_ref, c_ref])
+        finally:
+            settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE, settings.TTS_PROVIDER = previous_audio
         self.assertEqual(len(segments), 1)
         self.assertAlmostEqual(float(segments[0]["generation_duration"]), 6.82, places=2)
         self.assertIn("Do not change to a single-person close-up", str(segments[0]["prompt"]))
@@ -855,6 +1495,103 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         male.tts_voice = ""
         male.voice_description = "中年男性，沉稳威严"
         self.assertEqual(DialogueAudioService.voice_for(project, shot), settings.TTS_DEFAULT_MATURE_MALE_VOICE)
+
+    def test_character_voice_anchor_is_shared_by_seedance_h3_and_clean_tts(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="声音锚点", story="青年检修员抱怨"))
+        speaker = CharacterProfile(
+            name="李强",
+            description="22岁左右东亚男性，体型中等",
+            voice_description="年轻男性声线，语气毛躁缺乏耐心，说话节奏偏快，带着明显不耐烦",
+        )
+        project.characters = [speaker]
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="李强敷衍检查电杆",
+            dialogue="",
+            duration_seconds=8,
+            character_ids=[speaker.id],
+            voice_events=[
+                VoiceEvent(
+                    kind="character",
+                    speaker_id=speaker.id,
+                    speaker_name=speaker.name,
+                    text="真是麻烦。",
+                    start_seconds=2,
+                    end_seconds=4,
+                    lip_sync=True,
+                )
+            ],
+        )
+
+        seedance = self.service.compile_seedance_prompt(project, shot, [])
+        h3 = self.service.compile_h3_prompt(project, shot, [])
+        profile = DialogueAudioService.profile_for(project, shot.model_copy(update={
+            "dialogue": "真是麻烦。",
+            "dialogue_speaker_id": speaker.id,
+        }))
+
+        self.assertIn(speaker.voice_description, seedance)
+        self.assertIn("保持同一音色、年龄感、性别感、音高和口音", seedance)
+        self.assertNotIn(speaker.voice_description, h3)
+        self.assertIn("young adult male voice", h3)
+        self.assertIn("a restless, impatient edge", h3)
+        self.assertIn("Only the exact text inside existing <d>...</d> tags may become speech", h3)
+        self.assertEqual(profile.voice, "zh-CN-YunjianNeural")
+        self.assertEqual(profile.selection_reason, "young_forceful_male")
+        self.assertGreater(profile.rate_percent, 0)
+        self.assertLess(profile.pitch_hz, 0)
+        self.assertEqual(profile.voice_anchor, speaker.voice_description)
+
+    def test_voice_event_name_repairs_a_stale_speaker_id_before_prompt_and_tts(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="说话人修复", story="女监护人提醒胡浩"))
+        male = CharacterProfile(name="胡浩", voice_description="松散随意的年轻男性声线")
+        female = CharacterProfile(name="女试炼者A（胡浩监护人）", voice_description="清亮偏脆的年轻女声，语气急切")
+        project.characters = [male, female]
+        event = VoiceEvent(
+            kind="character",
+            speaker_id=male.id,
+            speaker_name=female.name,
+            text="你拉线还没做拉力测试！",
+            start_seconds=1,
+            end_seconds=4,
+            lip_sync=True,
+        )
+
+        resolved = self.service._resolve_voice_events(project, [event], 8, 8)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            duration_seconds=8,
+            character_ids=[male.id, female.id],
+            voice_events=[event],
+        )
+        seedance = self.service.compile_seedance_prompt(project, shot, [])
+        h3 = self.service.compile_h3_prompt(project, shot, [])
+
+        self.assertEqual(resolved[0].speaker_id, female.id)
+        self.assertIn(female.voice_description, seedance)
+        self.assertNotIn(female.voice_description, h3)
+        self.assertIn("young adult female voice", h3)
+        self.assertIn("urgent emotional intent", h3)
+        self.assertNotIn(f"声音锚点：{male.voice_description}", seedance)
+
+    def test_native_h3_audio_mode_leaves_generated_file_untouched(self) -> None:
+        video = self.root / "native.mp4"
+        video.write_bytes(b"native-h3-audio-fixture")
+        previous_audio = (settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE)
+        settings.H3_POSTPROCESS_AUDIO = True
+        settings.H3_AUDIO_MODE = "native"
+        try:
+            delivery = RenderQueue._replace_generated_audio(video, None, 0.0)
+        finally:
+            settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE = previous_audio
+
+        self.assertFalse(delivery["applied"])
+        self.assertEqual(delivery["mode"], "native")
+        self.assertEqual(video.read_bytes(), b"native-h3-audio-fixture")
+        self.assertFalse((self.root / "native.native-audio.mp4").exists())
 
     @unittest.skipUnless(shutil.which(settings.FFMPEG_BIN) and shutil.which(settings.FFPROBE_BIN), "ffmpeg required")
     def test_clean_audio_delivery_discards_native_h3_track(self) -> None:
@@ -888,6 +1625,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertTrue(delivery["applied"])
         self.assertEqual(delivery["native_h3_audio"], "discarded")
         self.assertEqual(delivery["delivered"], "independent_tts")
+        native_backup = Path(str(delivery["native_h3_backup"]))
+        self.assertTrue(native_backup.exists())
+        self.assertEqual(native_backup.name, "native-noise.native-audio.mp4")
         probe = subprocess.run(
             [
                 settings.FFPROBE_BIN, "-v", "error", "-select_streams", "a:0",
@@ -1185,9 +1925,13 @@ class ProjectAndWorkflowTests(unittest.TestCase):
     def test_runtime_settings_mask_secrets_and_apply_values(self) -> None:
         previous_key = settings.DEEPSEEK_API_KEY
         previous_model = settings.DEEPSEEK_MODEL
+        previous_provider = settings.H3_PROVIDER
+        previous_audio_mode = settings.H3_AUDIO_MODE
         manager = RuntimeSettingsManager()
         try:
             manager.update({"DEEPSEEK_API_KEY": "test-secret-1234", "DEEPSEEK_MODEL": "test-model"})
+            settings.H3_PROVIDER = "comfyui_h3"
+            settings.H3_AUDIO_MODE = "native"
             payload = manager.public_payload()
             fields = {field["key"]: field for group in payload["groups"] for field in group["fields"]}
             self.assertEqual(fields["DEEPSEEK_API_KEY"]["value"], "")
@@ -1197,10 +1941,15 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             routes = {route["id"]: route for route in payload["routes"]}
             self.assertEqual(routes["storyboard"]["setting_key"], "LLM_PROVIDER")
             self.assertEqual(routes["h3_video"]["effective_label"], "MiniMax H3 / ComfyUI")
+            self.assertEqual(routes["dialogue_audio"]["selected"], "native")
+            self.assertEqual(routes["dialogue_audio"]["options"][0]["value"], "native")
+            self.assertIn("默认直接交付", routes["dialogue_audio"]["description"])
             self.assertIsNone(routes["finalize"]["setting_key"])
         finally:
             settings.DEEPSEEK_API_KEY = previous_key
             settings.DEEPSEEK_MODEL = previous_model
+            settings.H3_PROVIDER = previous_provider
+            settings.H3_AUDIO_MODE = previous_audio_mode
 
     def test_brief_analysis_uses_bound_reference_images(self) -> None:
         project = self.service.create_project(ProjectBrief(title="analysis", story="小雨在旧车站等母亲", target_duration_seconds=30))
@@ -1236,6 +1985,28 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(draft.recommended_shot_count, 4)
         self.assertEqual(draft.characters[0].character_id, project.characters[0].id)
         self.assertEqual(captured["reference_images"], [str(reference.resolve())])
+
+    def test_brief_analysis_normalizes_common_claude_json_variations(self) -> None:
+        payload = _normalize_project_analysis_payload(
+            {
+                "visual_style": ["电影写实", "冷蓝色调"],
+                "recommended_shot_count": "建议 12 镜",
+                "characters": {
+                    "林砚": {
+                        "appearance": ["青年", "短发"],
+                        "costume": "蓝色工装",
+                        "voice": "语速沉稳",
+                    }
+                },
+                "analysis_notes": "确认安全带型号；\n确认现场天气",
+            },
+            8,
+        )
+        self.assertEqual(payload["recommended_shot_count"], 12)
+        self.assertEqual(payload["visual_style"], "电影写实；冷蓝色调")
+        self.assertEqual(payload["characters"][0]["name"], "林砚")
+        self.assertEqual(payload["characters"][0]["description"], "青年；短发")
+        self.assertEqual(payload["analysis_notes"], ["确认安全带型号", "确认现场天气"])
 
     def test_character_reference_backfill_merges_with_latest_project_state(self) -> None:
         project = self.service.create_project(ProjectBrief(title="parallel backfill", story="甲与乙同场", target_duration_seconds=30))

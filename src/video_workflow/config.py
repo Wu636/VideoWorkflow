@@ -11,8 +11,19 @@ class Settings(BaseSettings):
     GLM_API_KEY: str | None = None
     GLM_MODEL: str = "glm-4v-plus"
 
+    # OpenLux (OpenAI-compatible gateway for GPT / Claude / Gemini / DeepSeek)
+    OPENLUX_API_KEY: str | None = None
+    OPENLUX_BASE_URL: str = "https://api.openlux.ai/v1"
+    OPENLUX_MODEL: str = "claude-sonnet-5"
+    OPENLUX_VISION_MODEL: str = "gpt-5.6-sol"
+    # OpenLux 的旗舰模型可能需要数分钟。使用流式连接避免网关长时间无响应
+    # 触发 SDK 自动重试；自动重试会让同一次用户操作产生多次计费调用。
+    OPENLUX_REQUEST_TIMEOUT_SECONDS: float = 900.0
+    OPENLUX_STREAM: bool = True
+    OPENLUX_SAVE_RAW_RESPONSES: bool = True
+
     # LLM Provider Selection
-    # Options: "deepseek" | "glm" | "ark_doubao" | "ark_deepseek"
+    # Options: "deepseek" | "glm" | "openlux" | "ark_doubao" | "ark_deepseek"
     LLM_PROVIDER: str = "deepseek"
     # Per-function routing. "auto" resolves from configured/ready providers.
     BRIEF_ANALYSIS_PROVIDER: str = "auto"
@@ -105,13 +116,37 @@ class Settings(BaseSettings):
     H3_MAX_SEGMENT_SECONDS: float = 7.0
     H3_POSTPROCESS_AUDIO: bool = True
     H3_POSTPROCESS_AUDIO_BITRATE: str = "192k"
-    # clean_tts discards H3's unstable synthetic audio and overlays independent
-    # dialogue; mute writes a clean silent track; native preserves H3 audio.
-    H3_AUDIO_MODE: str = "clean_tts"
+    # Preserve H3's generated speech, ambience and effects by default. Users
+    # can explicitly select clean_tts for an independent replacement version,
+    # or mute for a silent delivery copy.
+    H3_AUDIO_MODE: str = "native"
+    # comfyui_h3 renders on the self-hosted ComfyUI instance; atlas_h3 and
+    # metaso_h3 are independent hosted MiniMax H3 API routes.
+    H3_PROVIDER: str = "comfyui_h3"
+    ATLASCLOUD_API_KEY: str | None = None
+    ATLASCLOUD_BASE_URL: str = "https://api.atlascloud.ai"
+    ATLASCLOUD_POLL_INTERVAL_SECONDS: float = 2.0
+    ATLASCLOUD_JOB_TIMEOUT_SECONDS: int = 1800
+    # Atlas H3 submit parameters are user-selected in the settings UI; there is
+    # no automatic mapping from the project resolution/aspect ratio.
+    H3_ATLAS_RESOLUTION: str = "768P"
+    H3_ATLAS_RATIO: str = "adaptive"
+    # MetaSo proxies the official MiniMax H3 v2 content API. Keep Context IR
+    # explicitly opt-in because the gateway bills it separately per request.
+    METASO_H3_API_KEY: str | None = None
+    METASO_H3_BASE_URL: str = "https://metaso.cn/api/minimax"
+    METASO_H3_POLL_INTERVAL_SECONDS: float = 5.0
+    METASO_H3_JOB_TIMEOUT_SECONDS: int = 1800
+    METASO_H3_RESOLUTION: str = "768P"
+    METASO_H3_RATIO: str = "adaptive"
+    METASO_H3_CONTEXT_IR_ENABLED: bool = False
     TTS_PROVIDER: str = "edge"
     TTS_DEFAULT_FEMALE_VOICE: str = "zh-CN-XiaoxiaoNeural"
     TTS_DEFAULT_MALE_VOICE: str = "zh-CN-YunxiNeural"
-    TTS_DEFAULT_MATURE_FEMALE_VOICE: str = "zh-CN-XiaoyiNeural"
+    # Xiaoxiao's warm/news profile is the steadier mature-female baseline;
+    # Xiaoyi is lively/cartoon-oriented and is selected only for young,
+    # energetic character descriptions.
+    TTS_DEFAULT_MATURE_FEMALE_VOICE: str = "zh-CN-XiaoxiaoNeural"
     TTS_DEFAULT_MATURE_MALE_VOICE: str = "zh-CN-YunyangNeural"
 
     # Final render

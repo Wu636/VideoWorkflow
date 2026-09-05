@@ -3,10 +3,10 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { ArchiveRestore, Clapperboard, Clock3, FileClock, Film, Loader2, Plus, Server, Settings2, Sparkles, Trash2 } from "lucide-react";
+import { ArchiveRestore, BookCopy, Clapperboard, Clock3, FileClock, Film, Loader2, Plus, Settings2, Sparkles, Trash2, Users } from "lucide-react";
 
-import { createProject, deleteProject, importLegacySession, listLegacySessions, listProjects, type LegacySession } from "@/lib/api";
-import type { Project } from "@/types";
+import { createProject, createSeriesEpisode, deleteProject, importLegacySession, listLegacySessions, listProductionSeries, listProjects, type LegacySession } from "@/lib/api";
+import type { ProductionSeries, Project } from "@/types";
 
 const STATUS_LABEL: Record<string, string> = {
     brief_draft: "需求草稿",
@@ -25,12 +25,15 @@ const STATUS_LABEL: Record<string, string> = {
 export default function ProjectDashboard() {
     const router = useRouter();
     const [projects, setProjects] = useState<Project[]>([]);
+    const [series, setSeries] = useState<ProductionSeries[]>([]);
     const [loading, setLoading] = useState(true);
     const [creating, setCreating] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
     const [showImport, setShowImport] = useState(false);
     const [legacy, setLegacy] = useState<LegacySession[]>([]);
     const [error, setError] = useState("");
+    const [selectedSeriesId, setSelectedSeriesId] = useState("");
+    const [selectedCharacterIds, setSelectedCharacterIds] = useState<string[]>([]);
     const [form, setForm] = useState({
         title: "",
         client_name: "",
@@ -42,7 +45,9 @@ export default function ProjectDashboard() {
 
     const reload = async () => {
         try {
-            setProjects(await listProjects());
+            const [nextProjects, nextSeries] = await Promise.all([listProjects(), listProductionSeries()]);
+            setProjects(nextProjects);
+            setSeries(nextSeries);
             setError("");
         } catch (caught) {
             setError(caught instanceof Error ? caught.message : String(caught));
@@ -56,14 +61,38 @@ export default function ProjectDashboard() {
     }, []);
 
     const activeCount = useMemo(() => projects.filter((item) => item.status !== "delivered").length, [projects]);
+    const seriesById = useMemo(() => new Map(series.map((item) => [item.id, item])), [series]);
+    const selectedSeries = seriesById.get(selectedSeriesId);
+
+    const openCreate = (seriesId = "") => {
+        const source = seriesById.get(seriesId);
+        setSelectedSeriesId(seriesId);
+        setSelectedCharacterIds(source?.characters.map((character) => character.id) || []);
+        setForm({
+            title: "",
+            client_name: "",
+            story: "",
+            visual_style: source?.visual_style || "",
+            target_duration_seconds: 30,
+            aspect_ratio: "16:9",
+        });
+        setShowCreate(true);
+    };
+
+    const selectSeries = (seriesId: string) => {
+        const source = seriesById.get(seriesId);
+        setSelectedSeriesId(seriesId);
+        setSelectedCharacterIds(source?.characters.map((character) => character.id) || []);
+        setForm((current) => ({ ...current, visual_style: source?.visual_style || "" }));
+    };
 
     const submit = async () => {
         if (!form.title.trim() || !form.story.trim()) return;
         setCreating(true);
         try {
-            const project = await createProject({
-                ...form,
-            });
+            const project = selectedSeriesId
+                ? await createSeriesEpisode(selectedSeriesId, form, selectedCharacterIds)
+                : await createProject(form);
             router.push(`/projects/${project.id}`);
         } catch (caught) {
             setError(caught instanceof Error ? caught.message : String(caught));
@@ -110,7 +139,7 @@ export default function ProjectDashboard() {
                             <p className="text-xs text-white/45">AI 视频项目生产与 MiniMax H3 调度台</p>
                         </div>
                     </div>
-                    <div className="flex gap-2"><Link href="/settings" className="studio-secondary px-3"><Settings2 size={16} /><span className="hidden xl:inline">模型设置</span></Link><Link href="/logs" className="studio-secondary px-3"><FileClock size={16} /><span className="hidden xl:inline">运行日志</span></Link><button className="studio-secondary" onClick={() => void openImport()}><ArchiveRestore size={16} /> <span className="hidden md:inline">导入旧项目</span></button><button className="studio-primary" onClick={() => setShowCreate(true)}><Plus size={17} /> 新建项目</button></div>
+                    <div className="flex gap-2"><Link href="/settings" className="studio-secondary px-3"><Settings2 size={16} /><span className="hidden xl:inline">模型设置</span></Link><Link href="/logs" className="studio-secondary px-3"><FileClock size={16} /><span className="hidden xl:inline">运行日志</span></Link><button className="studio-secondary" onClick={() => void openImport()}><ArchiveRestore size={16} /> <span className="hidden md:inline">导入旧项目</span></button><button className="studio-primary" onClick={() => openCreate()}><Plus size={17} /> 新建项目</button></div>
                 </div>
             </header>
 
@@ -118,8 +147,10 @@ export default function ProjectDashboard() {
                 <div className="mb-8 grid gap-4 md:grid-cols-3">
                     <Metric icon={<Film size={20} />} label="项目总数" value={String(projects.length)} />
                     <Metric icon={<Clock3 size={20} />} label="进行中" value={String(activeCount)} />
-                    <Metric icon={<Server size={20} />} label="云端渲染" value="按需开机" detail="开发期间可保持关机" />
+                    <Metric icon={<BookCopy size={20} />} label="系列资料" value={String(series.length)} detail="画风与常驻角色可复用" />
                 </div>
+
+                {series.length > 0 && <section className="mb-9"><div className="mb-4"><p className="studio-kicker">SERIES LIBRARY</p><h2 className="text-2xl font-semibold">系列续集</h2><p className="mt-1 text-sm text-white/40">沿用已确认的画风、负面约束和人物参考图，再录入本集剧本。</p></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{series.map((item) => { const episodeCount = projects.filter((project) => project.series_id === item.id).length; return <article key={item.id} className="rounded-xl border border-cyan-300/12 bg-cyan-300/[.025] p-5"><div className="mb-4 flex items-start justify-between gap-3"><div><span className="studio-status">{episodeCount} 集</span><h3 className="mt-3 text-lg font-semibold">{item.name}</h3></div><BookCopy className="text-cyan-300/60" size={22} /></div><p className="line-clamp-2 min-h-10 text-sm leading-5 text-white/45">{item.description || item.style_profile?.analysis_summary || item.visual_style || "已保存系列视觉资料"}</p><div className="mt-4 flex flex-wrap gap-1.5">{item.characters.map((character) => <span key={character.id} className="rounded-full border border-white/8 px-2 py-1 text-[11px] text-white/45">{character.name}</span>)}</div><button className="studio-primary mt-5 w-full" onClick={() => openCreate(item.id)}><Plus size={15} />创建续集</button></article>; })}</div></section>}
 
                 <div className="mb-5 flex items-end justify-between">
                     <div>
@@ -133,7 +164,7 @@ export default function ProjectDashboard() {
                 {loading ? (
                     <div className="flex min-h-64 items-center justify-center text-white/50"><Loader2 className="mr-2 animate-spin" />载入项目…</div>
                 ) : projects.length === 0 ? (
-                    <button onClick={() => setShowCreate(true)} className="studio-empty w-full">
+                    <button onClick={() => openCreate()} className="studio-empty w-full">
                         <Sparkles size={30} className="text-cyan-300" />
                         <strong>创建第一个 AI 视频项目</strong>
                         <span>录入客户故事、风格和时长，从分镜设计开始完整生产</span>
@@ -148,6 +179,7 @@ export default function ProjectDashboard() {
                                         <span className="font-mono text-[11px] text-white/30">V{project.storyboard_version}</span>
                                     </div>
                                     <h3 className="mb-1 truncate text-xl font-semibold group-hover:text-cyan-200">{project.brief.title}</h3>
+                                    {project.series_id && <p className="mb-1 text-xs text-cyan-200/65">{seriesById.get(project.series_id)?.name || "系列作品"} · 第 {project.episode_number || "?"} 集</p>}
                                     <p className="mb-5 text-sm text-white/45">{project.brief.client_name || "未填写客户"}</p>
                                     <p className="line-clamp-3 min-h-[63px] text-sm leading-5 text-white/65">{project.brief.story}</p>
                                     <div className="mt-6 flex gap-4 border-t border-white/8 pt-4 text-xs text-white/45">
@@ -169,18 +201,20 @@ export default function ProjectDashboard() {
                 <div className="studio-modal" onMouseDown={() => setShowCreate(false)}>
                     <section className="studio-dialog" onMouseDown={(event) => event.stopPropagation()}>
                         <p className="studio-kicker">NEW PRODUCTION</p>
-                        <h2 className="mb-6 text-2xl font-semibold">建立客户项目</h2>
+                        <h2 className="mb-6 text-2xl font-semibold">{selectedSeries ? `创建《${selectedSeries.name}》续集` : "建立客户项目"}</h2>
                         <div className="grid gap-4 md:grid-cols-2">
+                            <Field label="所属系列（可选）" wide><select value={selectedSeriesId} onChange={(event) => selectSeries(event.target.value)}><option value="">独立项目</option>{series.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
+                            {selectedSeries && <div className="rounded-xl border border-cyan-300/12 bg-cyan-300/[.025] p-4 md:col-span-2"><div className="flex items-center gap-2"><BookCopy size={16} className="text-cyan-300" /><strong>自动沿用系列资料</strong></div><p className="mt-2 text-sm leading-6 text-white/50">画风、统一风格圣经、负面约束和下方勾选角色的人物参考图会复制到新一集。新角色可在进入项目后添加，或由剧本分析识别。</p><div className="mt-3 flex flex-wrap gap-2">{selectedSeries.characters.map((character) => <label key={character.id} className="flex cursor-pointer items-center gap-2 rounded-lg border border-white/8 bg-black/15 px-3 py-2 text-sm text-white/65"><input type="checkbox" checked={selectedCharacterIds.includes(character.id)} onChange={(event) => setSelectedCharacterIds(event.target.checked ? [...selectedCharacterIds, character.id] : selectedCharacterIds.filter((id) => id !== character.id))} /><Users size={14} />{character.name}</label>)}</div></div>}
                             <Field label="项目名称"><input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="例如：品牌微电影《回家》" /></Field>
                             <Field label="客户名称"><input value={form.client_name} onChange={(event) => setForm({ ...form, client_name: event.target.value })} placeholder="选填" /></Field>
                             <Field label="目标时长（秒）"><input type="number" min={1} value={form.target_duration_seconds} onChange={(event) => setForm({ ...form, target_duration_seconds: Number(event.target.value) })} /></Field>
                             <Field label="画幅"><select value={form.aspect_ratio} onChange={(event) => setForm({ ...form, aspect_ratio: event.target.value })}><option>16:9</option><option>9:16</option><option>1:1</option></select></Field>
                             <Field label="客户故事/剧情脚本" wide><textarea rows={7} value={form.story} onChange={(event) => setForm({ ...form, story: event.target.value })} placeholder="粘贴客户的初步剧情、人物关系、重要台词和必须出现的内容…" /></Field>
-                            <Field label="期望画风" wide><textarea rows={3} value={form.visual_style} onChange={(event) => setForm({ ...form, visual_style: event.target.value })} placeholder="例如：东方奇幻、电影级光影、写实人物、冷青橙调…" /></Field>
+                            {selectedSeries ? <div className="rounded-lg border border-white/8 bg-black/15 p-4 text-sm text-white/50 md:col-span-2"><span className="text-white/70">系列画风：</span>{selectedSeries.visual_style || selectedSeries.style_profile?.name || "已保存的统一风格"}</div> : <Field label="期望画风" wide><textarea rows={3} value={form.visual_style} onChange={(event) => setForm({ ...form, visual_style: event.target.value })} placeholder="例如：东方奇幻、电影级光影、写实人物、冷青橙调…" /></Field>}
                         </div>
                         <div className="mt-7 flex justify-end gap-3">
                             <button className="studio-secondary" onClick={() => setShowCreate(false)}>取消</button>
-                            <button className="studio-primary" disabled={creating || !form.title.trim() || !form.story.trim()} onClick={() => void submit()}>{creating ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} 创建并进入</button>
+                            <button className="studio-primary" disabled={creating || !form.title.trim() || !form.story.trim()} onClick={() => void submit()}>{creating ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />} {selectedSeries ? "创建续集并进入" : "创建并进入"}</button>
                         </div>
                     </section>
                 </div>

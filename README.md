@@ -2,7 +2,7 @@
 
 面向 AI 视频制作订单的一站式生产系统：从客户需求、角色与风格设定、详细分镜、分镜图、MiniMax H3 视频生成，到客户审片、自动剪辑和成片交付。
 
-系统保留原有 DeepSeek / GLM / 火山方舟 / GRSAI 能力，并新增自部署 MiniMax H3 的 I2V（首帧图生视频）与 R2V（全能参考）生产链路。
+系统保留原有 DeepSeek / GLM / 火山方舟 / GRSAI 能力，新增 OpenLux（GPT / Claude / Gemini / DeepSeek）多模态大模型路由，以及自部署 MiniMax H3 的 I2V（首帧图生视频）与 R2V（全能参考）生产链路。
 
 ## 已实现的完整流程
 
@@ -78,7 +78,17 @@ brew install ffmpeg
 可以在工作台右上角“模型设置”统一配置并即时生效；也可以首次启动前在 `.env` 中提供默认值：
 
 ```dotenv
-LLM_PROVIDER=ark
+# OpenLux：填一个 Key 即可使用默认 Claude 文本模型和 GPT 多模态模型
+OPENLUX_API_KEY=你的OpenLuxKey
+OPENLUX_BASE_URL=https://api.openlux.ai/v1
+OPENLUX_MODEL=claude-sonnet-5
+OPENLUX_VISION_MODEL=gpt-5.6-sol
+LLM_PROVIDER=openlux
+BRIEF_ANALYSIS_PROVIDER=auto
+SHOT_COUNT_PROVIDER=auto
+REFERENCE_ANALYSIS_PROVIDER=auto
+
+# 火山方舟继续用于 Seedance / Seedream，也可作为剧本模型备用
 ARK_API_KEY=你的方舟Key
 ARK_LLM_MODEL=你的模型或推理接入点
 SEEDANCE_DEFAULT_MODEL=doubao-seedance-2-0-mini-260615
@@ -111,6 +121,14 @@ NEXT_PUBLIC_APP_URL=https://你的工作台域名
 2.0 / Fast / Mini 与清晰度 → “编译所选 Prompt” → 核对实时费用 → 提交。
 系统按镜头把任务写入本地持久队列，后台向方舟异步提交、轮询并下载 MP4；重启工作台后仍可继续查询。
 Seedance Prompt 与 H3 Prompt 分开保存，素材编号严格按实际发送的 `图片1`、`视频1`、`音频1` 顺序生成。
+
+MiniMax H3 支持三条互不覆盖的生成通道，可在“模型设置 → MiniMax H3 / ComfyUI → H3 生成通道”即时切换：
+
+- `comfyui_h3`：自部署 ComfyUI。
+- `metaso_h3`：MetaSo 的 `MiniMax-H3` v2 多模态接口，支持 `768P`（默认）/`2K`、首尾帧、参考图片/视频/音频、任务轮询和断点续查；Context IR 默认关闭。
+- `atlas_h3`：Atlas Cloud 的 `minimax/h3-developer/reference-to-video`，原有实现与模型保持不变。
+
+三条通道共用逐镜 Prompt、素材绑定、长镜头续帧和音频策略；默认保留 H3 原声，只有主动选择 `clean_tts` 时才输出独立配音替换版。
 
 MiniMax H3 必须使用已经实测通过的文件：
 
@@ -192,7 +210,7 @@ H3 的有效长度采用 `17k + 5` 帧网格，工作台自动计算：
 
 ## 对白、杂音与成片质量门禁
 
-- 默认 `clean_tts` 会彻底丢弃 H3 原生音轨，按明确的 `dialogue_speaker_id` 为每段对白生成独立普通话音轨，再输出 48 kHz 双声道 AAC；不会在波浪杂音上继续压缩或降噪。
+- 默认 `native` 直接保留 H3 生成的人声、环境音和动作音效。需要独立配音版时再主动选择 `clean_tts`；处理前会在视频同目录保留 `.native-audio.mp4` 原声备份，再按明确的发言者生成 48 kHz 双声道 AAC 配音版。
 - 同一镜头有多名发言者时，工作台会按发言者拆成连续短段，当前段只允许对应角色开口，其他人物保持闭嘴。
 - 任一应有对白未成功生成时，任务不会以静音或缺台词状态完成，而会换 Seed 重试；分辨率、时长、帧、音轨、采样率或完整解码不合格也会被媒体门禁拦截。
 - 最终剪辑使用 `FINAL_VIDEO_PRESET=slow`、`FINAL_VIDEO_CRF=14` 的高质量编码；最终 QC 未通过时不会进入交付状态。

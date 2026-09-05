@@ -21,8 +21,17 @@ from src.video_workflow.domain import (
     JobType,
     ProjectStatus,
     RenderJob,
+    Shot,
     ShotContinuityMode,
     utc_now,
+)
+from src.video_workflow.integrations.atlas_h3 import (
+    ATLAS_MAX_DURATION_SECONDS,
+    ATLAS_MODEL_ID,
+    AtlasH3Client,
+    atlas_duration,
+    atlas_ratio,
+    atlas_resolution,
 )
 from src.video_workflow.integrations.comfyui import (
     ComfyUIClient,
@@ -34,14 +43,22 @@ from src.video_workflow.integrations.comfyui import (
     resolve_h3_model_profile,
     resolve_h3_text_encoder_profile,
 )
+from src.video_workflow.integrations.metaso_h3 import (
+    METASO_H3_MAX_DURATION_SECONDS,
+    METASO_H3_MODEL_ID,
+    MetaSoH3Client,
+    media_data_url,
+    metaso_duration,
+)
 from src.video_workflow.integrations.seedance import (
     SeedanceClient,
     estimate_seedance_cost,
     resolve_seedance_model,
+    sign_seedance_asset,
     validate_seedance_resolution,
 )
 from src.video_workflow.media_paths import resolve_media_path
-from src.video_workflow.services.projects import ProjectService
+from src.video_workflow.services.projects import ProjectService, SEEDANCE_PROMPT_VERSION
 from src.video_workflow.services.audio import DialogueAudioService
 from src.video_workflow.storage import ProjectStore
 
@@ -72,6 +89,8 @@ class RenderQueue:
         self.projects = projects
         self.client = ComfyUIClient()
         self.seedance_client = SeedanceClient()
+        self.atlas_client = AtlasH3Client()
+        self.metaso_client = MetaSoH3Client()
         self.builder = H3WorkflowBuilder()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -80,6 +99,8 @@ class RenderQueue:
         """Refresh clients after browser-managed runtime settings change."""
         self.client = ComfyUIClient()
         self.seedance_client = SeedanceClient()
+        self.atlas_client = AtlasH3Client()
+        self.metaso_client = MetaSoH3Client()
         self.builder = H3WorkflowBuilder()
 
     async def start(self) -> None:
@@ -92,7 +113,16 @@ class RenderQueue:
     async def stop(self) -> None:
         self._stop.set()
         if self._task:
-            await self._task
+            try:
+                # Graceful window: let the current poll/submit cycle notice the
+                # stop flag before forcing cancellation.
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._task.cancel()
+                try:
+                    await self._task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self._task = None
 
     def enqueue(self, project_id: str, shot_ids: list[str] | None = None) -> list[RenderJob]:
@@ -134,6 +164,7 @@ class RenderQueue:
         for shot in planned_shots:
             model_profile = resolve_h3_model_profile(shot.h3_model_profile)
             text_encoder_profile = resolve_h3_text_encoder_profile(shot.h3_text_encoder_profile)
+            provider = settings.H3_PROVIDER if settings.H3_PROVIDER in {"comfyui_h3", "metaso_h3", "atlas_h3"} else "comfyui_h3"
             h3_parameters = {
                 "width": shot.h3_width or project.brief.width,
                 "height": shot.h3_height or project.brief.height,
@@ -170,6 +201,7 @@ class RenderQueue:
                 project_id=project_id,
                 shot_id=shot.id,
                 type=JobType.VIDEO,
+                provider=provider,
                 mode=shot.resolved_generation_mode,
                 seed=shot.h3_seed or random.randint(1, 2**31 - 1),
                 input_snapshot={
@@ -228,9 +260,11 @@ class RenderQueue:
             )
         for shot in candidates:
             refs = reference_map[shot.id]
-            prompt = shot.seedance_prompt.strip() or self.projects.compile_seedance_prompt(project, shot, assets)
+            diagnostics = self.projects.seedance_material_diagnostics(project, shot, assets)
+            prompt = self.projects.effective_seedance_prompt(project, shot, assets)
             shot.seedance_prompt = prompt
-            shot.seedance_prompt_version = "seedance-2.0-official-2026-08"
+            shot.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
+            shot.seedance_prompt_source_revision = shot.content_revision
             estimate = estimate_seedance_cost(
                 model.id,
                 resolution,
@@ -257,6 +291,10 @@ class RenderQueue:
                         "duration": shot.duration_seconds,
                         "generate_audio": generate_audio,
                         "reference_asset_ids": [asset.id for asset in refs],
+                        "reference_mode": diagnostics["resolved_mode"],
+                        "first_frame_asset_id": diagnostics["first_frame_asset_id"],
+                        "identity_risk_characters": diagnostics["identity_risk_characters"],
+                        "material_warnings": diagnostics["warnings"],
                         "prompt": prompt,
                         "continuity_mode": shot.continuity_mode.value,
                         "continuity_source_shot_id": shot.continuity_source_shot_id,
@@ -283,7 +321,7 @@ class RenderQueue:
             if job.prompt_id:
                 if job.provider == "ark_seedance":
                     await self.seedance_client.cancel(job.prompt_id)
-                else:
+                elif job.provider == "comfyui_h3":
                     await self.client.cancel(job.prompt_id)
         self.store.save_job(job)
         if job.shot_id:
@@ -313,7 +351,12 @@ class RenderQueue:
                     # Connectivity outages do not consume a model-generation retry.
                     job.attempt = max(0, job.attempt - 1)
                     job.status = JobStatus.QUEUED
-                    service = "Seedance API" if job.provider == "ark_seedance" else "ComfyUI"
+                    service = (
+                        "Seedance API" if job.provider == "ark_seedance"
+                        else "Atlas H3 API" if job.provider == "atlas_h3"
+                        else "MetaSo H3 API" if job.provider == "metaso_h3"
+                        else "ComfyUI"
+                    )
                     job.error = f"{service} 暂时不可连接，等待重试: {exc}"
                 elif (
                     job.status != JobStatus.CANCEL_REQUESTED
@@ -343,6 +386,12 @@ class RenderQueue:
     async def _process(self, job: RenderJob) -> None:
         if job.provider == "ark_seedance":
             await self._process_seedance(job)
+            return
+        if job.provider == "atlas_h3":
+            await self._process_atlas_h3(job)
+            return
+        if job.provider == "metaso_h3":
+            await self._process_metaso_h3(job)
             return
         if not job.shot_id:
             raise ValueError("Video render job has no shot_id")
@@ -374,7 +423,7 @@ class RenderQueue:
 
         required_modes: set[GenerationMode] = set()
         for segment_index, segment in enumerate(segment_plan):
-            if str(segment.get("dialogue") or "").strip():
+            if self.projects.spoken_dialogue_text(str(segment.get("dialogue") or "")):
                 required_modes.add(GenerationMode.R2V)
             elif segment_index == 0:
                 required_modes.add(job.mode or GenerationMode.I2V)
@@ -438,11 +487,13 @@ class RenderQueue:
         output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / f"{job.id}.mp4"
         dialogue_guides: dict[int, dict[str, object]] = {}
-        expected_dialogue_tracks = sum(bool(str(segment.get("dialogue") or "").strip()) for segment in segment_plan)
+        expected_dialogue_tracks = sum(
+            bool(self.projects.spoken_dialogue_text(str(segment.get("dialogue") or ""))) for segment in segment_plan
+        )
         if settings.H3_POSTPROCESS_AUDIO and settings.H3_AUDIO_MODE == "clean_tts":
             for segment_index, segment in enumerate(segment_plan):
                 dialogue = str(segment.get("dialogue") or "").strip()
-                if not dialogue:
+                if not self.projects.spoken_dialogue_text(dialogue):
                     continue
                 segment_shot = shot.model_copy(deep=True)
                 segment_shot.dialogue = dialogue
@@ -453,10 +504,15 @@ class RenderQueue:
                 h3_guide = output_dir / f"{job.id}.dialogue{segment_index + 1}.h3.wav"
                 metadata = await DialogueAudioService.synthesize(project, segment_shot, raw_speech)
                 if not metadata.get("generated"):
+                    if metadata.get("reason") == "no_dialogue":
+                        # The fragment carries no speakable text (stage direction
+                        # only); treat the segment as silent instead of failing.
+                        continue
                     raise RuntimeError(f"第 {segment_index + 1} 段干净对白生成失败：{metadata.get('reason') or '未知原因'}")
                 delivery_duration = float(segment["duration"])
                 generation_duration = float(segment.get("generation_duration", delivery_duration))
-                local_offset = min(shot.dialogue_start_seconds, max(0.05, delivery_duration * 0.2))
+                requested_offset = float(segment.get("dialogue_start_seconds", shot.dialogue_start_seconds))
+                local_offset = min(requested_offset, max(0.05, delivery_duration * 0.2))
                 await asyncio.to_thread(
                     self._prepare_dialogue_guide,
                     raw_speech,
@@ -593,6 +649,38 @@ class RenderQueue:
             self.store.save_job(job)
             return
 
+        await self._finalize_h3_video(
+            job,
+            shot,
+            segment_plan,
+            segment_paths,
+            dialogue_guides,
+            expected_dialogue_tracks,
+            destination,
+            started,
+            int(h3_parameters.get("width", shot.h3_width or project.brief.width)),
+            int(h3_parameters.get("height", shot.h3_height or project.brief.height)),
+            hourly_rate=settings.COMFYUI_HOURLY_RATE,
+        )
+
+    async def _finalize_h3_video(
+        self,
+        job: RenderJob,
+        shot: Shot,
+        segment_plan: list[dict[str, object]],
+        segment_paths: list[Path],
+        dialogue_guides: dict[int, dict[str, object]],
+        expected_dialogue_tracks: int,
+        destination: Path,
+        started: float,
+        width: int,
+        height: int,
+        *,
+        scale_to_expected: bool = False,
+        hourly_rate: float | None = None,
+    ) -> None:
+        """Concat segments, overlay clean dialogue, QC and mark the shot done."""
+        project = self.projects.require_project(job.project_id)
         if len(segment_paths) == 1 and abs(
             float(segment_plan[0].get("generation_duration", segment_plan[0]["duration"]))
             - float(segment_plan[0]["duration"])
@@ -607,6 +695,8 @@ class RenderQueue:
             )
             for segment_path in segment_paths:
                 segment_path.unlink(missing_ok=True)
+        if scale_to_expected:
+            await asyncio.to_thread(self._scale_video_to, destination, width, height)
         speech_tracks: list[dict[str, object]] = []
         speech_metadata: dict[str, object] = {"generated": False, "reason": "audio_mode_not_clean_tts", "tracks": []}
         if settings.H3_POSTPROCESS_AUDIO and settings.H3_AUDIO_MODE == "clean_tts":
@@ -647,6 +737,7 @@ class RenderQueue:
             destination,
             speech_tracks,
             shot.dialogue_start_seconds,
+            preserve_native_without_speech=job.provider in {"atlas_h3", "metaso_h3"},
         )
         for track in speech_tracks:
             Path(str(track["path"])).unlink(missing_ok=True)
@@ -655,10 +746,11 @@ class RenderQueue:
         media_qc = await asyncio.to_thread(
             self._validate_rendered_media,
             destination,
-            int(h3_parameters.get("width", shot.h3_width or project.brief.width)),
-            int(h3_parameters.get("height", shot.h3_height or project.brief.height)),
+            width,
+            height,
             float(shot.duration_seconds),
-            settings.H3_POSTPROCESS_AUDIO and settings.H3_AUDIO_MODE != "native",
+            bool(audio_delivery.get("applied")),
+            (job.provider in {"atlas_h3", "metaso_h3"} and settings.H3_AUDIO_MODE != "mute") or bool(speech_tracks),
         )
         job.input_snapshot["media_qc"] = media_qc
         if not media_qc["passed"]:
@@ -670,7 +762,7 @@ class RenderQueue:
         job.queue_position = None
         job.output_path = str(destination.resolve())
         job.elapsed_seconds = elapsed
-        job.estimated_cost = elapsed / 3600 * settings.COMFYUI_HOURLY_RATE
+        job.estimated_cost = elapsed / 3600 * hourly_rate if hourly_rate is not None else None
         job.completed_at = utc_now()
         job.error = None
         job.input_snapshot["dialogue_tts"] = speech_metadata
@@ -684,6 +776,589 @@ class RenderQueue:
         if all(item.video_status == "completed" for item in all_shots):
             project.status = ProjectStatus.CLIPS_REVIEW
             self.store.save_project(project)
+
+    async def _process_atlas_h3(self, job: RenderJob) -> None:
+        if not job.shot_id:
+            raise ValueError("Video render job has no shot_id")
+        if not settings.ATLASCLOUD_API_KEY:
+            raise ValueError("未配置 Atlas Cloud API Key：请在模型设置的 H3 分组填写后保存，再重新提交")
+        project = self.projects.require_project(job.project_id)
+        shot = self.projects.require_shot(job.shot_id)
+        h3_parameters = job.input_snapshot.get("h3_parameters", {})
+        width = int(h3_parameters.get("width", shot.h3_width or project.brief.width))
+        height = int(h3_parameters.get("height", shot.h3_height or project.brief.height))
+        assets = self.store.list_assets(job.project_id)
+        # The hosted model renders up to 15s per call, so shots within that cap
+        # stay a single continuous generation instead of stitched 5s segments.
+        segment_plan = self.projects.h3_segment_plan(project, shot, assets, max_segment_seconds=ATLAS_MAX_DURATION_SECONDS)
+        job.input_snapshot["segment_plan"] = segment_plan
+        job.input_snapshot.setdefault("quality_guard", {})["segment_count"] = len(segment_plan)
+        # Resolution/ratio are user-selected in the settings UI; only fall back
+        # to pixel mapping when the stored value is invalid.
+        resolution = settings.H3_ATLAS_RESOLUTION if settings.H3_ATLAS_RESOLUTION in {"768P", "1080P"} else atlas_resolution(width, height)
+        ratio = settings.H3_ATLAS_RATIO if settings.H3_ATLAS_RATIO in {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"} else atlas_ratio(width, height)
+        job.input_snapshot["atlas"] = {
+            "model": ATLAS_MODEL_ID,
+            "resolution": resolution,
+            "ratio": ratio,
+        }
+        self.store.save_job(job)
+
+        required = self._required_assets(shot, assets, job.mode or GenerationMode.I2V)
+        upload_cache: dict[str, str] = {}
+        # The approved keyframe is always Picture 1. Exclude it from the regular
+        # image list so it is not submitted a second time as Picture 2.
+        reference_assets = [asset for asset in required if asset.id != shot.keyframe_asset_id]
+        image_refs = [
+            await self._atlas_ref(asset, upload_cache)
+            for asset in reference_assets
+            if asset.type == AssetType.IMAGE
+        ]
+        video_refs = [
+            await self._atlas_ref(asset, upload_cache)
+            for asset in reference_assets
+            if asset.type == AssetType.VIDEO
+        ]
+        audio_refs = [
+            await self._atlas_ref(asset, upload_cache)
+            for asset in reference_assets
+            if asset.type == AssetType.AUDIO
+        ]
+        first_frame_ref: str | None = None
+        if shot.keyframe_asset_id:
+            keyframe_asset = next((asset for asset in assets if asset.id == shot.keyframe_asset_id), None)
+            if keyframe_asset:
+                first_frame_ref = await self._atlas_ref(keyframe_asset, upload_cache)
+        if not first_frame_ref and shot.image_path:
+            first_frame_ref = await self._atlas_local_ref(resolve_media_path(shot.image_path), upload_cache)
+
+        output_dir = self.projects.project_dir(job.project_id) / "videos" / shot.id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / f"{job.id}.mp4"
+        dialogue_guides: dict[int, dict[str, object]] = {}
+        expected_dialogue_tracks = sum(
+            bool(self.projects.spoken_dialogue_text(str(segment.get("dialogue") or ""))) for segment in segment_plan
+        )
+        if settings.H3_POSTPROCESS_AUDIO and settings.H3_AUDIO_MODE == "clean_tts":
+            for segment_index, segment in enumerate(segment_plan):
+                dialogue = str(segment.get("dialogue") or "").strip()
+                if not self.projects.spoken_dialogue_text(dialogue):
+                    continue
+                segment_shot = shot.model_copy(deep=True)
+                segment_shot.dialogue = dialogue
+                segment_shot.dialogue_speaker_id = segment.get("speaker_id") or shot.dialogue_speaker_id
+                segment_shot.dialogue_turns = []
+                raw_speech = output_dir / f"{job.id}.dialogue{segment_index + 1}.mp3"
+                delivery_guide = output_dir / f"{job.id}.dialogue{segment_index + 1}.delivery.wav"
+                h3_guide = output_dir / f"{job.id}.dialogue{segment_index + 1}.h3.wav"
+                metadata = await DialogueAudioService.synthesize(project, segment_shot, raw_speech)
+                if not metadata.get("generated"):
+                    if metadata.get("reason") == "no_dialogue":
+                        continue
+                    raise RuntimeError(f"第 {segment_index + 1} 段干净对白生成失败：{metadata.get('reason') or '未知原因'}")
+                delivery_duration = float(segment["duration"])
+                generation_duration = float(segment.get("generation_duration", delivery_duration))
+                requested_offset = float(segment.get("dialogue_start_seconds", shot.dialogue_start_seconds))
+                local_offset = min(requested_offset, max(0.05, delivery_duration * 0.2))
+                await asyncio.to_thread(
+                    self._prepare_dialogue_guide,
+                    raw_speech,
+                    delivery_guide,
+                    delivery_duration,
+                    local_offset,
+                )
+                await asyncio.to_thread(
+                    self._pad_dialogue_guide,
+                    delivery_guide,
+                    h3_guide,
+                    generation_duration,
+                )
+                raw_speech.unlink(missing_ok=True)
+                metadata.update(
+                    {
+                        "segment": segment_index + 1,
+                        "speaker_id": segment_shot.dialogue_speaker_id,
+                        "dialogue_start_seconds": local_offset,
+                        "delivery_guide": str(delivery_guide),
+                        "h3_reference_guide": str(h3_guide),
+                    }
+                )
+                dialogue_guides[segment_index] = {
+                    "delivery_path": delivery_guide,
+                    "h3_path": h3_guide,
+                    "remote": await self._atlas_local_ref(h3_guide, upload_cache),
+                    "metadata": metadata,
+                }
+            if len(dialogue_guides) != expected_dialogue_tracks:
+                raise RuntimeError(
+                    f"独立对白生成不完整：需要 {expected_dialogue_tracks} 段，成功 {len(dialogue_guides)} 段；"
+                    "已在提交 Atlas H3 前阻止任务"
+                )
+            job.input_snapshot["dialogue_guides"] = [
+                guide["metadata"] for guide in dialogue_guides.values()
+            ]
+            self.store.save_job(job)
+
+        segment_paths: list[Path] = []
+        continuation_ref = first_frame_ref
+        started = time.monotonic()
+        # Hosted predictions survive backend restarts; persist per-segment
+        # results so recovery resumes instead of paying to regenerate.
+        atlas_resume: dict[str, object] = dict(job.input_snapshot.get("atlas_resume") or {})
+        resume_parts = atlas_resume.get("parts") if isinstance(atlas_resume.get("parts"), list) else []
+        try:
+            for segment_index, segment in enumerate(segment_plan):
+                resume_part = resume_parts[segment_index] if segment_index < len(resume_parts) else None
+                resumed_path = Path(str(resume_part["path"])) if isinstance(resume_part, dict) and resume_part.get("path") else None
+                if resumed_path and resumed_path.exists():
+                    segment_paths.append(resumed_path)
+                    if segment_index < len(segment_plan) - 1:
+                        continuation_path = output_dir / f"{job.id}.continuation{segment_index + 1}.png"
+                        await asyncio.to_thread(self._extract_last_frame, resumed_path, continuation_path)
+                        continuation_ref = await self._atlas_local_ref(continuation_path, upload_cache)
+                        continuation_path.unlink(missing_ok=True)
+                    continue
+                dialogue_guide = dialogue_guides.get(segment_index)
+                refers: list[dict[str, str]] = []
+                if continuation_ref:
+                    refers.append({"url": continuation_ref, "type": "image"})
+                refers.extend({"url": ref, "type": "image"} for ref in image_refs)
+                refers.extend({"url": ref, "type": "video"} for ref in video_refs)
+                if dialogue_guide:
+                    refers.append({"url": str(dialogue_guide["remote"]), "type": "audio"})
+                refers.extend({"url": ref, "type": "audio"} for ref in audio_refs)
+                refers = self._dedupe_atlas_refers(refers)
+                if not any(item["type"] in {"image", "video"} for item in refers):
+                    raise ValueError(f"镜头 {shot.ordinal} 缺少 Atlas H3 需要的图片或视频参考")
+                pending_prediction = str(resume_part.get("prediction_id")) if isinstance(resume_part, dict) and resume_part.get("prediction_id") else ""
+                if pending_prediction:
+                    prediction_id = pending_prediction
+                    job.error = f"Atlas H3 第 {segment_index + 1}/{len(segment_plan)} 段从中断处续轮询"
+                else:
+                    job.status = JobStatus.SUBMITTING
+                    job.error = f"正在提交 Atlas H3 第 {segment_index + 1}/{len(segment_plan)} 段"
+                self.store.save_job(job)
+                if not pending_prediction:
+                    prediction_id = await self.atlas_client.submit(
+                        prompt=str(segment["prompt"]),
+                        refers=refers,
+                        resolution=resolution,
+                        duration=atlas_duration(float(segment.get("generation_duration", segment["duration"]))),
+                        ratio=ratio,
+                    )
+                job.prompt_id = prediction_id
+                job.status = JobStatus.RUNNING
+                job.workflow_snapshot = {"atlas_prediction_id": prediction_id, "segment": segment_index + 1}
+                while len(resume_parts) <= segment_index:
+                    resume_parts.append({})
+                resume_parts[segment_index] = {"prediction_id": prediction_id}
+                atlas_resume["parts"] = resume_parts
+                job.input_snapshot["atlas_resume"] = atlas_resume
+                self.store.save_job(job)
+
+                async def progress(value: float, message: str, *, index: int = segment_index) -> None:
+                    current = self.store.get_job(job.id)
+                    if current is None:
+                        return
+                    if current.status == JobStatus.CANCEL_REQUESTED:
+                        raise asyncio.CancelledError()
+                    current.progress = min(0.99, (index + value) / len(segment_plan))
+                    current.error = f"Atlas H3 段 {index + 1}/{len(segment_plan)} · {message}"
+                    self.store.save_job(current)
+
+                outputs = await self.atlas_client.wait_for_result(prediction_id, progress)
+                segment_path = output_dir / f"{job.id}.part{segment_index + 1}.mp4"
+                await self.atlas_client.download(outputs[0], segment_path)
+                segment_paths.append(segment_path)
+                resume_parts[segment_index] = {"prediction_id": prediction_id, "path": str(segment_path)}
+                atlas_resume["parts"] = resume_parts
+                job.input_snapshot["atlas_resume"] = atlas_resume
+                self.store.save_job(job)
+
+                if segment_index < len(segment_plan) - 1:
+                    continuation_path = output_dir / f"{job.id}.continuation{segment_index + 1}.png"
+                    await asyncio.to_thread(self._extract_last_frame, segment_path, continuation_path)
+                    continuation_ref = await self._atlas_local_ref(continuation_path, upload_cache)
+                    continuation_path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            job.status = JobStatus.CANCELLED
+            job.completed_at = utc_now()
+            self.store.save_job(job)
+            return
+
+        await self._finalize_h3_video(
+            job,
+            shot,
+            segment_plan,
+            segment_paths,
+            dialogue_guides,
+            expected_dialogue_tracks,
+            destination,
+            started,
+            width,
+            height,
+            scale_to_expected=True,
+        )
+
+    async def _process_metaso_h3(self, job: RenderJob) -> None:
+        """Render a shot through MetaSo's MiniMax H3 v2 content API."""
+        if not job.shot_id:
+            raise ValueError("Video render job has no shot_id")
+        if not settings.METASO_H3_API_KEY:
+            raise ValueError("未配置 MetaSo H3 API Key：请在模型设置的 H3 分组填写后保存，再重新提交")
+        project = self.projects.require_project(job.project_id)
+        shot = self.projects.require_shot(job.shot_id)
+        h3_parameters = job.input_snapshot.get("h3_parameters", {})
+        width = int(h3_parameters.get("width", shot.h3_width or project.brief.width))
+        height = int(h3_parameters.get("height", shot.h3_height or project.brief.height))
+        assets = self.store.list_assets(job.project_id)
+        segment_plan = self.projects.h3_segment_plan(
+            project,
+            shot,
+            assets,
+            max_segment_seconds=METASO_H3_MAX_DURATION_SECONDS,
+        )
+        job.input_snapshot["segment_plan"] = segment_plan
+        job.input_snapshot.setdefault("quality_guard", {})["segment_count"] = len(segment_plan)
+        resolution = settings.METASO_H3_RESOLUTION if settings.METASO_H3_RESOLUTION in {"768P", "2K"} else "768P"
+        ratio = (
+            settings.METASO_H3_RATIO
+            if settings.METASO_H3_RATIO in {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+            else "adaptive"
+        )
+        job.input_snapshot["metaso"] = {
+            "model": METASO_H3_MODEL_ID,
+            "resolution": resolution,
+            "ratio": ratio,
+            "context_ir_enabled": bool(settings.METASO_H3_CONTEXT_IR_ENABLED),
+        }
+        self.store.save_job(job)
+
+        required = self._required_assets(shot, assets, job.mode or GenerationMode.I2V)
+        reference_cache: dict[str, str] = {}
+        excluded_ids = {shot.keyframe_asset_id}
+        if job.mode == GenerationMode.I2V:
+            excluded_ids.add(shot.last_frame_asset_id)
+        reference_assets = [asset for asset in required if asset.id not in excluded_ids]
+        image_refs = [
+            await self._metaso_ref(asset, reference_cache)
+            for asset in reference_assets
+            if asset.type == AssetType.IMAGE
+        ]
+        video_refs = [
+            await self._metaso_ref(asset, reference_cache)
+            for asset in reference_assets
+            if asset.type == AssetType.VIDEO
+        ]
+        audio_refs = [
+            await self._metaso_ref(asset, reference_cache)
+            for asset in reference_assets
+            if asset.type == AssetType.AUDIO
+        ]
+
+        first_frame_ref: str | None = None
+        if shot.keyframe_asset_id:
+            keyframe_asset = next((asset for asset in assets if asset.id == shot.keyframe_asset_id), None)
+            if keyframe_asset:
+                first_frame_ref = await self._metaso_ref(keyframe_asset, reference_cache)
+        if not first_frame_ref and shot.image_path:
+            first_frame_ref = await self._metaso_local_ref(resolve_media_path(shot.image_path), reference_cache)
+        last_frame_ref: str | None = None
+        if job.mode == GenerationMode.I2V and shot.last_frame_asset_id:
+            last_frame_asset = next((asset for asset in assets if asset.id == shot.last_frame_asset_id), None)
+            if last_frame_asset:
+                last_frame_ref = await self._metaso_ref(last_frame_asset, reference_cache)
+
+        output_dir = self.projects.project_dir(job.project_id) / "videos" / shot.id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / f"{job.id}.mp4"
+        dialogue_guides: dict[int, dict[str, object]] = {}
+        expected_dialogue_tracks = sum(
+            bool(self.projects.spoken_dialogue_text(str(segment.get("dialogue") or ""))) for segment in segment_plan
+        )
+        if settings.H3_POSTPROCESS_AUDIO and settings.H3_AUDIO_MODE == "clean_tts":
+            for segment_index, segment in enumerate(segment_plan):
+                dialogue = str(segment.get("dialogue") or "").strip()
+                if not self.projects.spoken_dialogue_text(dialogue):
+                    continue
+                segment_shot = shot.model_copy(deep=True)
+                segment_shot.dialogue = dialogue
+                segment_shot.dialogue_speaker_id = segment.get("speaker_id") or shot.dialogue_speaker_id
+                segment_shot.dialogue_turns = []
+                raw_speech = output_dir / f"{job.id}.dialogue{segment_index + 1}.mp3"
+                delivery_guide = output_dir / f"{job.id}.dialogue{segment_index + 1}.delivery.wav"
+                h3_guide = output_dir / f"{job.id}.dialogue{segment_index + 1}.h3.wav"
+                metadata = await DialogueAudioService.synthesize(project, segment_shot, raw_speech)
+                if not metadata.get("generated"):
+                    if metadata.get("reason") == "no_dialogue":
+                        continue
+                    raise RuntimeError(f"第 {segment_index + 1} 段干净对白生成失败：{metadata.get('reason') or '未知原因'}")
+                delivery_duration = float(segment["duration"])
+                generation_duration = float(segment.get("generation_duration", delivery_duration))
+                requested_offset = float(segment.get("dialogue_start_seconds", shot.dialogue_start_seconds))
+                local_offset = min(requested_offset, max(0.05, delivery_duration * 0.2))
+                await asyncio.to_thread(
+                    self._prepare_dialogue_guide,
+                    raw_speech,
+                    delivery_guide,
+                    delivery_duration,
+                    local_offset,
+                )
+                await asyncio.to_thread(
+                    self._pad_dialogue_guide,
+                    delivery_guide,
+                    h3_guide,
+                    generation_duration,
+                )
+                raw_speech.unlink(missing_ok=True)
+                metadata.update(
+                    {
+                        "segment": segment_index + 1,
+                        "speaker_id": segment_shot.dialogue_speaker_id,
+                        "dialogue_start_seconds": local_offset,
+                        "delivery_guide": str(delivery_guide),
+                        "h3_reference_guide": str(h3_guide),
+                    }
+                )
+                dialogue_guides[segment_index] = {
+                    "delivery_path": delivery_guide,
+                    "h3_path": h3_guide,
+                    "remote": await self._metaso_local_ref(h3_guide, reference_cache),
+                    "metadata": metadata,
+                }
+            if len(dialogue_guides) != expected_dialogue_tracks:
+                raise RuntimeError(
+                    f"独立对白生成不完整：需要 {expected_dialogue_tracks} 段，成功 {len(dialogue_guides)} 段；"
+                    "已在提交 MetaSo H3 前阻止任务"
+                )
+            job.input_snapshot["dialogue_guides"] = [guide["metadata"] for guide in dialogue_guides.values()]
+            self.store.save_job(job)
+
+        segment_paths: list[Path] = []
+        continuation_ref = first_frame_ref
+        started = time.monotonic()
+        metaso_resume: dict[str, object] = dict(job.input_snapshot.get("metaso_resume") or {})
+        resume_parts = metaso_resume.get("parts") if isinstance(metaso_resume.get("parts"), list) else []
+        try:
+            for segment_index, segment in enumerate(segment_plan):
+                resume_part = resume_parts[segment_index] if segment_index < len(resume_parts) else None
+                resumed_path = Path(str(resume_part["path"])) if isinstance(resume_part, dict) and resume_part.get("path") else None
+                if resumed_path and resumed_path.exists():
+                    segment_paths.append(resumed_path)
+                    if segment_index < len(segment_plan) - 1:
+                        continuation_path = output_dir / f"{job.id}.continuation{segment_index + 1}.png"
+                        await asyncio.to_thread(self._extract_last_frame, resumed_path, continuation_path)
+                        continuation_ref = await self._metaso_local_ref(continuation_path, reference_cache)
+                        continuation_path.unlink(missing_ok=True)
+                    continue
+
+                dialogue_guide = dialogue_guides.get(segment_index)
+                segment_audio_refs = []
+                if dialogue_guide:
+                    segment_audio_refs.append(str(dialogue_guide["remote"]))
+                segment_audio_refs.extend(audio_refs)
+                segment_audio_refs = list(dict.fromkeys(segment_audio_refs))
+                frame_mode = job.mode == GenerationMode.I2V
+                segment_images = [] if frame_mode else list(dict.fromkeys([url for url in [continuation_ref, *image_refs] if url]))
+                segment_videos = [] if frame_mode else video_refs
+                segment_first_frame = continuation_ref if frame_mode else None
+                segment_last_frame = (
+                    last_frame_ref
+                    if frame_mode and segment_index == len(segment_plan) - 1
+                    else None
+                )
+                if not segment_first_frame and not segment_images and not segment_videos:
+                    raise ValueError(f"镜头 {shot.ordinal} 缺少 MetaSo H3 需要的首帧、参考图片或参考视频")
+
+                pending_task = str(resume_part.get("task_id")) if isinstance(resume_part, dict) and resume_part.get("task_id") else ""
+                if pending_task:
+                    task_id = pending_task
+                    job.error = f"MetaSo H3 第 {segment_index + 1}/{len(segment_plan)} 段从中断处续轮询"
+                else:
+                    job.status = JobStatus.SUBMITTING
+                    job.error = f"正在提交 MetaSo H3 第 {segment_index + 1}/{len(segment_plan)} 段"
+                self.store.save_job(job)
+                if not pending_task:
+                    task_id = await self.metaso_client.submit(
+                        prompt=str(segment["prompt"]),
+                        image_urls=segment_images,
+                        video_urls=segment_videos,
+                        audio_urls=segment_audio_refs,
+                        first_frame_url=segment_first_frame,
+                        last_frame_url=segment_last_frame,
+                        resolution=resolution,
+                        duration=metaso_duration(float(segment.get("generation_duration", segment["duration"]))),
+                        ratio=ratio,
+                    )
+                job.prompt_id = task_id
+                job.status = JobStatus.RUNNING
+                job.workflow_snapshot = {"metaso_task_id": task_id, "segment": segment_index + 1}
+                while len(resume_parts) <= segment_index:
+                    resume_parts.append({})
+                resume_parts[segment_index] = {"task_id": task_id}
+                metaso_resume["parts"] = resume_parts
+                job.input_snapshot["metaso_resume"] = metaso_resume
+                self.store.save_job(job)
+
+                async def progress(value: float, message: str, *, index: int = segment_index) -> None:
+                    current = self.store.get_job(job.id)
+                    if current is None:
+                        return
+                    if current.status == JobStatus.CANCEL_REQUESTED:
+                        raise asyncio.CancelledError()
+                    current.progress = min(0.99, (index + value) / len(segment_plan))
+                    current.error = f"MetaSo H3 段 {index + 1}/{len(segment_plan)} · {message}"
+                    self.store.save_job(current)
+
+                output_url = await self.metaso_client.wait_for_result(task_id, progress)
+                segment_path = output_dir / f"{job.id}.part{segment_index + 1}.mp4"
+                await self.metaso_client.download(output_url, segment_path)
+                segment_paths.append(segment_path)
+                resume_parts[segment_index] = {"task_id": task_id, "path": str(segment_path)}
+                metaso_resume["parts"] = resume_parts
+                job.input_snapshot["metaso_resume"] = metaso_resume
+                self.store.save_job(job)
+
+                if segment_index < len(segment_plan) - 1:
+                    continuation_path = output_dir / f"{job.id}.continuation{segment_index + 1}.png"
+                    await asyncio.to_thread(self._extract_last_frame, segment_path, continuation_path)
+                    continuation_ref = await self._metaso_local_ref(continuation_path, reference_cache)
+                    continuation_path.unlink(missing_ok=True)
+        except asyncio.CancelledError:
+            job.status = JobStatus.CANCELLED
+            job.completed_at = utc_now()
+            self.store.save_job(job)
+            return
+
+        await self._finalize_h3_video(
+            job,
+            shot,
+            segment_plan,
+            segment_paths,
+            dialogue_guides,
+            expected_dialogue_tracks,
+            destination,
+            started,
+            width,
+            height,
+            scale_to_expected=True,
+        )
+
+    async def _metaso_ref(self, asset: Asset, reference_cache: dict[str, str]) -> str:
+        """Resolve a project asset into a MetaSo-readable URL or data URL."""
+        if asset.path.startswith(("http://", "https://", "data:")):
+            return asset.path
+        path = resolve_media_path(asset.path)
+        if not path.is_file():
+            raise FileNotFoundError(f"素材文件不存在: {asset.name}")
+        resolved = path.resolve()
+        cache_key = str(resolved)
+        if cache_key in reference_cache:
+            return reference_cache[cache_key]
+        inline_limit = max(1, int(settings.SEEDANCE_INLINE_ASSET_MAX_MB)) * 1024 * 1024
+        if asset.type == AssetType.IMAGE and resolved.stat().st_size <= inline_limit:
+            reference_cache[cache_key] = media_data_url(resolved)
+            return reference_cache[cache_key]
+        public_base = (settings.SEEDANCE_PUBLIC_ASSET_BASE_URL or "").strip().rstrip("/")
+        if public_base:
+            expires = int(time.time()) + max(300, int(settings.SEEDANCE_ASSET_URL_TTL_SECONDS))
+            signature = sign_seedance_asset(asset.id, expires)
+            reference_cache[cache_key] = (
+                f"{public_base}/api/projects/seedance-assets/{asset.id}?expires={expires}&signature={signature}"
+            )
+            return reference_cache[cache_key]
+        reference_cache[cache_key] = media_data_url(resolved)
+        return reference_cache[cache_key]
+
+    @staticmethod
+    async def _metaso_local_ref(path: Path, reference_cache: dict[str, str]) -> str:
+        resolved = path.resolve()
+        cache_key = str(resolved)
+        if cache_key not in reference_cache:
+            reference_cache[cache_key] = media_data_url(resolved)
+        return reference_cache[cache_key]
+
+    async def _atlas_ref(self, asset: Asset, upload_cache: dict[str, str]) -> str:
+        """Resolve an asset to a public URL accepted by Atlas reference-to-video."""
+        if asset.path.startswith(("http://", "https://")):
+            return asset.path
+        if asset.path.startswith("data:"):
+            raise ValueError(f"素材 {asset.name} 是内联 Data URI，请重新上传为项目素材后再提交 Atlas H3")
+        path = resolve_media_path(asset.path)
+        if not path.is_file():
+            raise FileNotFoundError(f"素材文件不存在: {asset.name}")
+        return await self._atlas_local_ref(path, upload_cache)
+
+    async def _atlas_local_ref(self, path: Path, upload_cache: dict[str, str]) -> str:
+        resolved = path.resolve()
+        cache_key = str(resolved)
+        if cache_key not in upload_cache:
+            upload_cache[cache_key] = await self.atlas_client.upload_media(resolved)
+        return upload_cache[cache_key]
+
+    @staticmethod
+    def _dedupe_atlas_refers(refers: list[dict[str, str]]) -> list[dict[str, str]]:
+        seen: set[tuple[str, str]] = set()
+        result: list[dict[str, str]] = []
+        for item in refers:
+            key = (str(item.get("type") or ""), str(item.get("url") or ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _scale_video_to(path: Path, width: int, height: int) -> None:
+        """Hosted tiers return fixed sizes; rescale once so QC and delivery match the project."""
+        probe = subprocess.run(
+            [
+                settings.FFPROBE_BIN,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            raise RuntimeError(probe.stderr[-1000:] or "ffprobe failed before scaling")
+        streams = json.loads(probe.stdout or "{}").get("streams") or [{}]
+        actual = streams[0]
+        if int(actual.get("width") or 0) == width and int(actual.get("height") or 0) == height:
+            return
+        target = path.with_name(f"{path.stem}.scaled{path.suffix}")
+        command = [
+            settings.FFMPEG_BIN,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(path),
+            "-vf",
+            f"scale={width}:{height}:flags=lanczos",
+            "-c:v",
+            settings.FINAL_VIDEO_CODEC,
+            "-preset",
+            settings.FINAL_VIDEO_PRESET,
+            "-crf",
+            str(settings.FINAL_VIDEO_CRF),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(target),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0 or not target.exists() or target.stat().st_size == 0:
+            target.unlink(missing_ok=True)
+            raise RuntimeError(result.stderr[-1500:] or "Could not scale Atlas H3 output")
+        target.replace(path)
 
     async def _process_seedance(self, job: RenderJob) -> None:
         if not job.shot_id:
@@ -712,17 +1387,19 @@ class RenderQueue:
             assets = self.store.list_assets(job.project_id)
             refs = self.projects.seedance_reference_assets(shot, assets, project)
             config["reference_asset_ids"] = [asset.id for asset in refs]
-            config["prompt"] = self.projects.compile_seedance_prompt(project, shot, assets)
+            config["prompt"] = self.projects.effective_seedance_prompt(project, shot, assets)
+            diagnostics = self.projects.seedance_material_diagnostics(project, shot, assets)
+            config["reference_mode"] = diagnostics["resolved_mode"]
+            config["first_frame_asset_id"] = diagnostics["first_frame_asset_id"]
+            config["identity_risk_characters"] = diagnostics["identity_risk_characters"]
+            config["material_warnings"] = diagnostics["warnings"]
             job.input_snapshot["seedance"] = config
             shot.seedance_prompt = str(config["prompt"])
+            shot.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
             shot.seedance_prompt_source_revision = shot.content_revision
             self.store.save_shot(shot)
 
-        first_frame_asset_id = self.projects.seedance_first_frame_asset_id(
-            project,
-            shot,
-            self.store.list_assets(job.project_id),
-        )
+        first_frame_asset_id = str(config.get("first_frame_asset_id") or "") or None
 
         started = time.monotonic()
         job.status = JobStatus.SUBMITTING
@@ -1007,6 +1684,8 @@ class RenderQueue:
         path: Path,
         speech_path: Path | list[dict[str, object]] | None,
         dialogue_start_seconds: float,
+        *,
+        preserve_native_without_speech: bool = False,
     ) -> dict[str, object]:
         """Copy H3 pixels and replace its broadband synthetic noise track."""
         if not settings.H3_POSTPROCESS_AUDIO or settings.H3_AUDIO_MODE == "native":
@@ -1054,6 +1733,16 @@ class RenderQueue:
                 track for track in speech_path
                 if Path(str(track.get("path") or "")).exists()
             ]
+
+        if settings.H3_AUDIO_MODE == "clean_tts" and not tracks and preserve_native_without_speech:
+            return {
+                "applied": False,
+                "mode": settings.H3_AUDIO_MODE,
+                "delivered": "native_h3_audio",
+                "reason": "atlas_no_independent_tts",
+                "native_h3_audio": "preserved",
+                "speech_tracks": 0,
+            }
 
         if settings.H3_AUDIO_MODE == "clean_tts" and tracks:
             filters: list[str] = []
@@ -1109,6 +1798,9 @@ class RenderQueue:
             target.unlink(missing_ok=True)
             logger.warning("Audio replacement failed for %s: %s", path, result.stderr[-1500:])
             return {"applied": False, "mode": settings.H3_AUDIO_MODE, "reason": "ffmpeg_failed"}
+        native_backup = path.with_name(f"{path.stem}.native-audio{path.suffix}")
+        if not native_backup.exists():
+            shutil.copy2(path, native_backup)
         target.replace(path)
         return {
             "applied": True,
@@ -1118,6 +1810,7 @@ class RenderQueue:
             "bitrate": settings.H3_POSTPROCESS_AUDIO_BITRATE,
             "video_stream": "copied_without_reencoding",
             "native_h3_audio": "discarded",
+            "native_h3_backup": str(native_backup),
             "speech_tracks": len(tracks),
         }
 
@@ -1128,6 +1821,7 @@ class RenderQueue:
         expected_height: int,
         expected_duration: float,
         require_clean_audio: bool,
+        require_audible_audio: bool = False,
     ) -> dict[str, object]:
         """Reject broken media before a shot can be marked completed."""
         probe = subprocess.run(
@@ -1174,6 +1868,36 @@ class RenderQueue:
         elif require_clean_audio and sample_rate != settings.FINAL_AUDIO_SAMPLE_RATE:
             issues.append(f"音频采样率异常 {sample_rate}Hz，预期 {settings.FINAL_AUDIO_SAMPLE_RATE}Hz")
 
+        audio_mean_volume_db: float | None = None
+        audio_max_volume_db: float | None = None
+        if require_audible_audio and audio:
+            volume = subprocess.run(
+                [
+                    settings.FFMPEG_BIN,
+                    "-hide_banner",
+                    "-i", str(path),
+                    "-map", "0:a:0",
+                    "-af", "volumedetect",
+                    "-f", "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            for line in volume.stderr.splitlines():
+                if "mean_volume:" in line:
+                    raw = line.split("mean_volume:", 1)[1].split("dB", 1)[0].strip()
+                    audio_mean_volume_db = float(raw) if raw not in {"-inf", "inf"} else -999.0
+                elif "max_volume:" in line:
+                    raw = line.split("max_volume:", 1)[1].split("dB", 1)[0].strip()
+                    audio_max_volume_db = float(raw) if raw not in {"-inf", "inf"} else -999.0
+            if volume.returncode != 0 or audio_max_volume_db is None:
+                issues.append("音频响度检测失败")
+            elif audio_max_volume_db <= -60.0:
+                issues.append(f"音轨实际为静音（峰值 {audio_max_volume_db:.1f} dB）")
+        elif require_audible_audio and not audio:
+            issues.append("缺少应有的声音轨")
+
         decode = subprocess.run(
             [settings.FFMPEG_BIN, "-hide_banner", "-v", "error", "-i", str(path), "-f", "null", "-"],
             capture_output=True,
@@ -1190,6 +1914,8 @@ class RenderQueue:
             "frames": frame_count,
             "has_audio": bool(audio),
             "audio_sample_rate": sample_rate,
+            "audio_mean_volume_db": audio_mean_volume_db,
+            "audio_max_volume_db": audio_max_volume_db,
             "decode_passed": decode.returncode == 0,
             "size_bytes": path.stat().st_size if path.exists() else 0,
         }

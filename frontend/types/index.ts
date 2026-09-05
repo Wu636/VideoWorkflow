@@ -88,6 +88,35 @@ export interface StyleAnalysisDraft extends StyleProfile {
     observations: string[];
 }
 
+export interface SeriesAsset {
+    id: string;
+    type: AssetType;
+    role: AssetRole;
+    name: string;
+    path: string;
+    mime_type: string;
+    character_id: string | null;
+    description: string;
+    tags: string[];
+    approved: boolean;
+    sha256: string;
+    size_bytes: number;
+}
+
+export interface ProductionSeries {
+    id: string;
+    name: string;
+    description: string;
+    visual_style: string;
+    style_bible: string;
+    style_profile: StyleProfile | null;
+    negative_prompt: string;
+    characters: CharacterProfile[];
+    assets: SeriesAsset[];
+    created_at: string;
+    updated_at: string;
+}
+
 export interface SceneProfile {
     id: string;
     name: string;
@@ -96,6 +125,12 @@ export interface SceneProfile {
     reference_asset_ids: string[];
     source_shot_ids: string[];
     approved: boolean;
+    version: number;
+    reference_prompt: string;
+    reference_status: "idle" | "generating" | "downloading" | "completed" | "download_failed" | "failed";
+    reference_error: string;
+    reference_run_id: string;
+    reference_generation_prompt: string;
 }
 
 export interface Project {
@@ -107,10 +142,13 @@ export interface Project {
     scene_consistency_mode: "off" | "optional" | "strict";
     scene_profiles: SceneProfile[];
     preferred_prompt_targets: ("h3" | "seedance")[];
+    storyboard_warnings: string[];
     characters: CharacterProfile[];
     ai_recommended_shot_count: number | null;
     storyboard_count_mode: "manual" | "ai";
     manual_shot_count: number | null;
+    series_id: string | null;
+    episode_number: number | null;
     review_token: string;
     storyboard_version: number;
     created_at: string;
@@ -196,6 +234,28 @@ export interface H3PromptSkill {
     source_commit: string;
 }
 
+export interface VisualBeat {
+    start_seconds: number;
+    end_seconds: number;
+    purpose: string;
+    subject_action: string;
+    environment_action: string;
+    shot_size: string;
+    camera_angle: string;
+    camera_motion: string;
+    sound_cue: string;
+}
+
+export interface VoiceEvent {
+    kind: "character" | "system_vo" | "narration" | "offscreen";
+    speaker_id: string | null;
+    speaker_name: string;
+    text: string;
+    start_seconds: number;
+    end_seconds: number;
+    lip_sync: boolean;
+}
+
 export interface Shot {
     id: string;
     project_id: string;
@@ -213,6 +273,7 @@ export interface Shot {
     use_scene_profile: boolean;
     continuity_mode: "independent" | "same_scene" | "continuous";
     continuity_source_shot_id: string | null;
+    seedance_reference_mode: "auto" | "strict_first_frame" | "multimodal_reference";
     character_ids: string[];
     character_appearance_ids: Record<string, string>;
     shot_size: string;
@@ -222,12 +283,16 @@ export interface Shot {
     subject_motion: string;
     transition: string;
     audio_design: string;
+    visual_beats: VisualBeat[];
+    voice_events: VoiceEvent[];
+    text_policy: "none" | "post_overlay" | "reference_locked";
     visual_prompt: string;
     keyframe_prompt: string;
     video_prompt_source: string;
     video_prompt: string;
     h3_prompt_skill_id: string;
     h3_prompt_skill_version: string;
+    h3_director_version: string;
     h3_prompt_skill_output: string;
     seedance_prompt: string;
     seedance_prompt_version: string;
@@ -349,6 +414,15 @@ export interface SeedanceEstimate {
     estimated_yuan_per_task: number;
     has_video_input: boolean;
     note: string;
+}
+
+export interface SeedanceMaterialDiagnostics {
+    requested_mode: Shot["seedance_reference_mode"];
+    resolved_mode: Exclude<Shot["seedance_reference_mode"], "auto">;
+    first_frame_asset_id: string | null;
+    identity_risk_characters: string[];
+    materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    warnings: string[];
 }
 
 export interface Review {

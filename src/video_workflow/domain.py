@@ -55,6 +55,14 @@ class ShotContinuityMode(str, Enum):
     CONTINUOUS = "continuous"
 
 
+class SeedanceReferenceMode(str, Enum):
+    """How Seedance should trade exact opening pixels for identity references."""
+
+    AUTO = "auto"
+    STRICT_FIRST_FRAME = "strict_first_frame"
+    MULTIMODAL_REFERENCE = "multimodal_reference"
+
+
 class AssetType(str, Enum):
     IMAGE = "image"
     VIDEO = "video"
@@ -166,6 +174,45 @@ class SceneProfile(BaseModel):
     reference_asset_ids: list[str] = Field(default_factory=list)
     source_shot_ids: list[str] = Field(default_factory=list)
     approved: bool = False
+    version: int = Field(default=1, ge=1)
+    reference_prompt: str = ""
+    reference_status: Literal["idle", "generating", "downloading", "completed", "download_failed", "failed"] = "idle"
+    reference_error: str = ""
+    reference_run_id: str = ""
+    reference_generation_prompt: str = ""
+
+
+class SeriesAsset(BaseModel):
+    """Durable style/character reference owned by a production series."""
+
+    id: str = Field(default_factory=lambda: new_id("series_asset"))
+    type: AssetType
+    role: AssetRole
+    name: str
+    path: str
+    mime_type: str = "application/octet-stream"
+    character_id: str | None = None
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    approved: bool = False
+    sha256: str = ""
+    size_bytes: int = 0
+
+
+class ProductionSeries(BaseModel):
+    """Reusable visual identity and recurring cast for related episodes."""
+
+    id: str = Field(default_factory=lambda: new_id("series"))
+    name: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    visual_style: str = ""
+    style_bible: str = ""
+    style_profile: StyleProfile | None = None
+    negative_prompt: str = ""
+    characters: list[CharacterProfile] = Field(default_factory=list)
+    assets: list[SeriesAsset] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
 
 
 class Project(BaseModel):
@@ -177,12 +224,15 @@ class Project(BaseModel):
     scene_consistency_mode: SceneConsistencyMode = SceneConsistencyMode.OFF
     scene_profiles: list[SceneProfile] = Field(default_factory=list)
     preferred_prompt_targets: list[Literal["h3", "seedance"]] = Field(
-        default_factory=lambda: ["h3", "seedance"]
+        default_factory=lambda: ["seedance"]
     )
+    storyboard_warnings: list[str] = Field(default_factory=list)
     characters: list[CharacterProfile] = Field(default_factory=list)
     ai_recommended_shot_count: int | None = Field(default=None, ge=1, le=500)
     storyboard_count_mode: Literal["manual", "ai"] = "ai"
     manual_shot_count: int | None = Field(default=None, ge=1, le=500)
+    series_id: str | None = None
+    episode_number: int | None = Field(default=None, ge=1)
     review_token: str = Field(default_factory=lambda: new_id("review"))
     storyboard_version: int = 1
     created_at: str = Field(default_factory=utc_now)
@@ -209,6 +259,44 @@ class ProjectAnalysisDraft(BaseModel):
     shot_count_reason: str = ""
     characters: list[CharacterAnalysisDraft] = Field(default_factory=list)
     analysis_notes: list[str] = Field(default_factory=list)
+
+
+class VisualBeat(BaseModel):
+    """One directed, time-bounded visual change inside a generated shot."""
+
+    start_seconds: float = Field(default=0.0, ge=0.0, le=15.0)
+    end_seconds: float = Field(default=3.0, ge=0.0, le=15.0)
+    purpose: str = ""
+    subject_action: str = ""
+    environment_action: str = ""
+    shot_size: str = ""
+    camera_angle: str = ""
+    camera_motion: str = ""
+    sound_cue: str = ""
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> VisualBeat:
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("visual beat end_seconds must be greater than start_seconds")
+        return self
+
+
+class VoiceEvent(BaseModel):
+    """A timed voice event whose ownership is explicit and model-independent."""
+
+    kind: Literal["character", "system_vo", "narration", "offscreen"] = "narration"
+    speaker_id: str | None = None
+    speaker_name: str = ""
+    text: str = ""
+    start_seconds: float = Field(default=0.0, ge=0.0, le=15.0)
+    end_seconds: float = Field(default=3.0, ge=0.0, le=15.0)
+    lip_sync: bool = False
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> VoiceEvent:
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("voice event end_seconds must be greater than start_seconds")
+        return self
 
 
 class DialogueTurn(BaseModel):
@@ -241,6 +329,10 @@ class Shot(BaseModel):
     use_scene_profile: bool = False
     continuity_mode: ShotContinuityMode = ShotContinuityMode.INDEPENDENT
     continuity_source_shot_id: str | None = None
+    # Full multimodal reference is the project-wide default: character sheets
+    # are only useful when the video request actually sends them alongside the
+    # composition/scene anchors. Strict first-frame remains an explicit opt-in.
+    seedance_reference_mode: SeedanceReferenceMode = SeedanceReferenceMode.MULTIMODAL_REFERENCE
     character_ids: list[str] = Field(default_factory=list)
     # character_id -> appearance_profile_id. Empty means use the character's
     # base/default look. This lets one person age, change body state or wardrobe
@@ -253,6 +345,9 @@ class Shot(BaseModel):
     subject_motion: str = ""
     transition: str = "硬切"
     audio_design: str = ""
+    visual_beats: list[VisualBeat] = Field(default_factory=list)
+    voice_events: list[VoiceEvent] = Field(default_factory=list)
+    text_policy: Literal["none", "post_overlay", "reference_locked"] = "post_overlay"
     # General visual direction for the storyboard.  This intentionally stays
     # separate from the still-image prompt used to generate the first frame.
     visual_prompt: str = ""
@@ -263,6 +358,7 @@ class Shot(BaseModel):
     video_prompt: str = ""
     h3_prompt_skill_id: str = "h3-prompt-writing"
     h3_prompt_skill_version: str = ""
+    h3_director_version: str = ""
     h3_prompt_skill_output: str = ""
     # Seedance uses its own Chinese, numbered-material prompt grammar.  Keep it
     # separate from the MiniMax H3 prompt so switching providers never destroys

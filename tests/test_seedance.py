@@ -14,7 +14,10 @@ from src.video_workflow.domain import (
     DialogueTurn,
     Project,
     ProjectBrief,
+    SeedanceReferenceMode,
     Shot,
+    VisualBeat,
+    VoiceEvent,
 )
 from src.video_workflow.integrations.seedance import (
     SEEDANCE_MODELS,
@@ -230,6 +233,7 @@ class SeedanceIntegrationTests(unittest.TestCase):
             dialogue_turns=[DialogueTurn(speaker_id=lead.id, text="她是D同志。")],
             keyframe_asset_id="keyframe",
             reference_asset_ids=["character-image", "voice"],
+            seedance_reference_mode=SeedanceReferenceMode.STRICT_FIRST_FRAME,
         )
         assets = [
             Asset(id="keyframe", project_id=project.id, type=AssetType.IMAGE, role=AssetRole.KEYFRAME, name="shot.png", path="data:image/png;base64,AA=="),
@@ -240,12 +244,145 @@ class SeedanceIntegrationTests(unittest.TestCase):
         # The compiler itself does not access storage, so a lightweight service is sufficient.
         service = ProjectService.__new__(ProjectService)
         prompt = service.compile_seedance_prompt(project, shot, assets)
-        self.assertIn("图片1（shot.png）", prompt)
-        self.assertIn("图片2（lead.png）", prompt)
-        self.assertIn("音频1（lead.mp3）", prompt)
-        self.assertIn("将图片2中戴黑框眼镜的年轻男性，深蓝西装的角色定义为“秦绍辉”", prompt)
-        self.assertIn("秦绍辉说：“她是D同志。”", prompt)
-        self.assertIn("每句话只由标明角色说出，其他人物闭嘴", prompt)
+        self.assertIn("@图片1（shot.png）", prompt)
+        self.assertNotIn("lead.png", prompt)
+        self.assertNotIn("lead.mp3", prompt)
+        self.assertIn("@图片1是严格首帧", prompt)
+        self.assertIn("“秦绍辉”说：“她是D同志。”", prompt)
+        self.assertIn("其余人物闭嘴", prompt)
+        self.assertIn("【逐段时间轴】", prompt)
+
+    def test_auto_reference_mode_keeps_character_sheet_when_body_appears_after_frame_zero(self) -> None:
+        lead = CharacterProfile(
+            id="lead",
+            name="张小差",
+            description="半扎高丸子头的年轻阴差",
+            wardrobe="炭黑色立领工装和双肩皮带",
+            reference_asset_ids=["character-image"],
+        )
+        project = Project(
+            id="project-reveal",
+            brief=ProjectBrief(title="穿墙", story="张小差从墙里钻出来"),
+            characters=[lead],
+        )
+        shot = Shot(
+            id="shot-reveal",
+            project_id=project.id,
+            ordinal=3,
+            narrative="墙壁先出现轮廓，张小差随后从墙里钻出",
+            scene_description="老式客厅里墙面平整，李奶奶坐在沙发上",
+            keyframe_prompt="【首帧画面】老式客厅里墙面平整，李奶奶坐在沙发上\n【角色锚点】张小差：炭黑色工装",
+            subject_motion="张小差半个脑袋从墙内探出，随后全身钻出",
+            character_ids=[lead.id],
+            keyframe_asset_id="keyframe",
+            reference_asset_ids=["character-image"],
+        )
+        assets = [
+            Asset(id="keyframe", project_id=project.id, type=AssetType.IMAGE, role=AssetRole.KEYFRAME, name="shot-3.png", path="data:image/png;base64,AA=="),
+            Asset(id="character-image", project_id=project.id, type=AssetType.IMAGE, role=AssetRole.CHARACTER, name="zhang-sheet.png", path="data:image/png;base64,AA==", character_id=lead.id),
+        ]
+        service = ProjectService.__new__(ProjectService)
+
+        diagnostics = service.seedance_material_diagnostics(project, shot, assets)
+        prompt = service.compile_seedance_prompt(project, shot, assets)
+
+        self.assertEqual(diagnostics["resolved_mode"], "multimodal_reference")
+        self.assertEqual([item["id"] for item in diagnostics["materials"]], ["keyframe", "character-image"])
+        self.assertIsNone(diagnostics["first_frame_asset_id"])
+        self.assertEqual(diagnostics["identity_risk_characters"], ["张小差"])
+        self.assertIn("将@图片2中", prompt)
+        self.assertIn("其脸型、发型、服装和配饰以对应人物参考图为准", prompt)
+
+    def test_strict_first_frame_prompt_uses_timed_beats_and_external_system_voice(self) -> None:
+        lead = CharacterProfile(id="lead", name="林砚", description="年轻工程师")
+        project = Project(
+            id="project-director",
+            brief=ProjectBrief(title="闯关", story="系统发布挑战", visual_style="电影级 3D"),
+            characters=[lead],
+        )
+        shot = Shot(
+            id="shot-director",
+            project_id=project.id,
+            ordinal=1,
+            duration_seconds=15,
+            narrative="系统发布第一关，林砚启动设备并完成校验",
+            character_ids=[lead.id],
+            dialogue="第一关开始",
+            keyframe_asset_id="keyframe",
+            reference_asset_ids=["character", "voice"],
+            seedance_reference_mode=SeedanceReferenceMode.STRICT_FIRST_FRAME,
+            visual_beats=[
+                VisualBeat(start_seconds=0, end_seconds=3, purpose="钩子", subject_action="设备突然亮起", camera_motion="快速推近"),
+                VisualBeat(start_seconds=3, end_seconds=7, purpose="执行", subject_action="林砚抓住绝缘杆", camera_motion="侧向跟拍"),
+                VisualBeat(start_seconds=7, end_seconds=11, purpose="反馈", subject_action="能量脉冲沿线路传播", environment_action="指示灯依次点亮", camera_motion="平稳摇摄"),
+                VisualBeat(start_seconds=11, end_seconds=15, purpose="结果", subject_action="校验灯转为绿色", camera_motion="固定镜头"),
+            ],
+            voice_events=[
+                VoiceEvent(
+                    kind="system_vo",
+                    speaker_name="系统播报",
+                    text="第一关开始",
+                    start_seconds=0.4,
+                    end_seconds=2.2,
+                    lip_sync=False,
+                )
+            ],
+        )
+        assets = [
+            Asset(id="keyframe", project_id=project.id, type=AssetType.IMAGE, role=AssetRole.KEYFRAME, name="shot-1.png", path="data:image/png;base64,AA==", description="KEYFRAME_FULL_PROMPT_SHOULD_NOT_LEAK"),
+            Asset(id="character", project_id=project.id, type=AssetType.IMAGE, role=AssetRole.CHARACTER, name="linyan.png", path="data:image/png;base64,AA=="),
+            Asset(id="voice", project_id=project.id, type=AssetType.AUDIO, role=AssetRole.VOICE, name="system.mp3", path="data:audio/mpeg;base64,AA=="),
+        ]
+
+        service = ProjectService.__new__(ProjectService)
+        refs = service.seedance_reference_assets(shot, assets, project)
+        prompt = service.compile_seedance_prompt(project, shot, assets)
+
+        self.assertEqual([asset.id for asset in refs], ["keyframe"])
+        self.assertNotIn("KEYFRAME_FULL_PROMPT_SHOULD_NOT_LEAK", prompt)
+        self.assertIn("0.00–3.00秒", prompt)
+        self.assertIn("11.00–15.00秒", prompt)
+        self.assertIn("系统播报说", prompt)
+        self.assertIn("画面内所有人物不张嘴", prompt)
+        self.assertNotIn("唯一发言者“林砚”", prompt)
+
+    def test_legacy_system_broadcast_and_old_cached_prompt_are_upgraded(self) -> None:
+        lead = CharacterProfile(id="lead", name="林砚")
+        project = Project(
+            id="project-legacy",
+            brief=ProjectBrief(title="旧项目", story="系统发布任务"),
+            characters=[lead],
+        )
+        shot = Shot(
+            id="shot-legacy",
+            project_id=project.id,
+            ordinal=1,
+            duration_seconds=15,
+            narrative="系统发布任务，林砚抬头观察设备",
+            dialogue="【系统播报】第一关开始。",
+            dialogue_speaker_id=lead.id,
+            audio_design="冰冷机械系统播报，无人物对白",
+            subject_motion=(
+                "总时长约15秒。林砚抬头并走向设备；设备亮起；林砚完成操作。"
+                "本镜头只完成这一项核心动作；镜头固定或仅做一次缓慢单向移动。"
+            ),
+            keyframe_asset_id="keyframe",
+            seedance_prompt="OLD_CACHED_PROMPT",
+            seedance_prompt_version="seedance-2.0-official-2026-08",
+        )
+        assets = [
+            Asset(id="keyframe", project_id=project.id, type=AssetType.IMAGE, role=AssetRole.KEYFRAME, name="shot.png", path="data:image/png;base64,AA=="),
+        ]
+
+        service = ProjectService.__new__(ProjectService)
+        prompt = service.effective_seedance_prompt(project, shot, assets)
+
+        self.assertNotEqual(prompt, "OLD_CACHED_PROMPT")
+        self.assertIn("0.00–3.00秒", prompt)
+        self.assertNotIn("只完成这一项核心动作", prompt)
+        self.assertNotIn("缓慢单向", prompt)
+        self.assertIn("系统播报说：“第一关开始。”", prompt)
+        self.assertIn("画面内所有人物不张嘴", prompt)
 
     def test_dns_failure_detection_and_preflight_origin_probe(self) -> None:
         import httpx

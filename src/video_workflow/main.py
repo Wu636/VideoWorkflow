@@ -852,67 +852,8 @@ def review_images_loop(session_dir, storyboard: Storyboard, orchestrator, refere
 
 async def revise_storyboard(orchestrator, storyboard: Storyboard, feedback: str, reference_image: str | None) -> Storyboard:
     """让 AI 根据用户反馈修改脚本"""
-    from src.video_workflow.config import settings
-    
-    # 构建修改请求
-    current_script = storyboard.model_dump_json(indent=2)
-    
-    revision_prompt = f"""
-当前分镜脚本如下：
-```json
-{current_script}
-```
-
-用户反馈：{feedback}
-
-请根据用户的反馈修改脚本，保持相同的 JSON 结构。只修改需要修改的部分，保持其他内容不变。
-返回完整的修改后的 JSON，不要包含任何解释文字。
-"""
-    
-    # 调用 LLM 进行修改
     try:
-        if settings.LLM_PROVIDER == "deepseek":
-            # DeepSeek
-            response = await orchestrator.llm.client.chat.completions.create(
-                model=settings.DEEPSEEK_MODEL,
-                messages=[
-                    {"role": "system", "content": orchestrator.llm.system_prompt},
-                    {"role": "user", "content": revision_prompt}
-                ],
-                response_format={"type": "json_object"}
-            )
-            content = response.choices[0].message.content
-        else:
-            # GLM - 使用同步调用
-            import asyncio
-            loop = asyncio.get_running_loop()
-            
-            def _call_glm():
-                return orchestrator.llm.client.chat.completions.create(
-                    model=settings.GLM_MODEL,
-                    messages=[
-                        {"role": "system", "content": orchestrator.llm.system_prompt},
-                        {"role": "user", "content": [{"type": "text", "text": revision_prompt}]}
-                    ]
-                )
-            
-            response = await loop.run_in_executor(None, _call_glm)
-            content = response.choices[0].message.content
-        
-        if not content:
-            raise ValueError("LLM 返回空内容")
-        
-        # 解析响应
-        content = content.strip()
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        
-        data = json.loads(content.strip())
-        return Storyboard(**data)
+        return await orchestrator.llm.revise_storyboard(storyboard, feedback, reference_image)
     except Exception as e:
         console.print(f"[red]AI 修改失败: {e}[/red]")
         raise

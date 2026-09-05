@@ -6,7 +6,7 @@ from typing import List
 from src.video_workflow.config import settings
 from src.video_workflow.types import Storyboard, Scene, GenerationStatus
 from src.video_workflow.generators.base import ImageGenerator
-from src.video_workflow.generators.llm import DeepSeekGenerator, GLMGenerator, ArkLLMGenerator
+from src.video_workflow.generators.llm import DeepSeekGenerator, GLMGenerator, OpenLuxGenerator, ArkLLMGenerator
 from src.video_workflow.generators.image import create_image_generator
 from src.video_workflow.generators.video import create_video_generator
 
@@ -25,9 +25,28 @@ def create_llm_generator(provider: str | None = None):
         resolved = settings.LLM_PROVIDER
     if resolved == "glm":
         return GLMGenerator()
+    if resolved == "openlux":
+        return OpenLuxGenerator()
     if resolved in {"ark_doubao", "ark_deepseek", "ark"}:
         return ArkLLMGenerator()
     return DeepSeekGenerator()
+
+
+def resolve_reference_llm_provider(fallback: str | None = None) -> str:
+    """Resolve the vision route while keeping a selected multimodal gateway sticky."""
+    selected = (settings.REFERENCE_ANALYSIS_PROVIDER or "auto").strip().lower()
+    if selected != "auto":
+        return selected
+    fallback_provider = (fallback or settings.LLM_PROVIDER or "deepseek").strip().lower()
+    if fallback_provider == "openlux" and settings.OPENLUX_API_KEY:
+        return "openlux"
+    if settings.ARK_API_KEY:
+        return "ark"
+    if settings.GLM_API_KEY:
+        return "glm"
+    if settings.OPENLUX_API_KEY:
+        return "openlux"
+    return fallback_provider
 
 
 class WorkflowOrchestrator:

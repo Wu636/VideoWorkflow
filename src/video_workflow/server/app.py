@@ -16,6 +16,13 @@ from src.video_workflow.server.routers import files, projects, system, webhooks,
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    migration = projects.project_service.migrate_all_seedance_shots_to_multimodal()
+    if migration["shot_count"]:
+        logger.info(
+            "Seedance 全模态默认迁移完成: projects=%s shots=%s",
+            migration["project_count"],
+            migration["shot_count"],
+        )
     await projects.render_queue.start()
     try:
         yield
