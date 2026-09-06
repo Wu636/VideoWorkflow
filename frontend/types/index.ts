@@ -15,9 +15,11 @@ export type ProjectStatus =
 
 export type ApprovalStatus = 'draft' | 'pending' | 'approved' | 'changes_requested';
 export type GenerationMode = 'auto' | 'i2v' | 'r2v';
+export type FirstFrameCompleteness = 'unknown' | 'complete' | 'incomplete';
 export type AssetType = 'image' | 'video' | 'audio' | 'subtitle' | 'document';
 export type AssetRole =
     | 'character'
+    | 'prop'
     | 'style'
     | 'scene'
     | 'keyframe'
@@ -256,6 +258,38 @@ export interface VoiceEvent {
     lip_sync: boolean;
 }
 
+export interface ShotSplitSegment {
+    title: string;
+    duration_seconds: number;
+    narrative: string;
+    dialogue: string;
+    scene_description: string;
+    scene_profile_name: string;
+    scene_profile_description: string;
+    scene_continuity_notes: string;
+    character_names: string[];
+    shot_size: string;
+    camera_angle: string;
+    lens: string;
+    camera_motion: string;
+    subject_motion: string;
+    transition: string;
+    audio_design: string;
+    visual_beats: VisualBeat[];
+    voice_events: VoiceEvent[];
+    text_policy: "none" | "post_overlay" | "reference_locked";
+}
+
+export interface ShotSplitPreview {
+    source_shot_id: string;
+    source_shot_version: number;
+    source_ordinal: number;
+    original_duration_seconds: number;
+    proposed_duration_seconds: number;
+    rationale: string;
+    segments: ShotSplitSegment[];
+}
+
 export interface Shot {
     id: string;
     project_id: string;
@@ -269,11 +303,13 @@ export interface Shot {
     dialogue_turns: { speaker_id: string | null; text: string }[];
     duration_seconds: number;
     scene_description: string;
+    scene_profile_ids: string[];
     scene_profile_id: string | null;
     use_scene_profile: boolean;
     continuity_mode: "independent" | "same_scene" | "continuous";
     continuity_source_shot_id: string | null;
     seedance_reference_mode: "auto" | "strict_first_frame" | "multimodal_reference";
+    first_frame_completeness: FirstFrameCompleteness;
     character_ids: string[];
     character_appearance_ids: Record<string, string>;
     shot_size: string;
@@ -307,9 +343,12 @@ export interface Shot {
     generation_mode: GenerationMode;
     resolved_generation_mode: GenerationMode | null;
     ref_image_size: string;
+    keyframe_reference_asset_ids: string[] | null;
+    video_reference_asset_ids: string[] | null;
     reference_asset_ids: string[];
     keyframe_asset_id: string | null;
     last_frame_asset_id: string | null;
+    selected_video_job_id: string | null;
     image_path: string | null;
     video_path: string | null;
     image_status: GenerationStatus;
@@ -419,9 +458,23 @@ export interface SeedanceEstimate {
 export interface SeedanceMaterialDiagnostics {
     requested_mode: Shot["seedance_reference_mode"];
     resolved_mode: Exclude<Shot["seedance_reference_mode"], "auto">;
+    first_frame_completeness: FirstFrameCompleteness;
+    reference_mode_reason: string;
     first_frame_asset_id: string | null;
     identity_risk_characters: string[];
     materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    automatic_materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    available_materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    selection_mode: "automatic" | "manual";
+    warnings: string[];
+}
+
+export interface KeyframeMaterialDiagnostics {
+    selection_mode: "automatic" | "manual";
+    effective_character_ids: string[];
+    materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    automatic_materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    available_materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
     warnings: string[];
 }
 

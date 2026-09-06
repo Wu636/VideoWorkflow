@@ -103,6 +103,113 @@ class RenderQueue:
         self.metaso_client = MetaSoH3Client()
         self.builder = H3WorkflowBuilder()
 
+    @staticmethod
+    def job_last_frame_asset_id(job: RenderJob) -> str | None:
+        """Return the tail-frame artifact owned by one concrete render card."""
+        for key in ("output_artifacts", "seedance_result"):
+            payload = job.input_snapshot.get(key)
+            if not isinstance(payload, dict):
+                continue
+            asset_id = payload.get("last_frame_asset_id")
+            if isinstance(asset_id, str) and asset_id:
+                return asset_id
+        return None
+
+    def _ensure_job_last_frame(self, job: RenderJob, shot: Shot) -> str:
+        """Resolve or extract the tail frame for an adopted render version."""
+        existing_id = self.job_last_frame_asset_id(job)
+        existing = self.store.get_asset(existing_id) if existing_id else None
+        if (
+            existing
+            and existing.project_id == job.project_id
+            and existing.type == AssetType.IMAGE
+            and resolve_media_path(existing.path).is_file()
+        ):
+            return existing.id
+        if not job.output_path:
+            raise ValueError("该生成版本没有可用的视频文件")
+        source = resolve_media_path(job.output_path)
+        if not source.is_file():
+            raise ValueError("该生成版本的视频文件已不存在")
+        destination = (
+            self.projects.project_dir(job.project_id)
+            / "images"
+            / "last_frames"
+            / f"{shot.id}-{job.id}.png"
+        )
+        self._extract_last_frame(source, destination)
+        asset = self.projects.register_existing_asset(
+            job.project_id,
+            destination,
+            role=AssetRole.LAST_FRAME,
+            name=f"镜头 {shot.ordinal} · 采用版本尾帧",
+            description=f"从采用的视频版本 {job.id} 提取，供下一镜连续续接",
+        )
+        artifacts = job.input_snapshot.get("output_artifacts")
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+        artifacts["last_frame_asset_id"] = asset.id
+        job.input_snapshot["output_artifacts"] = artifacts
+        return asset.id
+
+    def select_output(self, project_id: str, job_id: str) -> Shot:
+        """Pin one completed render card as the shot's authoritative version."""
+        self.projects.require_project(project_id)
+        job = self.store.get_job(job_id)
+        if job is None or job.project_id != project_id:
+            raise KeyError("Render job not found")
+        if job.type != JobType.VIDEO or not job.shot_id:
+            raise ValueError("该任务不是可采用的分镜视频")
+        if job.status != JobStatus.COMPLETED or not job.output_path:
+            raise ValueError("只能采用已经完成的视频版本")
+        if not resolve_media_path(job.output_path).is_file():
+            raise ValueError("该生成版本的视频文件已不存在")
+        shot = self.store.get_shot(job.shot_id)
+        if shot is None or shot.project_id != project_id:
+            raise KeyError("Shot not found")
+        last_frame_asset_id = self._ensure_job_last_frame(job, shot)
+        artifacts = job.input_snapshot.get("output_artifacts")
+        if not isinstance(artifacts, dict):
+            artifacts = {}
+        artifacts["last_frame_asset_id"] = last_frame_asset_id
+        job.input_snapshot["output_artifacts"] = artifacts
+        self.store.save_job(job)
+
+        shot.selected_video_job_id = job.id
+        shot.video_path = job.output_path
+        shot.last_frame_asset_id = last_frame_asset_id
+        shot.video_status = "completed"
+        shot.version += 1
+        saved = self.store.save_shot(shot)
+        project = self.projects.require_project(project_id)
+        if all(item.video_path for item in self.store.list_shots(project_id)):
+            project.status = ProjectStatus.CLIPS_REVIEW
+            self.store.save_project(project)
+        return saved
+
+    @staticmethod
+    def _set_job_status_on_shot(shot: Shot, status: str) -> None:
+        """Keep an adopted output ready while a new candidate is rendering."""
+        if shot.selected_video_job_id and shot.video_path:
+            shot.video_status = "completed"
+        else:
+            shot.video_status = status
+
+    def _bind_completed_output(
+        self,
+        shot: Shot,
+        job: RenderJob,
+        *,
+        last_frame_asset_id: str | None = None,
+        replace_tail: bool = False,
+    ) -> None:
+        """Use a completed candidate automatically unless the shot is locked."""
+        if not shot.selected_video_job_id:
+            shot.video_path = job.output_path
+            if replace_tail:
+                shot.last_frame_asset_id = last_frame_asset_id
+        self._set_job_status_on_shot(shot, "completed")
+
     async def start(self) -> None:
         if self._task and not self._task.done():
             return
@@ -212,7 +319,7 @@ class RenderQueue:
                 },
             )
             jobs.append(self.store.save_job(job))
-            shot.video_status = "queued"
+            self._set_job_status_on_shot(shot, "queued")
             self.store.save_shot(shot)
         if jobs:
             project.status = ProjectStatus.RENDERING
@@ -303,7 +410,7 @@ class RenderQueue:
                 },
             )
             jobs.append(self.store.save_job(job))
-            shot.video_status = "queued"
+            self._set_job_status_on_shot(shot, "queued")
             self.store.save_shot(shot)
         if jobs:
             project.status = ProjectStatus.RENDERING
@@ -327,7 +434,7 @@ class RenderQueue:
         if job.shot_id:
             shot = self.store.get_shot(job.shot_id)
             if shot:
-                shot.video_status = "cancelled"
+                self._set_job_status_on_shot(shot, "cancelled")
                 self.store.save_shot(shot)
         return job
 
@@ -373,7 +480,10 @@ class RenderQueue:
                 if job.shot_id:
                     shot = self.store.get_shot(job.shot_id)
                     if shot:
-                        shot.video_status = "failed" if job.status == JobStatus.FAILED else job.status.value
+                        self._set_job_status_on_shot(
+                            shot,
+                            "failed" if job.status == JobStatus.FAILED else job.status.value,
+                        )
                         self.store.save_shot(shot)
                 if isinstance(exc, httpx.TransportError) or (
                     job.status == JobStatus.QUEUED and job.provider == "ark_seedance"
@@ -769,8 +879,10 @@ class RenderQueue:
         job.input_snapshot["audio_delivery"] = audio_delivery
         self.store.save_job(job)
 
-        shot.video_path = job.output_path
-        shot.video_status = "completed"
+        # The user may adopt an older card while this candidate is rendering.
+        # Reload before binding so that late completion cannot overwrite it.
+        shot = self.store.get_shot(shot.id) or shot
+        self._bind_completed_output(shot, job)
         self.store.save_shot(shot)
         all_shots = self.store.list_shots(job.project_id)
         if all(item.video_status == "completed" for item in all_shots):
@@ -1434,7 +1546,8 @@ class RenderQueue:
                 current.completed_at = utc_now()
                 current.error = "任务已取消"
                 self.store.save_job(current)
-                shot.video_status = "cancelled"
+                shot = self.store.get_shot(shot.id) or shot
+                self._set_job_status_on_shot(shot, "cancelled")
                 self.store.save_shot(shot)
                 return
             if time.monotonic() > deadline:
@@ -1454,22 +1567,27 @@ class RenderQueue:
         destination = self.projects.project_dir(job.project_id) / "videos" / shot.id / f"{job.id}.mp4"
         await self.seedance_client.download(self.seedance_client.video_url(result), destination)
         last_frame_url = self.seedance_client.last_frame_url(result)
+        last_frame_path = (
+            self.projects.project_dir(job.project_id)
+            / "images"
+            / "last_frames"
+            / f"{shot.id}-{job.id}.png"
+        )
         if last_frame_url:
-            last_frame_path = (
-                self.projects.project_dir(job.project_id)
-                / "images"
-                / "last_frames"
-                / f"{shot.id}-{job.id}.png"
-            )
             await self.seedance_client.download(last_frame_url, last_frame_path)
-            last_frame_asset = self.projects.register_existing_asset(
-                job.project_id,
-                last_frame_path,
-                role=AssetRole.LAST_FRAME,
-                name=f"镜头 {shot.ordinal} · Seedance 尾帧",
-                description="Seedance return_last_frame 产物，可作为下一镜连续续接的严格首帧",
-            )
-            shot.last_frame_asset_id = last_frame_asset.id
+        else:
+            await asyncio.to_thread(self._extract_last_frame, destination, last_frame_path)
+        last_frame_asset = self.projects.register_existing_asset(
+            job.project_id,
+            last_frame_path,
+            role=AssetRole.LAST_FRAME,
+            name=f"镜头 {shot.ordinal} · Seedance 尾帧",
+            description=(
+                "Seedance return_last_frame 产物，可作为下一镜连续续接的严格首帧"
+                if last_frame_url
+                else "从 Seedance 成片提取，可作为下一镜连续续接的严格首帧"
+            ),
+        )
         elapsed = time.monotonic() - started
         job = self.store.get_job(job.id) or job
         job.status = JobStatus.COMPLETED
@@ -1481,12 +1599,21 @@ class RenderQueue:
         job.input_snapshot["seedance_result"] = {
             "usage": result.get("usage", {}),
             "last_frame_url": last_frame_url,
-            "last_frame_asset_id": shot.last_frame_asset_id,
+            "last_frame_asset_id": last_frame_asset.id,
             "completed_at": utc_now(),
         }
+        job.input_snapshot["output_artifacts"] = {
+            "last_frame_asset_id": last_frame_asset.id,
+        }
         self.store.save_job(job)
-        shot.video_path = job.output_path
-        shot.video_status = "completed"
+        # Selection can change while Ark is rendering; honor the latest lock.
+        shot = self.store.get_shot(shot.id) or shot
+        self._bind_completed_output(
+            shot,
+            job,
+            last_frame_asset_id=last_frame_asset.id,
+            replace_tail=True,
+        )
         self.store.save_shot(shot)
         if all(item.video_status == "completed" for item in self.store.list_shots(job.project_id)):
             project.status = ProjectStatus.CLIPS_REVIEW

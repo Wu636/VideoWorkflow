@@ -26,6 +26,8 @@ from src.video_workflow.domain import (
     SeedanceReferenceMode,
     Shot,
     ShotContinuityMode,
+    ShotSplitPreview,
+    ShotSplitSegment,
     StyleProfile,
     VoiceEvent,
 )
@@ -46,7 +48,7 @@ from src.video_workflow.generators.image import (
 )
 from src.video_workflow.generators.llm import _build_user_suggestions_text
 from src.video_workflow.media_paths import resolve_media_path
-from src.video_workflow.services.projects import ProjectService, _normalize_project_analysis_payload
+from src.video_workflow.services.projects import ProjectService, ShotVersionConflictError, _normalize_project_analysis_payload
 from src.video_workflow.services.render_queue import RenderQueue
 from src.video_workflow.services.audio import DialogueAudioService
 from src.video_workflow.storage import ProjectStore
@@ -358,6 +360,145 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         saved_project = self.service.require_project(project.id)
         self.assertEqual([profile.id for profile in saved_project.scene_profiles], [parallel_profile.id])
 
+    def test_split_preview_and_confirm_replaces_only_source_shot(self) -> None:
+        project = self.service.create_project(ProjectBrief(
+            title="拆分过载镜头",
+            story="阿明发现电池冒烟，拔掉插头后退到门外。",
+            target_duration_seconds=18,
+        ))
+        character = CharacterProfile(name="阿明", description="短发青年", wardrobe="蓝色工装")
+        profile = SceneProfile(name="客厅", description="木地板，墙边插座", source_shot_ids=[])
+        project.characters = [character]
+        project.scene_profiles = [profile]
+        self.store.save_project(project)
+        first = self.store.save_shot(Shot(project_id=project.id, ordinal=1, title="开场", narrative="阿明进入客厅"))
+        source = self.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=2,
+            title="发现险情并处置",
+            narrative="阿明发现电池冒烟，拔掉插头后退到门外",
+            duration_seconds=8,
+            scene_profile_ids=[profile.id],
+            scene_profile_id=profile.id,
+            use_scene_profile=True,
+            character_ids=[character.id],
+            keyframe_asset_id="asset_old_keyframe",
+            reference_asset_ids=["asset_old_keyframe"],
+            image_path="/tmp/old-first.png",
+            video_path="/tmp/old-video.mp4",
+            selected_video_job_id="job_old_video",
+            image_status="completed",
+            video_status="completed",
+        ))
+        profile.source_shot_ids = [source.id]
+        self.store.save_project(project)
+        tail = self.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=3,
+            title="收尾",
+            narrative="阿明在门外报警",
+            video_path="/tmp/tail.mp4",
+            video_status="completed",
+        ))
+        first_updated_at = first.updated_at
+        captured: dict[str, str] = {}
+
+        class FakeLLM:
+            async def generate_json(self, system: str, prompt: str) -> dict[str, object]:
+                captured["system"] = system
+                captured["prompt"] = prompt
+                return {
+                    "rationale": "把发现和处置拆为两个单一动作",
+                    "segments": [
+                        {
+                            "title": "发现冒烟",
+                            "duration_seconds": 3,
+                            "narrative": "阿明发现电池冒烟",
+                            "scene_description": "客厅中，阿明望向墙边电池",
+                            "scene_profile_name": "客厅",
+                            "character_names": ["阿明"],
+                            "shot_size": "中景",
+                            "camera_angle": "平视",
+                            "camera_motion": "缓慢推近",
+                            "subject_motion": "阿明看到冒烟后停下",
+                            "visual_beats": [{"start_seconds": 0, "end_seconds": 3, "subject_action": "阿明发现冒烟"}],
+                        },
+                        {
+                            "title": "断电后退",
+                            "duration_seconds": 5,
+                            "narrative": "阿明拔掉插头并退到门外",
+                            "scene_description": "阿明的手停在插头上方",
+                            "scene_profile_name": "客厅",
+                            "character_names": ["阿明"],
+                            "shot_size": "近景",
+                            "camera_angle": "俯拍",
+                            "camera_motion": "固定镜头",
+                            "subject_motion": "拔掉插头后快速后退",
+                            "visual_beats": [{"start_seconds": 0, "end_seconds": 5, "subject_action": "拔掉插头后退"}],
+                        },
+                    ],
+                }
+
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()):
+            preview = asyncio.run(self.service.preview_shot_split(
+                project.id,
+                source.id,
+                "动作拆开，总时长不变",
+                2,
+            ))
+
+        self.assertIn("动作拆开", captured["prompt"])
+        self.assertEqual(preview.source_shot_version, source.version)
+        self.assertEqual(preview.proposed_duration_seconds, 8)
+        self.assertEqual([shot.id for shot in self.store.list_shots(project.id)], [first.id, source.id, tail.id])
+
+        preview.segments[0].title = "用户修改的发现镜头"
+        preview.segments[0].duration_seconds = 3.5
+        created = asyncio.run(self.service.confirm_shot_split(project.id, source.id, preview, []))
+        board = self.store.list_shots(project.id)
+
+        self.assertEqual([shot.id for shot in board], [first.id, created[0].id, created[1].id, tail.id])
+        self.assertEqual([shot.ordinal for shot in board], [1, 2, 3, 4])
+        self.assertEqual(board[0].updated_at, first_updated_at)
+        self.assertEqual(board[-1].video_path, "/tmp/tail.mp4")
+        self.assertEqual(board[-1].video_status, "completed")
+        self.assertIsNone(self.store.get_shot(source.id))
+        self.assertEqual(created[0].title, "用户修改的发现镜头")
+        self.assertEqual(created[0].duration_seconds, 3.5)
+        self.assertTrue(all(shot.id != source.id for shot in created))
+        self.assertTrue(all(shot.keyframe_asset_id is None for shot in created))
+        self.assertTrue(all(shot.selected_video_job_id is None for shot in created))
+        self.assertTrue(all(shot.image_path is None and shot.video_path is None for shot in created))
+        self.assertTrue(all(shot.image_status == "pending" and shot.video_status == "pending" for shot in created))
+        self.assertTrue(all("asset_old_keyframe" not in shot.reference_asset_ids for shot in created))
+        self.assertTrue(all(character.id in shot.character_ids for shot in created))
+        self.assertTrue(all(shot.visual_prompt and shot.keyframe_prompt and shot.video_prompt and shot.seedance_prompt for shot in created))
+        saved_profile = self.service.require_project(project.id).scene_profiles[0]
+        self.assertNotIn(source.id, saved_profile.source_shot_ids)
+        self.assertEqual(saved_profile.source_shot_ids, [shot.id for shot in created])
+
+    def test_split_confirmation_rejects_stale_preview(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="过期预览", story="人物连续完成两个动作"))
+        source = self.store.save_shot(Shot(project_id=project.id, ordinal=1, narrative="先开门，再落座", duration_seconds=6))
+        preview = ShotSplitPreview(
+            source_shot_id=source.id,
+            source_shot_version=source.version,
+            source_ordinal=source.ordinal,
+            original_duration_seconds=source.duration_seconds,
+            proposed_duration_seconds=6,
+            segments=[
+                ShotSplitSegment(title="开门", duration_seconds=3, narrative="人物开门"),
+                ShotSplitSegment(title="落座", duration_seconds=3, narrative="人物落座"),
+            ],
+        )
+        source.narrative = "页面之外已修改"
+        source.version += 1
+        self.store.save_shot(source)
+
+        with self.assertRaisesRegex(ShotVersionConflictError, "新的保存结果"):
+            asyncio.run(self.service.confirm_shot_split(project.id, source.id, preview, []))
+        self.assertEqual([shot.id for shot in self.store.list_shots(project.id)], [source.id])
+
     def test_scene_profile_analysis_rejects_obsolete_storyboard_mapping(self) -> None:
         project = self.service.create_project(ProjectBrief(title="并行场景", story="谈话", target_duration_seconds=8))
         original = Shot(project_id=project.id, ordinal=1, narrative="旧分镜")
@@ -485,8 +626,10 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             self.service._stable_seed(project.id, character.id, appearance.id),
         )
         self.assertEqual(captured["aspect_ratio"], "16:9")
-        self.assertIn("左侧约占画面三分之一：大尺寸正脸近照", str(captured["prompt"]))
+        self.assertIn("大尺寸正脸近照", str(captured["prompt"]))
         self.assertIn("全身正面、标准侧面、全身背面", str(captured["prompt"]))
+        self.assertIn("动物使用自然四足站姿", str(captured["prompt"]))
+        self.assertIn("固定品种", str(captured["prompt"]))
         self.assertIn("眼神更锐利，衣料增加磨损细节", str(captured["prompt"]))
         saved_project = self.service.require_project(project.id)
         saved_character = next(item for item in saved_project.characters if item.id == character.id)
@@ -612,6 +755,76 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertNotIn(reference.id, saved_by_name["弟弟"].reference_asset_ids)
         self.assertNotIn(reference.id, saved_by_name["站长"].reference_asset_ids)
         self.assertTrue(all("禁止复制参考图人物身份" in str(call["prompt"]) for call in image_calls))
+
+    def test_project_style_regeneration_uses_other_series_character_and_replaces_bad_binding(self) -> None:
+        zhang = CharacterProfile(name="张小差", description="年轻阴差", wardrobe="炭黑工装")
+        elder = CharacterProfile(name="王大爷", description="六十五岁农村老人", wardrobe="藏蓝中山装")
+        project = self.service.create_project(
+            ProjectBrief(
+                title="同系列新角色",
+                story="张小差劝王大爷不要把电动车推进家里充电。",
+                visual_style="数字手绘，二次元写实融合渲染，人物为二次元萌感+中式写实特征",
+            )
+        )
+        project.series_id = "series_test"
+        zhang_path = self.root / "zhang-style-anchor.png"
+        zhang_path.write_bytes(b"zhang")
+        zhang_asset = self.service.register_existing_asset(project.id, zhang_path, AssetRole.CHARACTER, "张小差四视图")
+        zhang_asset.character_id = zhang.id
+        zhang_asset.tags = ["series:series_test"]
+        zhang_asset.approved = True
+        self.store.save_asset(zhang_asset)
+        old_path = self.root / "elder-photoreal.png"
+        old_path.write_bytes(b"old")
+        old_asset = self.service.register_existing_asset(project.id, old_path, AssetRole.CHARACTER, "王大爷错误写实图")
+        old_asset.character_id = elder.id
+        old_asset.approved = True
+        self.store.save_asset(old_asset)
+        style_path = self.root / "generic-style.png"
+        style_path.write_bytes(b"style")
+        style_asset = self.service.register_existing_asset(project.id, style_path, AssetRole.STYLE, "普通风格图")
+        project.style_profile = StyleProfile(
+            name="中式轻喜剧插画",
+            medium="数字手绘，二次元写实融合渲染",
+            texture="人物为二次元萌感+中式写实特征，道具有真实磨损",
+            reference_asset_ids=[style_asset.id],
+            approved=True,
+        )
+        zhang.reference_asset_ids = [zhang_asset.id]
+        elder.reference_asset_ids = [old_asset.id]
+        project.characters = [zhang, elder]
+        self.store.save_project(project)
+        captured: dict[str, object] = {}
+
+        class FakeImageGenerator:
+            async def generate_image(self, scene: Scene, output_dir: str, reference_images: str | None, **kwargs: object) -> str:
+                captured["references"] = reference_images
+                captured["prompt"] = scene.visual_prompt
+                captured["style"] = kwargs.get("image_style")
+                output = Path(output_dir) / "elder-stylized.png"
+                output.write_bytes(b"new")
+                return str(output)
+
+        with patch("src.video_workflow.services.projects.create_image_generator", return_value=FakeImageGenerator()):
+            created = asyncio.run(self.service.generate_character_references(
+                project.id,
+                [elder.id],
+                reference_strategy="project_style",
+            ))
+
+        self.assertEqual(
+            str(captured["references"]).split(","),
+            [str(zhang_path.resolve()), str(style_path.resolve())],
+        )
+        self.assertNotIn(str(old_path.resolve()), str(captured["references"]))
+        self.assertIn("最高优先级画风锚点", str(captured["prompt"]))
+        self.assertIn("禁止真人照片", str(captured["prompt"]))
+        self.assertNotIn("二次元写实融合", str(captured["style"]))
+        self.assertIn("二维手绘动画插画", str(captured["style"]))
+        latest = self.service.require_project(project.id)
+        saved_elder = next(character for character in latest.characters if character.id == elder.id)
+        self.assertEqual(saved_elder.reference_asset_ids, [created[0].id])
+        self.assertIsNotNone(self.store.get_asset(old_asset.id))
 
     def test_manual_storyboard_count_mismatch_is_not_retried_or_truncated(self) -> None:
         project = self.service.create_project(
@@ -1014,10 +1227,13 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         project = self.service.create_project(ProjectBrief(title="continuity", story="三分钟谈话"))
         scene_path = self.root / "interview-room.png"
         tail_path = self.root / "tail.png"
+        keyframe_path = self.root / "old-keyframe.png"
         scene_path.write_bytes(b"scene")
         tail_path.write_bytes(b"tail")
+        keyframe_path.write_bytes(b"old-keyframe")
         scene_asset = self.service.register_existing_asset(project.id, scene_path, AssetRole.SCENE, "谈话室母版")
         tail_asset = self.service.register_existing_asset(project.id, tail_path, AssetRole.LAST_FRAME, "上一镜尾帧")
+        keyframe_asset = self.service.register_existing_asset(project.id, keyframe_path, AssetRole.KEYFRAME, "本镜旧首帧")
         profile = SceneProfile(
             name="谈话室",
             description="米白墙面、深木桌、固定门窗位置",
@@ -1047,6 +1263,14 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         second.use_scene_profile = True
         with_scene = self.service.seedance_reference_assets(second, assets, project)
         self.assertEqual([asset.id for asset in with_scene], [tail_asset.id, scene_asset.id])
+
+        # Even when the user previously made a manual full-modal selection,
+        # continuous mode replaces the stale current-shot keyframe with the
+        # source shot's adopted tail while preserving the other selected refs.
+        second.keyframe_asset_id = keyframe_asset.id
+        second.video_reference_asset_ids = [keyframe_asset.id, scene_asset.id]
+        manual_continuous = self.service.seedance_reference_assets(second, assets, project)
+        self.assertEqual([asset.id for asset in manual_continuous], [tail_asset.id, scene_asset.id])
         prompt = self.service.compile_seedance_prompt(project, second, assets)
         self.assertIn("图片1是上一镜真实尾帧", prompt)
         self.assertIn("图片2", prompt)
@@ -1771,6 +1995,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             visual_prompt="办公室里的双人中景",
             reference_asset_ids=[character.id],
             keyframe_asset_id=previous.id,
+            video_reference_asset_ids=[previous.id, character.id],
             image_path=str(previous_path),
             image_status="completed",
         )
@@ -1804,6 +2029,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             )
             iterated_asset = self.store.get_asset(iterated[0].keyframe_asset_id or "")
             self.assertIsNotNone(iterated_asset)
+            self.assertNotIn(previous.id, iterated[0].video_reference_asset_ids or [])
+            self.assertIn(iterated_asset.id, iterated[0].video_reference_asset_ids or [])  # type: ignore[union-attr]
             current_path = Path(iterated_asset.path)  # type: ignore[union-attr]
             fresh = asyncio.run(
                 self.service.generate_keyframes(
@@ -1824,6 +2051,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(fresh_references, [str(character_path.resolve())])
         self.assertNotIn(str(current_path.resolve()), fresh_references)
         self.assertEqual(fresh[0].image_status, "completed")
+        self.assertNotIn(iterated_asset.id, fresh[0].video_reference_asset_ids or [])  # type: ignore[union-attr]
+        self.assertIn(fresh[0].keyframe_asset_id, fresh[0].video_reference_asset_ids or [])
 
     def test_failed_keyframe_regeneration_keeps_user_suggestion_for_retry(self) -> None:
         project = self.service.create_project(ProjectBrief(title="retry", story="story"))
@@ -2007,6 +2236,21 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["characters"][0]["name"], "林砚")
         self.assertEqual(payload["characters"][0]["description"], "青年；短发")
         self.assertEqual(payload["analysis_notes"], ["确认安全带型号", "确认现场天气"])
+
+    def test_brief_analysis_turns_flagged_animal_into_editable_character_default(self) -> None:
+        payload = _normalize_project_analysis_payload(
+            {
+                "characters": [],
+                "analysis_notes": ["需确认剧情中出现的老黄狗是否需要单独设定形象"],
+            },
+            4,
+        )
+        self.assertEqual(payload["characters"][0]["name"], "老黄狗")
+        self.assertIn("固定形象", payload["characters"][0]["description"])
+        self.assertEqual(
+            payload["analysis_notes"],
+            ["已默认将老黄狗作为独立固定形象建档；如不需要，可在上方角色草稿中删除。"],
+        )
 
     def test_character_reference_backfill_merges_with_latest_project_state(self) -> None:
         project = self.service.create_project(ProjectBrief(title="parallel backfill", story="甲与乙同场", target_duration_seconds=30))

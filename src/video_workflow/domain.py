@@ -63,6 +63,14 @@ class SeedanceReferenceMode(str, Enum):
     MULTIMODAL_REFERENCE = "multimodal_reference"
 
 
+class FirstFrameCompleteness(str, Enum):
+    """How much of the shot's required visual context is already in frame zero."""
+
+    UNKNOWN = "unknown"
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+
+
 class AssetType(str, Enum):
     IMAGE = "image"
     VIDEO = "video"
@@ -73,6 +81,7 @@ class AssetType(str, Enum):
 
 class AssetRole(str, Enum):
     CHARACTER = "character"
+    PROP = "prop"
     STYLE = "style"
     SCENE = "scene"
     KEYFRAME = "keyframe"
@@ -312,6 +321,40 @@ class ScriptRewriteDraft(BaseModel):
     feasibility_notes: list[str] = Field(default_factory=list)
 
 
+class ShotSplitSegment(BaseModel):
+    """Editable AI proposal for one segment of a split shot."""
+
+    title: str = ""
+    duration_seconds: float = Field(default=6.0, ge=0.25, le=15.0)
+    narrative: str = ""
+    dialogue: str = ""
+    scene_description: str = ""
+    scene_profile_name: str = ""
+    scene_profile_description: str = ""
+    scene_continuity_notes: str = ""
+    character_names: list[str] = Field(default_factory=list)
+    shot_size: str = "中景"
+    camera_angle: str = "平视"
+    lens: str = "标准镜头"
+    camera_motion: str = "固定镜头"
+    subject_motion: str = ""
+    transition: str = "硬切"
+    audio_design: str = ""
+    visual_beats: list[VisualBeat] = Field(default_factory=list)
+    voice_events: list[VoiceEvent] = Field(default_factory=list)
+    text_policy: Literal["none", "post_overlay", "reference_locked"] = "post_overlay"
+
+
+class ShotSplitPreview(BaseModel):
+    source_shot_id: str
+    source_shot_version: int = Field(ge=1)
+    source_ordinal: int = Field(ge=1)
+    original_duration_seconds: float = Field(ge=0.25, le=15.0)
+    proposed_duration_seconds: float = Field(ge=0.5, le=60.0)
+    rationale: str = ""
+    segments: list[ShotSplitSegment] = Field(min_length=2, max_length=4)
+
+
 class Shot(BaseModel):
     id: str = Field(default_factory=lambda: new_id("shot"))
     project_id: str
@@ -325,14 +368,18 @@ class Shot(BaseModel):
     dialogue_turns: list[DialogueTurn] = Field(default_factory=list)
     duration_seconds: float = Field(default=5.0, ge=0.25, le=15.0)
     scene_description: str = ""
+    # Ordered scene anchors. The first item owns frame zero; the optional
+    # second item owns the destination after an in-shot location transition.
+    # ``scene_profile_id`` remains as the legacy/start-scene alias.
+    scene_profile_ids: list[str] = Field(default_factory=list, max_length=2)
     scene_profile_id: str | None = None
     use_scene_profile: bool = False
     continuity_mode: ShotContinuityMode = ShotContinuityMode.INDEPENDENT
     continuity_source_shot_id: str | None = None
-    # Full multimodal reference is the project-wide default: character sheets
-    # are only useful when the video request actually sends them alongside the
-    # composition/scene anchors. Strict first-frame remains an explicit opt-in.
-    seedance_reference_mode: SeedanceReferenceMode = SeedanceReferenceMode.MULTIMODAL_REFERENCE
+    # ``auto`` uses the user-confirmed first-frame completeness below. Existing
+    # records with an explicit multimodal/strict choice keep that choice.
+    seedance_reference_mode: SeedanceReferenceMode = SeedanceReferenceMode.AUTO
+    first_frame_completeness: FirstFrameCompleteness = FirstFrameCompleteness.UNKNOWN
     character_ids: list[str] = Field(default_factory=list)
     # character_id -> appearance_profile_id. Empty means use the character's
     # base/default look. This lets one person age, change body state or wardrobe
@@ -376,9 +423,17 @@ class Shot(BaseModel):
     generation_mode: GenerationMode = GenerationMode.AUTO
     resolved_generation_mode: GenerationMode | None = None
     ref_image_size: str = "match"
+    # ``None`` keeps automatic reference resolution. An explicit list (also an
+    # empty list) is a user-owned allowlist for the corresponding provider call.
+    keyframe_reference_asset_ids: list[str] | None = None
+    video_reference_asset_ids: list[str] | None = None
     reference_asset_ids: list[str] = Field(default_factory=list)
     keyframe_asset_id: str | None = None
     last_frame_asset_id: str | None = None
+    # A manually adopted render stays authoritative across later re-rolls.
+    # When unset, the most recently completed render remains the automatic
+    # working version for backwards-compatible projects.
+    selected_video_job_id: str | None = None
     image_path: str | None = None
     video_path: str | None = None
     image_status: str = "pending"
@@ -426,11 +481,20 @@ class Shot(BaseModel):
         intended static opening frame, so expose it as ``keyframe_prompt`` when
         loading those records.  Once a shot is saved the new field is persisted.
         """
-        if isinstance(value, dict) and "keyframe_prompt" not in value:
+        if isinstance(value, dict):
             migrated = dict(value)
-            migrated["keyframe_prompt"] = str(
-                migrated.get("scene_description") or migrated.get("visual_prompt") or ""
-            )
+            if "keyframe_prompt" not in migrated:
+                migrated["keyframe_prompt"] = str(
+                    migrated.get("scene_description") or migrated.get("visual_prompt") or ""
+                )
+            raw_scene_ids = migrated.get("scene_profile_ids")
+            scene_ids = [str(item) for item in raw_scene_ids or [] if item]
+            legacy_scene_id = migrated.get("scene_profile_id")
+            if legacy_scene_id and legacy_scene_id not in scene_ids:
+                scene_ids.insert(0, str(legacy_scene_id))
+            scene_ids = list(dict.fromkeys(scene_ids))[:2]
+            migrated["scene_profile_ids"] = scene_ids
+            migrated["scene_profile_id"] = scene_ids[0] if scene_ids else None
             return migrated
         return value
 

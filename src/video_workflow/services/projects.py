@@ -22,7 +22,9 @@ from src.video_workflow.domain import (
     CharacterAppearanceProfile,
     CharacterProfile,
     DialogueTurn,
+    FirstFrameCompleteness,
     GenerationMode,
+    JobStatus,
     Project,
     ProjectAnalysisDraft,
     ProjectBrief,
@@ -35,6 +37,8 @@ from src.video_workflow.domain import (
     ScriptRewriteDraft,
     Shot,
     ShotContinuityMode,
+    ShotSplitPreview,
+    ShotSplitSegment,
     StyleAnalysisDraft,
     StyleProfile,
     VisualBeat,
@@ -61,12 +65,18 @@ logger = logging.getLogger(__name__)
 SEEDANCE_PROMPT_VERSION = "seedance-2.0-director-v6"
 H3_DIRECTOR_VERSION = "h3-director-v7"
 
-CHARACTER_REFERENCE_SHEET_LAYOUT = """生成一张横向 16:9 的单一角色四视图设定板，画面严格只呈现同一个角色的四个视图，不是四个不同人物：
-1. 左侧约占画面三分之一：大尺寸正脸近照，人物直视镜头，完整呈现发型、脸型、五官、肤质和颈肩服装细节；
-2. 右侧约占画面三分之二：依次并排放置同一角色的全身正面、标准侧面、全身背面，三者均从头顶到鞋底完整入画，站姿中性，比例、身高和基线一致；
-3. 四个视图必须保持完全一致的身份、年龄、脸型、五官、发型、体型、服装、配饰、材质与配色，侧面和背面需要准确补全对应结构；
+CHARACTER_REFERENCE_SHEET_LAYOUT = """生成一张横向 16:9 的单一角色四视图设定板，角色可以是人物、动物或拟人角色；画面严格只呈现同一个角色的四个视图，不是四个不同角色：
+1. 左侧约占画面三分之一：人物使用大尺寸正脸近照，动物使用大尺寸正面头部近照；完整呈现人物的发型、脸型、五官与颈肩细节，或动物的品种特征、耳形、口鼻、眼睛、毛色与独特斑纹；
+2. 右侧约占画面三分之二：依次并排放置同一角色的全身正面、标准侧面、全身背面，三者均从头顶到鞋底或足爪完整入画；人物使用中性站姿，动物使用自然四足站姿，三个全身视图比例、体型和基线一致；
+3. 四个视图必须保持完全一致的身份、年龄或物种、脸型或头部结构、发型或毛发、体型、服装、项圈及其他配饰、材质与配色；动物必须固定品种、毛长、毛色分区、斑纹位置、耳尾形态和体型，侧面与背面准确补全对应结构；
 4. 使用纯净统一的中性影棚背景和均匀柔光，不添加场景、动作叙事、边框、分隔线、文字标签、尺寸标注、Logo 或水印；
-5. 保证版面整洁、各视图互不遮挡，不裁切头顶、身体或鞋子，不增加其他角度、表情小图、道具特写或第二个角色。"""
+5. 保证版面整洁、各视图互不遮挡，不裁切头顶、身体、鞋子或足爪，不增加其他角度、表情小图、道具特写或第二个角色。"""
+
+STYLIZED_2D_CHARACTER_RULE = (
+    "人物和动物必须保持明显的二维手绘动画造型：清晰手绘勾线、概括化五官与皮肤、动画化头身比例、"
+    "平涂结合柔和局部厚涂；禁止真人照片、摄影棚人像、毛孔级皮肤、照片级写实人物、3D/PBR/CGI 人物。"
+    "生活道具可以保留真实结构、磨损和材质细节，但不得把人物渲染成真人。"
+)
 
 
 def _analysis_text(value: object) -> str:
@@ -159,8 +169,6 @@ def _normalize_project_analysis_payload(payload: dict, fallback_count: int) -> d
                     ),
                 }
             )
-    normalized["characters"] = characters
-
     notes = payload.get("analysis_notes") or payload.get("notes") or []
     if isinstance(notes, str):
         notes = [
@@ -172,7 +180,39 @@ def _normalize_project_analysis_payload(payload: dict, fallback_count: int) -> d
         notes = [f"{key}：{_analysis_text(value)}" for key, value in notes.items()]
     elif not isinstance(notes, list):
         notes = []
-    normalized["analysis_notes"] = [_analysis_text(item) for item in notes if _analysis_text(item)]
+    normalized_notes = [_analysis_text(item) for item in notes if _analysis_text(item)]
+    known_names = {str(character["name"]).strip().casefold() for character in characters}
+    for index, note in enumerate(normalized_notes):
+        match = re.search(
+            r"(?P<name>[^，。；：]{1,36}?)(?:是否需要|是否要|需不需要)(?:单独|独立)(?:设定|设计)(?:形象|角色)?",
+            note,
+        )
+        if not match:
+            continue
+        name = match.group("name").strip()
+        for prefix in ("需确认", "确认", "剧中出现的", "剧中", "画面中的", "出现的", "中的"):
+            if prefix in name:
+                name = name.rsplit(prefix, 1)[-1].strip()
+        name = re.sub(r"(?:角色|形象)$", "", name).strip()
+        if not name or len(name) > 20:
+            continue
+        if name.casefold() in known_names:
+            normalized_notes[index] = f"已默认将{name}作为独立固定形象建档；如不需要，可在上方角色草稿中删除。"
+            continue
+        characters.append(
+            {
+                "character_id": None,
+                "name": name,
+                "description": f"根据剧本为{name}建立独立、稳定、可跨镜复用的固定形象；请在应用前直接补充或修改识别特征。",
+                "wardrobe": "无服装；如有项圈、挂件或其他固定配饰，请在应用前直接补充。",
+                "voice_description": "无台词；如有叫声或拟人台词，请在应用前直接补充。",
+                "reference_observations": f"由分析确认项自动建档：{note}",
+            }
+        )
+        known_names.add(name.casefold())
+        normalized_notes[index] = f"已默认将{name}作为独立固定形象建档；如不需要，可在上方角色草稿中删除。"
+    normalized["characters"] = characters
+    normalized["analysis_notes"] = normalized_notes
     return normalized
 
 
@@ -187,6 +227,10 @@ class KeyframeBusyError(ValueError):
 
 class ShotVersionConflictError(ValueError):
     """An older whole-shot form must not overwrite newly saved work."""
+
+
+class ShotSplitBusyError(ValueError):
+    """A shot with in-flight generation work must not be replaced."""
 
 
 class SceneReferenceConflictError(ValueError):
@@ -276,7 +320,9 @@ class ProjectService:
             for character in project.characters
         }
         referenced_ids: list[str] = [
-            asset.id for asset in project_assets.values() if asset.role == AssetRole.STYLE
+            asset.id
+            for asset in project_assets.values()
+            if asset.role in {AssetRole.STYLE, AssetRole.PROP}
         ]
         if project.style_profile:
             referenced_ids.extend(project.style_profile.reference_asset_ids)
@@ -340,10 +386,19 @@ class ProjectService:
             )
         }
         if current:
+            current_prop_names = {
+                asset.name.strip().casefold()
+                for asset in snapshots
+                if asset.role == AssetRole.PROP
+            }
             snapshots.extend(
                 asset.model_copy(deep=True)
                 for asset in current.assets
                 if asset.id in preserved_asset_ids
+                or (
+                    asset.role == AssetRole.PROP
+                    and asset.name.strip().casefold() not in current_prop_names
+                )
             )
         series.characters = [
             self._remap_character(character, series_character_ids[character.id], reference_map)
@@ -359,6 +414,10 @@ class ProjectService:
                 update={
                     "palette": "",
                     "lighting": "",
+                    # These fields extracted from one episode often name its
+                    # hero prop or location, so they are not series constants.
+                    "composition": "",
+                    "motion_language": "",
                     "analysis_summary": self.reusable_series_style_text(project),
                     "reference_asset_ids": [
                         reference_map[asset_id]
@@ -420,7 +479,9 @@ class ProjectService:
         if series.style_profile:
             required_asset_ids.update(series.style_profile.reference_asset_ids)
         required_asset_ids.update(
-            asset.id for asset in series.assets if asset.role == AssetRole.STYLE
+            asset.id
+            for asset in series.assets
+            if asset.role in {AssetRole.STYLE, AssetRole.PROP}
         )
         for character in series.characters:
             if character.id not in selected_ids:
@@ -503,7 +564,21 @@ class ProjectService:
         return shot
 
     @staticmethod
-    def project_style_text(project: Project) -> str:
+    def _clarify_stylized_2d_style(value: str) -> str:
+        """Disambiguate style wording that can accidentally request a photo."""
+        text = value.strip()
+        if not text or not any(marker in text for marker in ("二维", "二次元", "手绘", "动画")):
+            return text
+        text = text.replace("二次元写实融合渲染", "二维手绘动画插画渲染")
+        text = text.replace("二次元写实融合", "二维手绘动画插画")
+        text = text.replace("二次元萌感+中式写实特征", "二次元萌感＋中式动画角色特征")
+        text = text.replace("二次元萌感 + 中式写实特征", "二次元萌感＋中式动画角色特征")
+        if STYLIZED_2D_CHARACTER_RULE not in text:
+            text = "；".join(part for part in (text.strip("；"), STYLIZED_2D_CHARACTER_RULE) if part)
+        return text
+
+    @classmethod
+    def project_style_text(cls, project: Project) -> str:
         profile = project.style_profile
         if profile and profile.approved:
             fields = [
@@ -517,11 +592,13 @@ class ProjectService:
                 profile.motion_language,
                 profile.analysis_summary,
             ]
-            return "；".join(item.strip() for item in fields if item and item.strip())
-        return project.brief.visual_style or project.style_bible
+            return cls._clarify_stylized_2d_style(
+                "；".join(item.strip() for item in fields if item and item.strip())
+            )
+        return cls._clarify_stylized_2d_style(project.brief.visual_style or project.style_bible)
 
-    @staticmethod
-    def reusable_series_style_text(project: Project) -> str:
+    @classmethod
+    def reusable_series_style_text(cls, project: Project) -> str:
         """Keep rendering language while leaving location lighting to each episode."""
         profile = project.style_profile
         if profile and profile.approved:
@@ -530,11 +607,11 @@ class ProjectService:
                 profile.medium,
                 profile.texture,
                 profile.camera_language,
-                profile.composition,
-                profile.motion_language,
             )
-            return "；".join(value.strip() for value in values if value and value.strip())
-        return project.brief.visual_style or project.style_bible
+            return cls._clarify_stylized_2d_style(
+                "；".join(value.strip() for value in values if value and value.strip())
+            )
+        return cls._clarify_stylized_2d_style(project.brief.visual_style or project.style_bible)
 
     @classmethod
     def reusable_series_style_bible(cls, project: Project) -> str:
@@ -546,8 +623,8 @@ class ProjectService:
             "不得混入上一集其他地点的环境与光影。"
         )
 
-    @staticmethod
-    def project_rendering_style_text(project: Project) -> str:
+    @classmethod
+    def project_rendering_style_text(cls, project: Project) -> str:
         """Return only visual traits that are safe to reuse in every location.
 
         A style reference is often a finished shot. Its palette, lighting,
@@ -557,25 +634,44 @@ class ProjectService:
         """
         profile = project.style_profile
         if profile and profile.approved:
-            return "；".join(
-                value.strip()
-                for value in (profile.name, profile.medium)
-                if value and value.strip()
+            return cls._clarify_stylized_2d_style(
+                "；".join(
+                    value.strip()
+                    for value in (profile.name, profile.medium)
+                    if value and value.strip()
+                )
             )
-        return project.brief.visual_style or project.style_bible
+        return cls._clarify_stylized_2d_style(project.brief.visual_style or project.style_bible)
+
+    @classmethod
+    def character_rendering_style_text(cls, project: Project) -> str:
+        """Return character medium/texture without scene-specific lighting."""
+        profile = project.style_profile
+        if profile and profile.approved:
+            return cls._clarify_stylized_2d_style(
+                "；".join(
+                    value.strip()
+                    for value in (profile.name, profile.medium, profile.texture)
+                    if value and value.strip()
+                )
+            )
+        return cls._clarify_stylized_2d_style(project.brief.visual_style or project.style_bible)
 
     @classmethod
     def shot_style_text(cls, project: Project, shot: Shot) -> str:
         """Resolve project rendering plus the authoritative local environment."""
-        profile = cls.scene_profile_for_shot(project, shot)
-        if profile is None:
+        profiles = cls.scene_profiles_for_shot(project, shot)
+        if not profiles:
             return cls.project_style_text(project)
+        rendering = cls.project_rendering_style_text(project)
+        if len(profiles) > 1:
+            return rendering
+        profile = profiles[0]
         scene = "；".join(
             value.strip()
             for value in (profile.description, profile.continuity_notes)
             if value and value.strip()
         )
-        rendering = cls.project_rendering_style_text(project)
         return "；".join(
             part for part in (
                 rendering,
@@ -586,11 +682,54 @@ class ProjectService:
 
     @staticmethod
     def scene_profile_for_shot(project: Project, shot: Shot) -> SceneProfile | None:
-        if not shot.use_scene_profile or not shot.scene_profile_id:
-            return None
-        return next(
-            (profile for profile in project.scene_profiles if profile.id == shot.scene_profile_id),
-            None,
+        profiles = ProjectService.scene_profiles_for_shot(project, shot)
+        return profiles[0] if profiles else None
+
+    @staticmethod
+    def scene_profiles_for_shot(
+        project: Project,
+        shot: Shot,
+        *,
+        include_strict: bool = False,
+    ) -> list[SceneProfile]:
+        if not shot.use_scene_profile and not (
+            include_strict and project.scene_consistency_mode == SceneConsistencyMode.STRICT
+        ):
+            return []
+        profile_ids = list(dict.fromkeys([
+            *(shot.scene_profile_ids or []),
+            *([shot.scene_profile_id] if shot.scene_profile_id else []),
+        ]))[:2]
+        if not profile_ids:
+            return []
+        profile_map = {profile.id: profile for profile in project.scene_profiles}
+        return [profile_map[profile_id] for profile_id in profile_ids if profile_id in profile_map]
+
+    @staticmethod
+    def scene_transition_contract(profiles: list[SceneProfile]) -> str:
+        if not profiles:
+            return ""
+        if len(profiles) == 1:
+            profile = profiles[0]
+            return (
+                f"【场景档案｜本镜最高优先级】本镜只使用场景“{profile.name}”："
+                f"{profile.description}；{profile.continuity_notes or '保持空间布局、固定陈设、材质与光线'}；"
+                "环境、光线、色彩和陈设只按此档案执行"
+            )
+        start, destination = profiles[:2]
+        start_text = ProjectService._compact_prompt_text(
+            "；".join(filter(None, [start.description, start.continuity_notes])),
+            300,
+        )
+        destination_text = ProjectService._compact_prompt_text(
+            "；".join(filter(None, [destination.description, destination.continuity_notes])),
+            300,
+        )
+        return (
+            "【跨场景档案｜严格按顺序执行】"
+            f"0.00 秒与转场前只使用起始场景“{start.name}”：{start_text}；"
+            f"角色穿过门、墙、传送通道或完成地点切换后，只使用目标场景“{destination.name}”：{destination_text}；"
+            "两个场景是前后接续关系，禁止在同一阶段混合两套空间、陈设、色彩或光源，禁止把两个房间拼贴在同一画面"
         )
 
     def update_project(self, project: Project) -> Project:
@@ -711,19 +850,14 @@ class ProjectService:
         if not profiles:
             raise ValueError("当前没有可应用的场景档案")
 
-        profile_by_shot: dict[str, SceneProfile] = {}
+        profiles_by_shot: dict[str, list[SceneProfile]] = {}
         for profile in profiles:
             for shot_id in profile.source_shot_ids:
-                previous = profile_by_shot.get(shot_id)
-                if previous and previous.id != profile.id:
-                    raise ValueError(
-                        f"同一镜头同时归属于“{previous.name}”和“{profile.name}”，请先修正场景映射"
-                    )
-                profile_by_shot[shot_id] = profile
+                profiles_by_shot.setdefault(shot_id, []).append(profile)
 
         shots = self.store.list_shots(project_id)
         known_ids = {shot.id for shot in shots}
-        matched_ids = [shot_id for shot_id in profile_by_shot if shot_id in known_ids]
+        matched_ids = [shot_id for shot_id in profiles_by_shot if shot_id in known_ids]
         if not matched_ids:
             raise ValueError("这些场景档案没有匹配当前分镜，请重新识别场景")
         if self._active_keyframes.intersection(matched_ids):
@@ -733,10 +867,11 @@ class ProjectService:
         keyframes_preserved = 0
         ordinals: list[int] = []
         for shot in shots:
-            profile = profile_by_shot.get(shot.id)
-            if profile is None:
+            shot_profiles = profiles_by_shot.get(shot.id, [])[:2]
+            if not shot_profiles:
                 continue
-            shot.scene_profile_id = profile.id
+            shot.scene_profile_ids = [profile.id for profile in shot_profiles]
+            shot.scene_profile_id = shot.scene_profile_ids[0]
             shot.use_scene_profile = True
             h3_preserved += int(bool(shot.h3_prompt_skill_output.strip()))
             keyframes_preserved += int(bool(shot.keyframe_asset_id or shot.image_path))
@@ -1286,7 +1421,8 @@ character_names 使用逗号分隔项目中已有角色名；generation_mode 只
 }}
 
 recommended_shot_count 必须不少于 {minimum}，确保任一镜头不超过 15 秒；6–15 秒镜头要规划每 2–4 秒一次可见变化的动作弧线，不能靠静止等待填时长。角色描述必须具备跨镜头复用的一致性，不要改变参考图中的身份特征。
-characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执行动作或与主要角色互动的人物；即使原文只写“短发男生”“一名女生”“搭档”等未具名角色，也要为其建立独立、稳定、可复用的角色名和形象档案，禁止省略或合并成其他角色。纯远景且不可辨认的群众不建角色档案。
+characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执行动作或与主要角色互动的人物、动物、鬼魂、拟人角色及其他需要跨镜保持外观的可辨认主体。即使原文只写“短发男生”“一名女生”“搭档”“老黄狗”等未具名角色，也要为其建立独立、稳定、可复用的角色名和形象档案。动物的 description 必须固定品种、年龄感、体型、毛长、毛色分区、斑纹位置、耳尾形态、眼睛和项圈等识别特征，wardrobe 填写项圈、牵引物或“无服装”。纯远景且不可辨认的群众不建角色档案。
+凡是涉及“是否需要单独设计形象”的主体，一律先按“需要”处理并写入 characters，不得只放进 analysis_notes。每条 analysis_notes 都必须先把推荐默认方案落实到 characters、style_bible、delivery_notes 或其他对应字段中，再用“已默认……；如需可调整……”说明，禁止只提出问题而不给默认结果。
 """
         provider = settings.BRIEF_ANALYSIS_PROVIDER
         if provider == "auto":
@@ -1407,6 +1543,12 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             raise ValueError("所选素材中没有可分析的画面")
         llm = create_llm_generator(resolve_reference_llm_provider())
         prompt = f"""分析这些客户参考画面，识别可复用的 AI 视频视觉风格。项目剧情仅用于判断适配性，不要凭剧情改写画面观察。
+
+先明确参考画面属于真人摄影、3D/CGI，还是二维手绘/动画/插画。若画面属于二维手绘、动画或插画：
+- medium、texture 和 analysis_summary 必须明确写“二维手绘动画/插画”，准确描述勾线、五官简化程度、头身比例、平涂与厚涂关系；
+- 不得使用含混的“写实融合”“写实人物”“写实皮肤”来描述角色；道具结构、磨损或生活细节较真实时，只能明确限定为“道具写实细节”；
+- negative_constraints 必须明确加入：真人照片、摄影棚肖像、毛孔级皮肤、照片级写实人物、3D/PBR/CGI 人物。
+逐张区分可复用的绘制媒介与当前画面的场景光线；不要把单张画面的地点、主光方向、冷暖色温或陈设写成所有场景都必须遵守的全局规则。
 
 项目：{project.brief.title}
 剧情摘要：{self._compact_prompt_text(project.brief.story, 1200)}
@@ -1575,14 +1717,14 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         self.store.save_project(latest_project)
         # Bind the suggested profile without enabling it. Users opt in per shot
         # or switch the project to strict mode explicitly.
-        profile_by_shot = {
-            shot_id: profile.id
-            for profile in profiles
-            for shot_id in profile.source_shot_ids
-        }
+        profiles_by_shot: dict[str, list[str]] = {}
+        for profile in profiles:
+            for shot_id in profile.source_shot_ids:
+                profiles_by_shot.setdefault(shot_id, []).append(profile.id)
         for shot in current_shots:
             latest_shot = self.require_shot(shot.id)
-            latest_shot.scene_profile_id = profile_by_shot.get(shot.id)
+            latest_shot.scene_profile_ids = profiles_by_shot.get(shot.id, [])[:2]
+            latest_shot.scene_profile_id = latest_shot.scene_profile_ids[0] if latest_shot.scene_profile_ids else None
             latest_shot.use_scene_profile = False
             self.store.save_shot(latest_shot)
         return profiles
@@ -1751,7 +1893,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         reference_asset_ids: list[str] | None = None,
         appearance_profile_id: str | None = None,
         context_reference_asset_ids: list[str] | None = None,
+        reference_strategy: str = "identity",
     ) -> list[Asset]:
+        if reference_strategy not in {"identity", "project_style"}:
+            raise ValueError("未知的角色参考策略")
         project = self.require_project(project_id)
         selected = set(character_ids or [])
         characters = [
@@ -1769,11 +1914,13 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             )
             if appearance_profile_id and appearance is None:
                 continue
-            requested_bound_ids = list(
-                dict.fromkeys(
-                    reference_asset_ids
-                    or (appearance.reference_asset_ids if appearance else character.reference_asset_ids)
-                )
+            target_reference_ids = list(
+                dict.fromkeys(appearance.reference_asset_ids if appearance else character.reference_asset_ids)
+            )
+            requested_bound_ids = (
+                list(dict.fromkeys(reference_asset_ids or target_reference_ids))
+                if reference_strategy == "identity"
+                else []
             )
             bound_ids = [
                 asset_id
@@ -1782,14 +1929,64 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 and assets_by_id[asset_id].type == AssetType.IMAGE
                 and resolve_media_path(assets_by_id[asset_id].path).is_file()
             ]
+            requested_context_ids = (
+                [*(reference_asset_ids or []), *(context_reference_asset_ids or [])]
+                if reference_strategy == "project_style"
+                else list(context_reference_asset_ids or [])
+            )
+            target_owned_ids = set(target_reference_ids)
+            other_character_ids = [
+                asset_id
+                for other in project.characters
+                if other.id != character.id
+                for asset_id in self._valid_character_reference_ids(other, assets_by_id)
+            ]
+            other_character_ids.sort(
+                key=lambda asset_id: (
+                    not any(tag.startswith("series:") for tag in assets_by_id[asset_id].tags),
+                    not assets_by_id[asset_id].approved,
+                )
+            )
+            style_ids = [
+                *(project.style_profile.reference_asset_ids if project.style_profile and project.style_profile.approved else []),
+                *[
+                    asset.id
+                    for asset in assets_by_id.values()
+                    if asset.role == AssetRole.STYLE and asset.type == AssetType.IMAGE
+                ],
+            ]
+            requested_character_context_ids = [
+                asset_id
+                for asset_id in requested_context_ids
+                if asset_id in assets_by_id and assets_by_id[asset_id].role == AssetRole.CHARACTER
+            ]
+            requested_style_context_ids = [
+                asset_id for asset_id in requested_context_ids
+                if asset_id not in requested_character_context_ids
+            ]
+            context_candidates = (
+                [
+                    *requested_character_context_ids,
+                    *other_character_ids,
+                    *requested_style_context_ids,
+                    *style_ids,
+                ]
+                if reference_strategy == "project_style"
+                else requested_context_ids
+            )
             context_ids = [
                 asset_id
-                for asset_id in dict.fromkeys(context_reference_asset_ids or [])
+                for asset_id in dict.fromkeys(context_candidates)
                 if asset_id not in bound_ids
+                and asset_id not in target_owned_ids
                 and asset_id in assets_by_id
+                and not (
+                    reference_strategy == "project_style"
+                    and assets_by_id[asset_id].character_id == character.id
+                )
                 and assets_by_id[asset_id].type == AssetType.IMAGE
                 and resolve_media_path(assets_by_id[asset_id].path).is_file()
-            ]
+            ][:10]
             reference_paths = [
                 str(resolve_media_path(assets_by_id[asset_id].path))
                 for asset_id in [*bound_ids, *context_ids]
@@ -1799,14 +1996,21 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             appearance_description = appearance.description if appearance else character.description
             appearance_wardrobe = appearance.wardrobe if appearance else character.wardrobe
             if bound_ids:
-                reference_instruction = "严格保留目标角色身份参考图中同一人物的脸型、五官、发型和体型，并按档案补齐缺失角度与细节。"
+                reference_instruction = "严格保留目标角色身份参考图中的脸部或头部结构、发型或毛色斑纹、体型及配饰，并按档案补齐缺失角度与细节。"
+            elif any(assets_by_id[asset_id].role == AssetRole.CHARACTER for asset_id in context_ids):
+                reference_instruction = (
+                    "输入参考图中的已确认角色图是本项目/同系列最高优先级画风锚点。严格继承其二维或三维媒介、"
+                    "线条方式、五官简化程度、头身比例、上色方法和材质颗粒，使目标角色看起来属于同一部作品；"
+                    "只继承画风，禁止复制参考图人物身份或动物角色身份，也不复制其脸、发型、服装、年龄或性别。目标角色必须根据剧本档案"
+                    "设计独立且可区分的面部或物种特征、体型、毛发与服装配饰。"
+                )
             elif context_ids:
                 reference_instruction = (
-                    "输入参考图是项目画风或其他已确认角色的上下文参考，只继承统一渲染风格、人体比例、材质精度和年代服饰语言；"
-                    "目标角色必须根据剧本档案设计独立且可区分的新脸、新发型与新服装，禁止复制参考图人物身份。"
+                    "输入参考图是项目画风参考，严格继承其绘制媒介、线条、角色造型比例、上色方式、材质颗粒和年代语言；"
+                    "目标角色必须根据剧本档案设计独立且可区分的身份，禁止复制参考图人物身份或动物角色身份。"
                 )
             else:
-                reference_instruction = "当前没有目标角色身份参考图，根据剧本角色档案设计唯一、稳定、可跨镜复用的人物身份。"
+                reference_instruction = "当前没有目标角色身份参考图，根据剧本角色档案设计唯一、稳定、可跨镜复用的角色身份；若为动物，必须固定品种、毛色斑纹、耳尾形态、体型与项圈等识别特征。"
             suggestion = user_suggestions.strip()
             prompt = (
                 f"【角色四视图设定板版式】\n{CHARACTER_REFERENCE_SHEET_LAYOUT}\n"
@@ -1814,7 +2018,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 f"角色：{character.name}。形象档案：{appearance_label}。剧情时期/状态：{appearance_time}。"
                 f"外貌：{appearance_description}。服装：{appearance_wardrobe}。"
                 f"项目剧情依据：{self._compact_prompt_text(project.brief.story, 1800)}。"
-                f"项目统一风格：{self.project_style_text(project)}。"
+                f"项目角色渲染风格：{self.character_rendering_style_text(project)}。"
                 f"【用户生成建议】\n{suggestion or '无额外建议，严格按角色档案生成。'}\n"
                 "用户建议用于细化角色外貌、服装、气质、材质和表现细节；最终成图仍须严格保持上述四视图数量、顺序和横向排版。"
             )
@@ -1827,7 +2031,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 ",".join(reference_paths) or None,
                 seed=self._stable_seed(project_id, character.id, appearance_profile_id or "base"),
                 character_description="，".join(filter(None, [appearance_description, appearance_wardrobe])),
-                image_style=self.project_style_text(project),
+                image_style=self.character_rendering_style_text(project),
                 aspect_ratio="16:9",
             )
             asset = self.register_existing_asset(
@@ -1839,6 +2043,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             )
             asset.character_id = character.id
             asset.approved = True
+            if reference_strategy == "project_style":
+                asset.tags = list(dict.fromkeys([*asset.tags, "generation:project-style-match"]))
             if appearance:
                 asset.tags = list(dict.fromkeys([*asset.tags, f"appearance:{appearance.id}"]))
             self.store.save_asset(asset)
@@ -1861,13 +2067,17 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 )
                 if latest_appearance is None:
                     raise KeyError(f"Appearance profile not found after generation: {appearance.id}")
-                latest_appearance.reference_asset_ids = list(
-                    dict.fromkeys([*latest_appearance.reference_asset_ids, *bound_ids, asset.id])
+                latest_appearance.reference_asset_ids = (
+                    [asset.id]
+                    if reference_strategy == "project_style"
+                    else list(dict.fromkeys([*latest_appearance.reference_asset_ids, *bound_ids, asset.id]))
                 )
                 latest_appearance.approved = True
             else:
-                latest_character.reference_asset_ids = list(
-                    dict.fromkeys([*latest_character.reference_asset_ids, *bound_ids, asset.id])
+                latest_character.reference_asset_ids = (
+                    [asset.id]
+                    if reference_strategy == "project_style"
+                    else list(dict.fromkeys([*latest_character.reference_asset_ids, *bound_ids, asset.id]))
                 )
             self.store.save_project(latest_project)
             created.append(asset)
@@ -1994,18 +2204,20 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 if character.id not in {item.id for item in missing}
                 for asset_id in references_by_character[character.id]
             ]
+        # Confirmed character sheets are the strongest signal for how a new
+        # cast member should be drawn. Keep them ahead of generic style stills
+        # so provider reference limits never discard the character-style anchor.
         context_ids = list(
-            dict.fromkeys([*requested_context_ids, *style_context_ids, *character_context_ids])
+            dict.fromkeys([*requested_context_ids, *character_context_ids, *style_context_ids])
         )[:10]
         created = await self.generate_character_references(
-            project_id,
-            [character.id for character in missing],
-            user_suggestions,
-            image_provider,
-            image_model,
-            None,
-            None,
-            context_ids,
+            project_id=project_id,
+            character_ids=[character.id for character in missing],
+            user_suggestions=user_suggestions,
+            image_provider=image_provider,
+            image_model=image_model,
+            context_reference_asset_ids=context_ids,
+            reference_strategy="project_style" if mode == "complete_missing" else "identity",
         )
         return {
             "assets": created,
@@ -3020,6 +3232,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         project: Project,
         character_ids: list[str] | None = None,
         appearance_ids: dict[str, str] | None = None,
+        detail_limit: int | None = None,
     ) -> str:
         """Return only appearance/wardrobe details suitable for image models."""
         selected = set(character_ids) if character_ids is not None else None
@@ -3044,6 +3257,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 ]
                 if item
             )
+            if detail_limit is not None:
+                details = ProjectService._compact_prompt_text(details, detail_limit)
             parts.append(f"{character.name}：{details}" if details else character.name)
         return "；".join(parts)
 
@@ -3098,9 +3313,17 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             else ProjectService.project_style_text(project)
         )
         style = ProjectService._compact_prompt_text(style_source, 260)
+        # Compact each subject independently. A single detailed protagonist
+        # must not consume the whole budget and erase later people/pets from
+        # the provider prompt.
         character_text = ProjectService._compact_prompt_text(
-            ProjectService.character_visual_bible(project, character_ids, appearance_ids),
-            360,
+            ProjectService.character_visual_bible(
+                project,
+                character_ids,
+                appearance_ids,
+                detail_limit=260,
+            ),
+            1600,
         )
         composition = "，".join(item.strip("，。 ") for item in [shot_size, camera_angle, lens] if item)
         text_rule = (
@@ -3142,7 +3365,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             for item in [prompt, shot.scene_description, shot.narrative, shot.dialogue]
             if item
         )
-        resolved = ProjectService.resolve_character_ids(
+        resolved_from_text = ProjectService.resolve_character_ids(
             project,
             combined_text,
             speaker_ids=[
@@ -3150,13 +3373,24 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 *(turn.speaker_id for turn in shot.dialogue_turns),
             ],
         )
-        if resolved:
-            return resolved
-
         project_id_set = {character.id for character in project.characters}
         selected = [character_id for character_id in shot.character_ids if character_id in project_id_set]
         if selected and set(selected) != project_id_set:
-            return selected
+            # A per-shot cast subset is an explicit storyboard decision. Keep
+            # every selected subject even when prose uses a role alias such as
+            # “王大爷” while the canonical character card is named “王德发”.
+            return ProjectService.resolve_character_ids(
+                project,
+                combined_text,
+                selected_ids=selected,
+                speaker_ids=[
+                    shot.dialogue_speaker_id,
+                    *(turn.speaker_id for turn in shot.dialogue_turns),
+                ],
+            )
+
+        if resolved_from_text:
+            return resolved_from_text
 
         group_cues = ("众人", "全体", "所有人", "多人", "大家", "他们", "她们")
         if selected and any(cue in combined_text for cue in group_cues):
@@ -3181,7 +3415,31 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         return f"{base}\n\n【本次修改建议｜高优先级】{revision}".strip()
 
     @classmethod
-    def keyframe_reference_assets(
+    def apply_fixed_prop_anchor(cls, prompt: str, references: list[Asset]) -> str:
+        """Keep selected recurring props physically stable across still frames."""
+        prop_assets = [asset for asset in references if asset.role == AssetRole.PROP]
+        base = re.sub(
+            r"\n*【固定物锚点】.*?(?=\n【|\Z)",
+            "",
+            (prompt or "").strip(),
+            flags=re.DOTALL,
+        ).strip()
+        if not prop_assets:
+            return base
+        descriptions = "；".join(
+            f"{cls._compact_prompt_text(asset.name, 80)}："
+            f"{cls._compact_prompt_text(asset.description or '严格按参考图保持外形、结构、材质与尺度', 420)}"
+            for asset in prop_assets
+        )
+        anchor = (
+            f"【固定物锚点】{descriptions}；以对应物品参考图为唯一造型与尺度依据，"
+            "跨镜保持数量、整体尺寸、长宽高比例、结构、颜色、材质、接口和连接线一致；"
+            "必须按场景中的人物、家具和门框呈现可信真实尺度，禁止缩成掌心玩具、便携小盒或随意改变结构"
+        )
+        return f"{base}\n{anchor}".strip()
+
+    @classmethod
+    def _automatic_keyframe_reference_assets(
         cls,
         project: Project,
         shot: Shot,
@@ -3215,16 +3473,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             ]
         }
         selected: list[Asset] = []
-        profile = cls.scene_profile_for_shot(project, shot)
-        if (
-            profile is None
-            and project.scene_consistency_mode == SceneConsistencyMode.STRICT
-            and shot.scene_profile_id
-        ):
-            profile = next(
-                (item for item in project.scene_profiles if item.id == shot.scene_profile_id),
-                None,
-            )
+        profile = next(iter(cls.scene_profiles_for_shot(project, shot, include_strict=True)), None)
         ordered_ids = [
             *(profile.reference_asset_ids if profile else []),
             *allowed_character_ref_list,
@@ -3247,6 +3496,126 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             selected.append(asset)
         return selected
 
+    @classmethod
+    def keyframe_reference_assets(
+        cls,
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+        character_ids: list[str],
+    ) -> list[Asset]:
+        """Return the exact still-image references, honoring a saved allowlist."""
+        if shot.keyframe_reference_asset_ids is None:
+            return cls._automatic_keyframe_reference_assets(
+                project, shot, assets, character_ids
+            )
+        asset_map = {asset.id: asset for asset in assets}
+        return [
+            asset_map[asset_id]
+            for asset_id in dict.fromkeys(shot.keyframe_reference_asset_ids)
+            if asset_id in asset_map and asset_map[asset_id].type == AssetType.IMAGE
+        ]
+
+    @classmethod
+    def keyframe_material_diagnostics(
+        cls,
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+    ) -> dict[str, object]:
+        effective_prompt = (
+            shot.keyframe_prompt.strip()
+            or shot.scene_description.strip()
+            or shot.visual_prompt.strip()
+        )
+        character_ids = cls.keyframe_character_ids(project, shot, effective_prompt)
+        automatic = cls._automatic_keyframe_reference_assets(
+            project, shot, assets, character_ids
+        )
+        selected = cls.keyframe_reference_assets(
+            project, shot, assets, character_ids
+        )
+        selected_ids = {asset.id for asset in selected}
+        automatic_ids = {asset.id for asset in automatic}
+        eligible_roles = {AssetRole.CHARACTER, AssetRole.PROP, AssetRole.SCENE, AssetRole.STYLE}
+        available = [
+            asset
+            for asset in assets
+            if asset.type == AssetType.IMAGE
+            and (
+                asset.role in eligible_roles
+                or asset.id in selected_ids
+                or asset.id in automatic_ids
+            )
+        ]
+
+        warnings: list[str] = []
+        missing_characters: list[str] = []
+        for character in project.characters:
+            if character.id not in character_ids:
+                continue
+            appearance = next(
+                (
+                    item
+                    for item in character.appearance_profiles
+                    if item.id == shot.character_appearance_ids.get(character.id)
+                ),
+                None,
+            )
+            reference_ids = (
+                appearance.reference_asset_ids
+                if appearance
+                else character.reference_asset_ids
+            )
+            if reference_ids and not selected_ids.intersection(reference_ids):
+                missing_characters.append(character.name)
+        if missing_characters:
+            warnings.append(
+                f"本镜画面包含{'、'.join(missing_characters)}，但其人物形象图未被勾选"
+            )
+        start_profile = cls.scene_profile_for_shot(project, shot)
+        if (
+            start_profile
+            and start_profile.reference_asset_ids
+            and not selected_ids.intersection(start_profile.reference_asset_ids)
+        ):
+            warnings.append(f"起始场景“{start_profile.name}”的场景母版未被勾选")
+        if shot.keyframe_reference_asset_ids == []:
+            warnings.append("本镜已手动取消全部首帧参考图，将只使用文字 Prompt 生成")
+        bound_prop_ids = {
+            asset_id
+            for asset_id in shot.reference_asset_ids
+            if asset_id in {asset.id for asset in assets if asset.role == AssetRole.PROP}
+        }
+        missing_prop_ids = bound_prop_ids - selected_ids
+        if missing_prop_ids:
+            missing_names = [asset.name for asset in assets if asset.id in missing_prop_ids]
+            warnings.append(
+                f"本镜已绑定固定物品{'、'.join(missing_names)}，但其物品参考图未被勾选"
+            )
+
+        def item(asset: Asset) -> dict[str, object]:
+            return {
+                "id": asset.id,
+                "name": asset.name,
+                "type": asset.type.value,
+                "role": asset.role.value,
+                "character_id": asset.character_id,
+            }
+
+        return {
+            "selection_mode": (
+                "automatic"
+                if shot.keyframe_reference_asset_ids is None
+                else "manual"
+            ),
+            "effective_character_ids": character_ids,
+            "materials": [item(asset) for asset in selected],
+            "automatic_materials": [item(asset) for asset in automatic],
+            "available_materials": [item(asset) for asset in available],
+            "warnings": warnings,
+        }
+
     @staticmethod
     def compile_base_video_prompt(project: Project, motion: str, narrative: str = "") -> str:
         parts = [
@@ -3259,6 +3628,11 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
     def resolve_generation_mode(self, shot: Shot, assets: list[Asset]) -> GenerationMode:
         if shot.generation_mode != GenerationMode.AUTO:
             return shot.generation_mode
+        configured_reference_ids = (
+            shot.video_reference_asset_ids
+            if shot.video_reference_asset_ids is not None
+            else shot.reference_asset_ids
+        )
         # Clean dialogue needs Ref2VA: the stock FL2VA/I2V node accepts image
         # anchors but has no audio-conditioning input. Ref2VA can keep the
         # approved group keyframe as Picture 1 while the exact clean TTS track
@@ -3268,7 +3642,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             and settings.H3_POSTPROCESS_AUDIO
             and settings.H3_AUDIO_MODE == "clean_tts"
             and settings.TTS_PROVIDER != "disabled"
-            and (shot.keyframe_asset_id or shot.image_path or shot.reference_asset_ids)
+            and (shot.keyframe_asset_id or shot.image_path or configured_reference_ids)
         ):
             return GenerationMode.R2V
         # A composed first frame is a much stronger spatial/identity anchor than
@@ -3277,7 +3651,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         # or when no approved first frame exists.
         if shot.keyframe_asset_id or shot.image_path:
             return GenerationMode.I2V
-        references = [asset for asset in assets if asset.id in shot.reference_asset_ids]
+        references = [asset for asset in assets if asset.id in configured_reference_ids]
         if references:
             return GenerationMode.R2V
         return GenerationMode.I2V
@@ -3309,23 +3683,14 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         excluded = ("音乐", "说话", "对白", "人声", "旁白", "回音", "口型")
         return "，".join(part.strip() for part in parts if part.strip() and not any(word in part for word in excluded))
 
-    def _reference_assets_in_shot_order(
+    def _automatic_reference_assets_in_shot_order(
         self,
         project: Project,
         shot: Shot,
         assets: list[Asset],
     ) -> list[Asset]:
         asset_map = {asset.id: asset for asset in assets}
-        profile = self.scene_profile_for_shot(project, shot)
-        if (
-            profile is None
-            and project.scene_consistency_mode == SceneConsistencyMode.STRICT
-            and shot.scene_profile_id
-        ):
-            profile = next(
-                (item for item in project.scene_profiles if item.id == shot.scene_profile_id),
-                None,
-            )
+        profiles = self.scene_profiles_for_shot(project, shot, include_strict=True)
         character_refs: list[str] = []
         for character in project.characters:
             if character.id not in shot.character_ids:
@@ -3341,7 +3706,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             character_refs.extend(appearance.reference_asset_ids if appearance else character.reference_asset_ids)
         style_refs = (
             project.style_profile.reference_asset_ids
-            if profile is None and project.style_profile and project.style_profile.approved
+            if not profiles and project.style_profile and project.style_profile.approved
             else []
         )
         continuity_input_id = self.continuity_input_asset_id(project, shot)
@@ -3353,7 +3718,11 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 # keyframe as the opening composition. Keep one composition
                 # anchor, then add scene and character sheets.
                 shot.keyframe_asset_id if not continuity_input_id else None,
-                *(profile.reference_asset_ids if profile else []),
+                *(
+                    asset_id
+                    for profile in profiles
+                    for asset_id in profile.reference_asset_ids
+                ),
                 *character_refs,
                 *style_refs,
                 *shot.reference_asset_ids,
@@ -3361,6 +3730,43 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             if asset_id
         ]
         return [asset_map[asset_id] for asset_id in dict.fromkeys(ordered_ids) if asset_id in asset_map]
+
+    def _reference_assets_in_shot_order(
+        self,
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+    ) -> list[Asset]:
+        """Return exact video references, or the automatic ordered defaults."""
+        if shot.video_reference_asset_ids is None:
+            return self._automatic_reference_assets_in_shot_order(
+                project, shot, assets
+            )
+        asset_map = {asset.id: asset for asset in assets}
+        supported = {AssetType.IMAGE, AssetType.VIDEO, AssetType.AUDIO}
+        manual_ids = list(dict.fromkeys(shot.video_reference_asset_ids))
+        # A continuous shot has one authoritative opening composition: the
+        # selected tail of its source shot.  A stale manually checked current
+        # keyframe must not be sent alongside that tail, because the two
+        # images describe competing frame-zero compositions.  Keep the rest
+        # of the user's manual allowlist (character, scene, prop, audio, ...)
+        # unchanged.
+        if shot.continuity_mode == ShotContinuityMode.CONTINUOUS:
+            continuity_input_id = self.continuity_input_asset_id(project, shot)
+            if continuity_input_id:
+                manual_ids = [
+                    continuity_input_id,
+                    *(
+                        asset_id
+                        for asset_id in manual_ids
+                        if asset_id not in {continuity_input_id, shot.keyframe_asset_id}
+                    ),
+                ]
+        return [
+            asset_map[asset_id]
+            for asset_id in dict.fromkeys(manual_ids)
+            if asset_id in asset_map and asset_map[asset_id].type in supported
+        ]
 
     def seedance_reference_assets(
         self,
@@ -3372,8 +3778,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
 
         Frame mode and reference mode are mutually exclusive. Full multimodal
         mode sends the composition, scene and every visible character sheet in
-        one request. Strict first-frame remains available only when explicitly
-        selected for a shot that values exact frame-zero pixels above identity.
+        one request. AUTO may resolve to strict first-frame only after the user
+        confirms that the approved still already contains the complete shot.
         """
         project = project or self.require_project(shot.project_id)
         supported = {AssetType.IMAGE, AssetType.VIDEO, AssetType.AUDIO}
@@ -3486,11 +3892,95 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         shot: Shot,
         assets: list[Asset],
     ) -> SeedanceReferenceMode:
+        # An in-shot location transition needs both ordered scene sheets. The
+        # strict first-frame API path accepts only one image, so use the full
+        # multimodal path for this case even if an older shot requested strict.
+        if len(self.scene_profiles_for_shot(project, shot)) > 1:
+            return SeedanceReferenceMode.MULTIMODAL_REFERENCE
         if shot.seedance_reference_mode != SeedanceReferenceMode.AUTO:
             return shot.seedance_reference_mode
-        # ``auto`` is retained for old records and now follows the safer global
-        # policy: always send available character sheets.
-        return SeedanceReferenceMode.MULTIMODAL_REFERENCE
+        return self._resolve_auto_seedance_reference_mode(project, shot, assets)[0]
+
+    def _resolve_auto_seedance_reference_mode(
+        self,
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+    ) -> tuple[SeedanceReferenceMode, str]:
+        """Resolve AUTO without guessing that an arbitrary still is complete.
+
+        The still-image generator cannot expose reliable pixel-level coverage
+        to this service. AUTO therefore trusts the user's per-shot completeness
+        choice, while still forcing multimodal references for transitions,
+        late reveals, and explicit extra media selections.
+        """
+        if len(self.scene_profiles_for_shot(project, shot)) > 1:
+            return (
+                SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                "跨场景镜头必须携带起始和目标场景母版",
+            )
+        keyframe = next(
+            (
+                asset
+                for asset in assets
+                if asset.id == shot.keyframe_asset_id
+                and asset.type == AssetType.IMAGE
+            ),
+            None,
+        )
+        if keyframe is None:
+            return (
+                SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                "尚未登记可提交的完整首帧",
+            )
+        if shot.first_frame_completeness == FirstFrameCompleteness.INCOMPLETE:
+            return (
+                SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                "首帧已标记为信息不完整",
+            )
+        if shot.first_frame_completeness != FirstFrameCompleteness.COMPLETE:
+            return (
+                SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                "首帧完整度尚未确认，默认保留全模态",
+            )
+        risky = self.seedance_identity_risk_characters(project, shot, assets)
+        if risky:
+            return (
+                SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                f"{'、'.join(risky)}在首帧后才完整出场",
+            )
+        if shot.video_reference_asset_ids is not None:
+            manual_ids = set(shot.video_reference_asset_ids)
+            if not manual_ids:
+                return (
+                    SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                    "本镜已手动取消视频参考素材",
+                )
+            extra_ids = manual_ids - {keyframe.id}
+            if extra_ids:
+                return (
+                    SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+                    "手动清单包含首帧之外的参考素材",
+                )
+        return (
+            SeedanceReferenceMode.STRICT_FIRST_FRAME,
+            "首帧已确认包含本镜所需人物、场景和固定物品",
+        )
+
+    def seedance_reference_mode_reason(
+        self,
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+    ) -> str:
+        """Explain the resolved Seedance mode for the material diagnostics UI."""
+        if len(self.scene_profiles_for_shot(project, shot)) > 1:
+            return "跨场景镜头必须携带起始和目标场景母版"
+        if shot.seedance_reference_mode == SeedanceReferenceMode.AUTO:
+            return self._resolve_auto_seedance_reference_mode(project, shot, assets)[1]
+        if shot.seedance_reference_mode == SeedanceReferenceMode.STRICT_FIRST_FRAME:
+            return "手动指定严格首帧"
+        return "手动指定全模态参考"
 
     def seedance_material_diagnostics(
         self,
@@ -3502,30 +3992,113 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         resolved = self.resolve_seedance_reference_mode(project, shot, assets)
         risky = self.seedance_identity_risk_characters(project, shot, assets)
         first_frame_id = self.seedance_first_frame_asset_id(project, shot, assets)
+        if resolved == SeedanceReferenceMode.STRICT_FIRST_FRAME:
+            automatic = [
+                asset for asset in assets
+                if asset.id == first_frame_id and asset.type == AssetType.IMAGE
+            ]
+        else:
+            automatic = [
+                asset
+                for asset in self._automatic_reference_assets_in_shot_order(
+                    project, shot, assets
+                )
+                if asset.type in {AssetType.IMAGE, AssetType.VIDEO, AssetType.AUDIO}
+            ]
+        selected_ids = {asset.id for asset in refs}
+        automatic_ids = {asset.id for asset in automatic}
+        continuity_id = self.continuity_input_asset_id(project, shot)
+        available = [
+            asset
+            for asset in assets
+            if asset.type in {AssetType.IMAGE, AssetType.VIDEO, AssetType.AUDIO}
+            and asset.role != AssetRole.OUTPUT
+            and (
+                asset.role not in {AssetRole.KEYFRAME, AssetRole.LAST_FRAME}
+                or asset.id in {
+                    shot.keyframe_asset_id,
+                    continuity_id,
+                    *selected_ids,
+                    *automatic_ids,
+                }
+            )
+        ]
         warnings: list[str] = []
+        missing_character_refs: list[str] = []
+        for character in project.characters:
+            if character.id not in shot.character_ids:
+                continue
+            appearance = next(
+                (
+                    item
+                    for item in character.appearance_profiles
+                    if item.id == shot.character_appearance_ids.get(character.id)
+                ),
+                None,
+            )
+            reference_ids = appearance.reference_asset_ids if appearance else character.reference_asset_ids
+            if reference_ids and not selected_ids.intersection(reference_ids):
+                missing_character_refs.append(character.name)
         if risky and resolved == SeedanceReferenceMode.STRICT_FIRST_FRAME:
             warnings.append(
                 f"严格首帧只提交一张构图图，{'、'.join(risky)}在 0 秒未完整出场，服装和发型可能漂移"
+            )
+        elif missing_character_refs:
+            warnings.append(
+                f"本镜包含{'、'.join(missing_character_refs)}，但其人物形象图未被选入视频参考"
             )
         elif risky:
             warnings.append(
                 f"检测到{'、'.join(risky)}在首帧后才完整出场，已同时提交人物参考图以锁定服装和发型"
             )
+        if len(self.scene_profiles_for_shot(project, shot)) > 1:
+            scene_ids = {
+                asset_id
+                for profile in self.scene_profiles_for_shot(project, shot)
+                for asset_id in profile.reference_asset_ids
+            }
+            if scene_ids.issubset(selected_ids):
+                warnings.append("跨场景镜头已切换为全模态参考，并按起始→目标顺序提交两张场景母版")
+            else:
+                warnings.append("跨场景镜头缺少起始或目标场景母版，请检查手动参考选择")
+        if shot.video_reference_asset_ids == []:
+            warnings.append("本镜已手动取消全部视频参考素材")
+        prop_assets = {
+            asset.id: asset
+            for asset in assets
+            if asset.role == AssetRole.PROP
+        }
+        missing_prop_ids = {
+            asset_id
+            for asset_id in shot.reference_asset_ids
+            if asset_id in prop_assets and asset_id not in selected_ids
+        }
+        if missing_prop_ids:
+            warnings.append(
+                "本镜已绑定固定物品"
+                + "、".join(prop_assets[asset_id].name for asset_id in missing_prop_ids)
+                + "，但其物品参考图未被选入视频参考"
+            )
+
+        def item(asset: Asset) -> dict[str, object]:
+            return {
+                "id": asset.id,
+                "name": asset.name,
+                "type": asset.type.value,
+                "role": asset.role.value,
+                "character_id": asset.character_id,
+            }
         return {
             "requested_mode": shot.seedance_reference_mode.value,
             "resolved_mode": resolved.value,
+            "first_frame_completeness": shot.first_frame_completeness.value,
+            "reference_mode_reason": self.seedance_reference_mode_reason(project, shot, assets),
             "first_frame_asset_id": first_frame_id,
             "identity_risk_characters": risky,
-            "materials": [
-                {
-                    "id": asset.id,
-                    "name": asset.name,
-                    "type": asset.type.value,
-                    "role": asset.role.value,
-                    "character_id": asset.character_id,
-                }
-                for asset in refs
-            ],
+            "materials": [item(asset) for asset in refs],
+            "automatic_materials": [item(asset) for asset in automatic],
+            "available_materials": [item(asset) for asset in available],
+            "selection_mode": "automatic" if shot.video_reference_asset_ids is None else "manual",
             "warnings": warnings,
         }
 
@@ -3630,9 +4203,38 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             else:
                 definitions.append(f"将{traits or character.name}的角色定义为“{character.name}”")
 
+        scene_profiles = self.scene_profiles_for_shot(project, shot)
+        for index, profile in enumerate(scene_profiles):
+            pictures = [
+                image_numbers[asset_id]
+                for asset_id in profile.reference_asset_ids
+                if asset_id in image_numbers
+            ]
+            if pictures:
+                phase = "转场前的起始场景" if index == 0 and len(scene_profiles) > 1 else (
+                    "转场完成后的目标场景" if index == 1 else "本镜场景"
+                )
+                definitions.append(
+                    f"将@图片{pictures[0]}中的无人环境定义为{phase}“{profile.name}”，"
+                    "只锁定空间布局、固定陈设、材质、色彩与光源，不从场景图新增人物"
+                )
+
+        for asset in refs:
+            if asset.role != AssetRole.PROP or asset.id not in image_numbers:
+                continue
+            prop_details = self._compact_prompt_text(
+                asset.description or "严格按参考图保持外形、结构、材质与尺度",
+                360,
+            )
+            definitions.append(
+                f"将@图片{image_numbers[asset.id]}中的固定物品定义为“{self._compact_prompt_text(asset.name, 64)}”："
+                f"{prop_details}；全片保持数量、真实尺寸、比例、结构、颜色、接口与连接线一致，"
+                "按人物和家具呈现可信尺度，禁止缩成掌心玩具或便携小盒"
+            )
+
         style = self._compact_prompt_text(
             self.project_rendering_style_text(project)
-            if self.scene_profile_for_shot(project, shot)
+            if scene_profiles
             else self.project_style_text(project),
             180,
         )
@@ -3741,7 +4343,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     "@图片1是严格首帧：目标视频 0.00 秒必须与其构图一致，并继承人物身份、人数、服装、站位、道具、场景、景别和光影；随后从该状态立即开始第一个节拍"
                 )
             else:
-                reference_instructions.append("使用上述@图片锁定对应角色、服装、场景或视觉风格")
+                reference_instructions.append("使用上述@图片锁定对应角色、服装、场景、固定物品外形尺度或视觉风格")
                 keyframe_number = image_numbers.get(shot.keyframe_asset_id or "")
                 if keyframe_number:
                     reference_instructions.append(
@@ -3753,14 +4355,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         if counters[AssetType.AUDIO]:
             reference_instructions.append("参考上述@音频的音色、对白或声音氛围")
 
-        profile = self.scene_profile_for_shot(project, shot)
         continuity = ""
-        if profile:
-            continuity = (
-                f"【场景档案｜本镜最高优先级】本镜使用场景“{profile.name}”：{profile.description}；"
-                f"必须保持：{profile.continuity_notes or '空间布局、固定陈设、材质与光线'}；"
-                "本镜环境、光线、色彩和陈设只按此档案执行，忽略全局风格分析或旧分镜中的冲突描述"
-            )
+        if scene_profiles:
+            continuity = self.scene_transition_contract(scene_profiles)
         if shot.continuity_mode == ShotContinuityMode.CONTINUOUS:
             continuity = (
                 continuity + "。" if continuity else "【连续长镜头】"
@@ -3835,11 +4432,11 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         return saved
 
     def migrate_all_seedance_shots_to_multimodal(self) -> dict[str, int]:
-        """Make full multimodal references the durable default for all projects.
+        """Upgrade legacy Seedance prompts without overwriting current choices.
 
-        Existing render jobs remain immutable audit records. Every future
-        submission uses the refreshed prompt/material manifest and includes the
-        visible cast's bound character sheets.
+        Older prompt versions predate the explicit AUTO/STRICT/MULTIMODAL
+        policy, so they are rebuilt with multimodal references once. Current
+        prompts keep their per-shot mode and first-frame completeness choice.
         """
         project_count = 0
         shot_count = 0
@@ -3847,10 +4444,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             assets = self.store.list_assets(project.id)
             changed_in_project = 0
             for shot in self.store.list_shots(project.id):
-                if (
-                    shot.seedance_reference_mode == SeedanceReferenceMode.MULTIMODAL_REFERENCE
-                    and shot.seedance_prompt_version == SEEDANCE_PROMPT_VERSION
-                ):
+                if shot.seedance_prompt_version == SEEDANCE_PROMPT_VERSION:
                     continue
                 shot.seedance_reference_mode = SeedanceReferenceMode.MULTIMODAL_REFERENCE
                 self.synchronize_shot_cast(project, shot)
@@ -3950,6 +4544,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             and settings.H3_AUDIO_MODE == "clean_tts"
             and settings.TTS_PROVIDER != "disabled"
         )
+        scene_profiles = self.scene_profiles_for_shot(project, shot)
+        scene_contract = self.scene_transition_contract(scene_profiles)
         style = self._compact_prompt_text(self.shot_style_text(project, shot), 360)
         narrative = self._compact_prompt_text(shot.narrative or shot.scene_description, 260)
         motion = self._compact_subject_motion(shot)
@@ -4102,6 +4698,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         details = [
             f"纯净画面约束：{text_rule}",
             f"画面风格：{style}" if style else "",
+            scene_contract,
             f"场景与事件：{narrative}" if narrative else "",
             f"逐段动作弧线：{beat_timeline}" if beat_timeline else f"动作：{motion}" if motion else "",
             f"整镜基础镜头：{camera}；每个时间段只执行该段的一种主要运镜" if camera else "",
@@ -4122,7 +4719,15 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             for asset in refs:
                 if asset.type == AssetType.IMAGE:
                     picture_index += 1
-                    tag_notes.append(f"<Picture {picture_index}> 用作{asset.role.value}参考：{self._compact_prompt_text(asset.name, 64)}")
+                    prop_note = (
+                        f"；{self._compact_prompt_text(asset.description, 360)}；"
+                        "严格保持真实尺度、长宽高比例、结构、接口与连接线，禁止缩成掌心小物"
+                        if asset.role == AssetRole.PROP else ""
+                    )
+                    tag_notes.append(
+                        f"<Picture {picture_index}> 用作{asset.role.value}参考："
+                        f"{self._compact_prompt_text(asset.name, 64)}{prop_note}"
+                    )
                 elif asset.type == AssetType.VIDEO:
                     video_index += 1
                     tag_notes.append(f"<Video {video_index}> 用作动作与镜头参考：{self._compact_prompt_text(asset.name, 64)}")
@@ -4579,10 +5184,12 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             tuple((turn.speaker_id, turn.text) for turn in shot.dialogue_turns),
             shot.duration_seconds,
             shot.scene_description,
+            tuple(shot.scene_profile_ids),
             shot.scene_profile_id,
             shot.use_scene_profile,
             shot.continuity_mode,
             shot.continuity_source_shot_id,
+            shot.first_frame_completeness,
             tuple(shot.character_ids),
             shot.shot_size,
             shot.camera_angle,
@@ -4619,6 +5226,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             ),
             shot.text_policy,
             shot.visual_prompt,
+            tuple(shot.reference_asset_ids),
+            None if shot.keyframe_reference_asset_ids is None else tuple(shot.keyframe_reference_asset_ids),
+            None if shot.video_reference_asset_ids is None else tuple(shot.video_reference_asset_ids),
         )
 
     def update_shot(self, project_id: str, incoming: Shot) -> Shot:
@@ -4634,6 +5244,37 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             raise ValueError("Shot project mismatch")
         if incoming.version != existing.version:
             raise ShotVersionConflictError("本镜已有新的保存结果，已阻止旧页面覆盖。请刷新后再编辑保存。")
+        known_scene_ids = {profile.id for profile in project.scene_profiles}
+        incoming.scene_profile_ids = [
+            profile_id
+            for profile_id in dict.fromkeys([
+                *incoming.scene_profile_ids,
+                *([incoming.scene_profile_id] if incoming.scene_profile_id else []),
+            ])
+            if profile_id in known_scene_ids
+        ][:2]
+        incoming.scene_profile_id = incoming.scene_profile_ids[0] if incoming.scene_profile_ids else None
+        if not incoming.scene_profile_ids:
+            incoming.use_scene_profile = False
+        asset_types = {
+            asset.id: asset.type for asset in self.store.list_assets(project_id)
+        }
+        if incoming.keyframe_reference_asset_ids is not None:
+            incoming.keyframe_reference_asset_ids = [
+                asset_id
+                for asset_id in dict.fromkeys(incoming.keyframe_reference_asset_ids)
+                if asset_types.get(asset_id) == AssetType.IMAGE
+            ][:20]
+        if incoming.video_reference_asset_ids is not None:
+            incoming.video_reference_asset_ids = [
+                asset_id
+                for asset_id in dict.fromkeys(incoming.video_reference_asset_ids)
+                if asset_types.get(asset_id) in {
+                    AssetType.IMAGE,
+                    AssetType.VIDEO,
+                    AssetType.AUDIO,
+                }
+            ][:20]
         # These are server-owned generation metadata. Preserve them even when
         # an older client omits them; explicit prompt edits are handled below.
         incoming.h3_prompt_skill_output = existing.h3_prompt_skill_output
@@ -4641,6 +5282,12 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         incoming.h3_prompt_skill_version = existing.h3_prompt_skill_version
         incoming.h3_director_version = existing.h3_director_version
         incoming.h3_prompt_source_revision = existing.h3_prompt_source_revision
+        # Render selection is server-owned. A stale editor save must never
+        # unlock an adopted card or point continuity at a different tail frame.
+        incoming.selected_video_job_id = existing.selected_video_job_id
+        incoming.video_path = existing.video_path
+        incoming.last_frame_asset_id = existing.last_frame_asset_id
+        incoming.video_status = existing.video_status
         self.synchronize_shot_cast(project, incoming)
         content_changed = self._shot_content_signature(existing) != self._shot_content_signature(incoming)
         seedance_reference_mode_changed = (
@@ -4653,6 +5300,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             incoming.content_revision = existing.content_revision + 1
             character_ids = self.keyframe_character_ids(project, incoming, incoming.scene_description)
             scene_profile = self.scene_profile_for_shot(project, incoming)
+            assets = self.store.list_assets(project_id)
             if not keyframe_authored:
                 incoming.keyframe_prompt = self.compile_keyframe_prompt(
                     project,
@@ -4665,8 +5313,16 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     text_policy=incoming.text_policy,
                     scene_profile=scene_profile,
                 )
+                incoming.keyframe_prompt = self.apply_fixed_prop_anchor(
+                    incoming.keyframe_prompt,
+                    self.keyframe_reference_assets(
+                        project,
+                        incoming,
+                        assets,
+                        character_ids,
+                    ),
+                )
             incoming.keyframe_prompt_source_revision = incoming.content_revision
-            assets = self.store.list_assets(project_id)
             if not seedance_authored:
                 incoming.seedance_prompt = self.compile_seedance_prompt(project, incoming, assets)
                 incoming.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
@@ -4706,6 +5362,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         keyframe_prompt: str,
         revision_suggestion: str | None = None,
         revision_mode: str | None = None,
+        reference_asset_ids: list[str] | None = None,
+        reference_selection_supplied: bool = False,
     ) -> Shot:
         """Patch only keyframe fields, preserving concurrently generated video prompts."""
         shot = self.require_shot(shot_id)
@@ -4722,6 +5380,33 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             shot.keyframe_revision_suggestion_draft = revision_suggestion.strip()
         if revision_mode is not None:
             shot.keyframe_revision_mode = revision_mode
+        if reference_selection_supplied:
+            if reference_asset_ids is None:
+                shot.keyframe_reference_asset_ids = None
+            else:
+                image_ids = {
+                    asset.id
+                    for asset in self.store.list_assets(project_id)
+                    if asset.type == AssetType.IMAGE
+                }
+                unknown = set(reference_asset_ids) - image_ids
+                if unknown:
+                    raise ValueError("所选首帧参考图已不存在，请刷新页面后重试")
+                shot.keyframe_reference_asset_ids = list(
+                    dict.fromkeys(reference_asset_ids)
+                )[:20]
+        project = self.require_project(project_id)
+        assets = self.store.list_assets(project_id)
+        character_ids = self.keyframe_character_ids(project, shot, shot.keyframe_prompt)
+        shot.keyframe_prompt = self.apply_fixed_prop_anchor(
+            shot.keyframe_prompt,
+            self.keyframe_reference_assets(
+                project,
+                shot,
+                assets,
+                character_ids,
+            ),
+        )
         shot.version += 1
         saved = self.store.save_shot(shot)
         self.invalidate_storyboard(project_id)
@@ -4745,7 +5430,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             {"id": item.id, "name": item.name, "description": item.description, "wardrobe": item.wardrobe}
             for item in project.characters
         ]
-        payload = await create_llm_generator(settings.LLM_PROVIDER).generate_json(
+        generator = create_llm_generator(settings.LLM_PROVIDER)
+        payload = await generator.generate_json(
             "你是影视分镜导演。只重做指定单镜；镜号和时长是硬约束，人物、对白、场景、动作与构图可按建议改变。",
             f"""重做下面一个分镜。保持 shot_id、ordinal、duration_seconds 原值；其他内容按用户建议重新设计。
 
@@ -4880,6 +5566,387 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         if "h3" in targets:
             await self.generate_h3_prompts(project_id, [shot_id], h3_skill_id, suggestions)
         return self.require_shot(shot_id)
+
+    async def preview_shot_split(
+        self,
+        project_id: str,
+        shot_id: str,
+        user_suggestions: str = "",
+        segment_count: int | None = None,
+    ) -> ShotSplitPreview:
+        """Generate an editable proposal without mutating the saved storyboard."""
+        if segment_count is not None and segment_count not in {2, 3, 4}:
+            raise ValueError("拆分数量只能是 2、3 或 4 镜")
+        project = self.require_project(project_id)
+        source = self.require_shot(shot_id)
+        if source.project_id != project_id:
+            raise KeyError("Shot not found")
+        source_version = source.version
+        shots = self.store.list_shots(project_id)
+        previous = next((item for item in shots if item.ordinal == source.ordinal - 1), None)
+        following = next((item for item in shots if item.ordinal == source.ordinal + 1), None)
+        characters = [
+            {
+                "name": item.name,
+                "description": item.description,
+                "wardrobe": item.wardrobe,
+            }
+            for item in project.characters
+        ]
+        scene_profiles = [
+            {
+                "name": profile.name,
+                "description": profile.description,
+                "continuity_notes": profile.continuity_notes,
+            }
+            for profile in project.scene_profiles
+        ]
+        count_instruction = (
+            f"严格拆成 {segment_count} 镜"
+            if segment_count is not None
+            else "根据动作、场景或对白节拍自行选择拆成 2–4 镜"
+        )
+        suggestions = user_suggestions.strip()
+        generator = create_llm_generator(settings.LLM_PROVIDER)
+        payload = await generator.generate_json(
+            "你是影视分镜导演。把一个过载镜头拆成连续、可独立生产的小镜头，只返回结构化 JSON。",
+            f"""把下面的第 {source.ordinal} 镜拆分为多个连续镜头。{count_instruction}。这一步只生成可编辑预览，不要生成大段提示词。
+
+项目剧情：{self._compact_prompt_text(project.brief.story, 3000)}
+统一风格：{self.project_rendering_style_text(project)}
+可用角色：{json.dumps(characters, ensure_ascii=False)}
+可用场景档案：{json.dumps(scene_profiles, ensure_ascii=False)}
+上一镜：{json.dumps(previous.model_dump(mode='json') if previous else {}, ensure_ascii=False)}
+待拆原镜：{json.dumps(source.model_dump(mode='json'), ensure_ascii=False)}
+下一镜：{json.dumps(following.model_dump(mode='json') if following else {}, ensure_ascii=False)}
+用户本次要求（高优先级）：{suggestions or '保持原镜剧情、角色和风格，只优化为可生产的小镜头'}
+
+要求：
+1. 不丢失原镜事件因果，不重复上下镜已经完成的内容。
+2. 每镜 0.25–15 秒，每镜只承担一个主动作或一个明确叙事转折；默认尽量保持原镜总时长。
+3. scene_description 只写 0.00 秒首帧静态状态，narrative 写该镜完整事件。
+4. visual_beats 从 0 秒无缝覆盖到该镜结尾；voice_events 是唯一声音时序来源。
+5. scene_profile_name 优先逐字使用已有场景档案名称；确有新场景时才填新名称和档案说明。
+6. character_names 只列画面中真正出现的已有角色。
+
+严格返回：
+{{"rationale":"拆分依据","segments":[{{"title":"","duration_seconds":4,"narrative":"","dialogue":"","scene_description":"","scene_profile_name":"","scene_profile_description":"","scene_continuity_notes":"","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","subject_motion":"","transition":"硬切","audio_design":"","visual_beats":[{{"start_seconds":0,"end_seconds":4,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[],"text_policy":"post_overlay"}}]}}""",
+        )
+        raw_segments = payload.get("segments") or payload.get("shots")
+        if not isinstance(raw_segments, list) or not 2 <= len(raw_segments) <= 4:
+            raise ValueError(f"AI 拆分结果需要包含 2–4 个镜头{_raw_response_hint(generator)}")
+        if segment_count is not None and len(raw_segments) != segment_count:
+            raise ValueError(f"AI 未按要求返回 {segment_count} 个镜头，请重试")
+
+        source_profiles = self.scene_profiles_for_shot(project, source)
+        segments: list[ShotSplitSegment] = []
+        for index, raw in enumerate(raw_segments):
+            if not isinstance(raw, dict):
+                raise ValueError(f"拆分预览的第 {index + 1} 镜格式不正确")
+            try:
+                duration = max(0.25, min(15.0, float(raw.get("duration_seconds") or 4.0)))
+            except (TypeError, ValueError):
+                duration = 4.0
+            narrative = str(raw.get("narrative") or raw.get("event") or "").strip()
+            opening = str(
+                raw.get("scene_description")
+                or raw.get("opening_state")
+                or narrative
+            ).strip()
+            if not narrative:
+                raise ValueError(f"拆分预览的第 {index + 1} 镜缺少剧情内容")
+            fallback_profile = None
+            if source_profiles:
+                fallback_profile = source_profiles[-1] if len(source_profiles) > 1 and index > 0 else source_profiles[0]
+            beats: list[VisualBeat] = []
+            for beat in raw.get("visual_beats") or []:
+                try:
+                    beats.append(VisualBeat.model_validate(beat))
+                except Exception:
+                    continue
+            beats = self._scale_visual_beats(
+                beats,
+                max((beat.end_seconds for beat in beats), default=duration),
+                duration,
+                shot_size=str(raw.get("shot_size") or source.shot_size or "中景").strip(),
+                camera_angle=str(raw.get("camera_angle") or source.camera_angle or "平视").strip(),
+                camera_motion=str(raw.get("camera_motion") or source.camera_motion or "固定镜头").strip(),
+                fallback_action=str(raw.get("subject_motion") or narrative).strip(),
+            )
+            voices: list[VoiceEvent] = []
+            for event in raw.get("voice_events") or []:
+                try:
+                    voices.append(VoiceEvent.model_validate(event))
+                except Exception:
+                    continue
+            voices = self._resolve_voice_events(
+                project,
+                voices,
+                max((event.end_seconds for event in voices), default=duration),
+                duration,
+            )
+            policy = str(raw.get("text_policy") or source.text_policy)
+            if policy not in {"none", "post_overlay", "reference_locked"}:
+                policy = "post_overlay"
+            raw_character_names = raw.get("character_names") or []
+            if isinstance(raw_character_names, str):
+                raw_character_names = re.split(r"[,，、;/；]", raw_character_names)
+            if not isinstance(raw_character_names, list):
+                raw_character_names = []
+            segments.append(ShotSplitSegment(
+                title=str(raw.get("title") or f"{source.title or f'镜头 {source.ordinal}'} · {index + 1}").strip(),
+                duration_seconds=duration,
+                narrative=narrative,
+                dialogue=str(raw.get("dialogue") or "").strip(),
+                scene_description=opening,
+                scene_profile_name=str(raw.get("scene_profile_name") or (fallback_profile.name if fallback_profile else "")).strip(),
+                scene_profile_description=str(raw.get("scene_profile_description") or "").strip(),
+                scene_continuity_notes=str(raw.get("scene_continuity_notes") or "").strip(),
+                character_names=[str(name).strip() for name in raw_character_names if str(name).strip()],
+                shot_size=str(raw.get("shot_size") or source.shot_size or "中景").strip(),
+                camera_angle=str(raw.get("camera_angle") or source.camera_angle or "平视").strip(),
+                lens=str(raw.get("lens") or source.lens or "标准镜头").strip(),
+                camera_motion=str(raw.get("camera_motion") or source.camera_motion or "固定镜头").strip(),
+                subject_motion=str(raw.get("subject_motion") or narrative).strip(),
+                transition=str(raw.get("transition") or (source.transition if index == len(raw_segments) - 1 else "硬切")).strip(),
+                audio_design=str(raw.get("audio_design") or source.audio_design).strip(),
+                visual_beats=beats,
+                voice_events=voices,
+                text_policy=policy,
+            ))
+
+        latest = self.require_shot(shot_id)
+        if latest.project_id != project_id or latest.version != source_version:
+            raise ShotVersionConflictError("本镜在拆分预览生成期间已更新，请重新生成预览")
+        return ShotSplitPreview(
+            source_shot_id=shot_id,
+            source_shot_version=source_version,
+            source_ordinal=source.ordinal,
+            original_duration_seconds=source.duration_seconds,
+            proposed_duration_seconds=round(sum(segment.duration_seconds for segment in segments), 2),
+            rationale=str(payload.get("rationale") or "").strip(),
+            segments=segments,
+        )
+
+    async def confirm_shot_split(
+        self,
+        project_id: str,
+        shot_id: str,
+        preview: ShotSplitPreview,
+        prompt_targets: list[str] | None = None,
+        h3_skill_id: str = "h3-prompt-writing",
+    ) -> list[Shot]:
+        """Compile edited split segments and atomically replace the source shot."""
+        project = self.require_project(project_id)
+        source = self.require_shot(shot_id)
+        if source.project_id != project_id:
+            raise KeyError("Shot not found")
+        if preview.source_shot_id != shot_id:
+            raise ValueError("拆分预览与当前镜头不匹配")
+        if preview.source_ordinal != source.ordinal or abs(preview.original_duration_seconds - source.duration_seconds) > 0.001:
+            raise ShotVersionConflictError("镜号或原镜时长已变化，请重新生成拆分预览")
+        if preview.source_shot_version != source.version:
+            raise ShotVersionConflictError("本镜已有新的保存结果，请重新生成拆分预览")
+        active_statuses = {
+            JobStatus.QUEUED,
+            JobStatus.SUBMITTING,
+            JobStatus.RUNNING,
+            JobStatus.CANCEL_REQUESTED,
+        }
+        if any(job.shot_id == shot_id and job.status in active_statuses for job in self.store.list_jobs(project_id)):
+            raise ShotSplitBusyError("本镜仍有视频生成任务在进行，请等待完成或取消后再确认拆分")
+        try:
+            self.ensure_keyframe_idle(shot_id)
+        except KeyframeBusyError as exc:
+            raise ShotSplitBusyError(str(exc)) from exc
+
+        assets = self.store.list_assets(project_id)
+        source_profiles = self.scene_profiles_for_shot(project, source)
+        excluded_generated_assets = {source.keyframe_asset_id, source.last_frame_asset_id}
+        inherited_references = [
+            asset_id
+            for asset_id in source.reference_asset_ids
+            if asset_id and asset_id not in excluded_generated_assets
+        ]
+        replacements: list[Shot] = []
+        profile_by_name = {profile.name.strip().casefold(): profile for profile in project.scene_profiles}
+        used_profile_ids: dict[str, list[str]] = {}
+        for index, segment in enumerate(preview.segments):
+            narrative = segment.narrative.strip()
+            if not narrative:
+                raise ValueError(f"第 {index + 1} 个拆分镜头的剧情内容不能为空")
+            duration = max(0.25, min(15.0, float(segment.duration_seconds)))
+            requested_profile_name = segment.scene_profile_name.strip()
+            scene_profile = profile_by_name.get(requested_profile_name.casefold()) if requested_profile_name else None
+            if scene_profile is None and not requested_profile_name and source_profiles:
+                scene_profile = source_profiles[-1] if len(source_profiles) > 1 and index > 0 else source_profiles[0]
+            if scene_profile is None and requested_profile_name:
+                scene_profile = SceneProfile(
+                    name=requested_profile_name,
+                    description=segment.scene_profile_description.strip() or segment.scene_description.strip() or narrative,
+                    continuity_notes=segment.scene_continuity_notes.strip() or "保持空间布局、固定陈设、材质、主色与光源方向",
+                )
+                project.scene_profiles.append(scene_profile)
+                profile_by_name[requested_profile_name.casefold()] = scene_profile
+
+            source_beat_duration = max((beat.end_seconds for beat in segment.visual_beats), default=duration)
+            source_voice_duration = max((event.end_seconds for event in segment.voice_events), default=duration)
+            voices = self._resolve_voice_events(
+                project,
+                segment.voice_events,
+                source_voice_duration,
+                duration,
+            )
+            speaker_ids = [event.speaker_id for event in voices if event.kind == "character" and event.speaker_id]
+            character_ids = self.resolve_character_ids(
+                project,
+                segment.title,
+                narrative,
+                segment.scene_description,
+                segment.subject_motion,
+                explicit_names=segment.character_names,
+                speaker_ids=speaker_ids,
+            )
+            character_appearance_ids = {
+                character_id: appearance_id
+                for character_id, appearance_id in source.character_appearance_ids.items()
+                if character_id in character_ids
+            }
+            previous_replacement = replacements[-1] if replacements else None
+            same_profile_as_previous = bool(
+                previous_replacement
+                and scene_profile
+                and previous_replacement.scene_profile_id == scene_profile.id
+            )
+            shot = Shot(
+                project_id=project_id,
+                ordinal=source.ordinal + index,
+                title=segment.title.strip() or f"{source.title or f'镜头 {source.ordinal}'} · {index + 1}",
+                narrative=narrative,
+                dialogue=segment.dialogue.strip(),
+                duration_seconds=duration,
+                scene_description=segment.scene_description.strip() or narrative,
+                scene_profile_ids=[scene_profile.id] if scene_profile else [],
+                scene_profile_id=scene_profile.id if scene_profile else None,
+                use_scene_profile=bool(scene_profile),
+                continuity_mode=(
+                    source.continuity_mode
+                    if index == 0
+                    else ShotContinuityMode.SAME_SCENE
+                    if same_profile_as_previous
+                    else ShotContinuityMode.INDEPENDENT
+                ),
+                continuity_source_shot_id=source.continuity_source_shot_id if index == 0 else None,
+                seedance_reference_mode=SeedanceReferenceMode.AUTO,
+                first_frame_completeness=FirstFrameCompleteness.UNKNOWN,
+                character_ids=character_ids,
+                character_appearance_ids=character_appearance_ids,
+                shot_size=segment.shot_size.strip() or source.shot_size,
+                camera_angle=segment.camera_angle.strip() or source.camera_angle,
+                lens=segment.lens.strip() or source.lens,
+                camera_motion=segment.camera_motion.strip() or source.camera_motion,
+                subject_motion=segment.subject_motion.strip() or narrative,
+                transition=segment.transition.strip() or (source.transition if index == len(preview.segments) - 1 else "硬切"),
+                audio_design=segment.audio_design.strip() or source.audio_design,
+                visual_beats=self._scale_visual_beats(
+                    segment.visual_beats,
+                    source_beat_duration,
+                    duration,
+                    shot_size=segment.shot_size.strip() or source.shot_size,
+                    camera_angle=segment.camera_angle.strip() or source.camera_angle,
+                    camera_motion=segment.camera_motion.strip() or source.camera_motion,
+                    fallback_action=segment.subject_motion.strip() or narrative,
+                ),
+                voice_events=voices,
+                text_policy=segment.text_policy,
+                negative_prompt=source.negative_prompt,
+                generation_mode=source.generation_mode,
+                ref_image_size=source.ref_image_size,
+                reference_asset_ids=list(inherited_references),
+                h3_width=source.h3_width,
+                h3_height=source.h3_height,
+                h3_turbo=source.h3_turbo,
+                h3_model_profile=source.h3_model_profile,
+                h3_text_encoder_profile=source.h3_text_encoder_profile,
+                h3_steps=source.h3_steps,
+                h3_scheduler=source.h3_scheduler,
+                h3_denoise=source.h3_denoise,
+                h3_lora_strength=source.h3_lora_strength,
+                h3_low_vram=source.h3_low_vram,
+                h3_shift_video=source.h3_shift_video,
+                h3_shift_audio=source.h3_shift_audio,
+                render_frames=h3_frames_for_seconds(duration),
+            )
+            shot.dialogue_speaker_id = speaker_ids[0] if len(set(speaker_ids)) == 1 else None
+            shot.dialogue_turns = [
+                DialogueTurn(speaker_id=event.speaker_id, text=event.text)
+                for event in voices
+                if event.kind == "character" and event.text.strip()
+            ]
+            self.synchronize_shot_cast(project, shot)
+            shot.visual_prompt = self.compile_visual_prompt(
+                project,
+                shot.scene_description or shot.narrative,
+                shot.character_ids,
+                shot.character_appearance_ids,
+                scene_profile=scene_profile,
+            )
+            shot.keyframe_prompt = self.compile_keyframe_prompt(
+                project,
+                shot.scene_description or shot.narrative,
+                shot.character_ids,
+                shot.character_appearance_ids,
+                shot_size=shot.shot_size,
+                camera_angle=shot.camera_angle,
+                lens=shot.lens,
+                text_policy=shot.text_policy,
+                scene_profile=scene_profile,
+            )
+            shot.keyframe_prompt = self.apply_fixed_prop_anchor(
+                shot.keyframe_prompt,
+                self.keyframe_reference_assets(project, shot, assets, shot.character_ids),
+            )
+            shot.keyframe_prompt_source_revision = shot.content_revision
+            shot.video_prompt_source = self.compile_base_video_prompt(project, shot.subject_motion, shot.narrative)
+            shot.video_prompt = self.compile_h3_prompt(project, shot, assets)
+            shot.h3_director_version = H3_DIRECTOR_VERSION
+            shot.h3_prompt_source_revision = shot.content_revision
+            shot.seedance_prompt = self.compile_seedance_prompt(project, shot, assets)
+            shot.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
+            shot.seedance_prompt_source_revision = shot.content_revision
+            replacements.append(shot)
+            if scene_profile:
+                used_profile_ids.setdefault(scene_profile.id, []).append(shot.id)
+
+        try:
+            saved = self.store.replace_shot_with_many(
+                project_id,
+                shot_id,
+                replacements,
+                expected_version=preview.source_shot_version,
+            )
+        except ValueError as exc:
+            if "新的保存结果" in str(exc):
+                raise ShotVersionConflictError(str(exc)) from exc
+            raise
+        for profile in project.scene_profiles:
+            profile.source_shot_ids = [item for item in profile.source_shot_ids if item != shot_id]
+            profile.source_shot_ids = list(dict.fromkeys([
+                *profile.source_shot_ids,
+                *used_profile_ids.get(profile.id, []),
+            ]))
+        self.store.save_project(project)
+        self.invalidate_storyboard(project_id)
+
+        targets = [target for target in dict.fromkeys(prompt_targets or []) if target in {"h3", "seedance"}]
+        if "h3" in targets:
+            await self.generate_h3_prompts(
+                project_id,
+                [shot.id for shot in saved],
+                h3_skill_id,
+                f"从原镜头 {source.ordinal} 拆分后保持剧情连续",
+            )
+        return [self.require_shot(shot.id) for shot in saved]
 
     async def insert_shot_with_ai(
         self,
@@ -5025,6 +6092,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             )
             project.scene_profiles.append(scene_profile)
         if scene_profile:
+            shot.scene_profile_ids = [scene_profile.id]
             shot.scene_profile_id = scene_profile.id
             shot.use_scene_profile = True
         self.synchronize_shot_cast(project, shot)
@@ -5390,6 +6458,10 @@ Do not copy the full project bible or every character into the result. The autho
                         text_policy=shot.text_policy,
                         scene_profile=profile,
                     )
+                effective_prompt = self.apply_fixed_prop_anchor(
+                    effective_prompt,
+                    keyframe_references,
+                )
                 effective_prompt = self.merge_keyframe_suggestions(
                     effective_prompt,
                     "" if suggestion_is_duplicate else user_suggestions,
@@ -5457,6 +6529,14 @@ Do not copy the full project bible or every character into the result. The autho
                     latest.keyframe_asset_id = asset.id
                     latest.image_path = str(path)
                     latest.image_status = "completed"
+                    if latest.video_reference_asset_ids is not None and previous_keyframe_id:
+                        latest.video_reference_asset_ids = [
+                            asset.id if asset_id == previous_keyframe_id else asset_id
+                            for asset_id in latest.video_reference_asset_ids
+                        ]
+                        latest.video_reference_asset_ids = list(
+                            dict.fromkeys(latest.video_reference_asset_ids)
+                        )
                     latest.keyframe_revision_last_suggestion = user_suggestions
                     latest.keyframe_revision_suggestion_draft = ""
                     latest.keyframe_prompt_source_revision = shot.content_revision

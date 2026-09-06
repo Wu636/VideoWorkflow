@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
-from src.video_workflow.domain import AssetRole, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, Shot, StyleProfile
+from src.video_workflow.domain import AssetRole, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, Shot, ShotContinuityMode, StyleProfile
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
@@ -64,7 +64,8 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(episode.status_code, 200, episode.text)
         self.assertEqual(episode.json()["series_id"], series_id)
         self.assertEqual(episode.json()["episode_number"], 2)
-        self.assertEqual(episode.json()["brief"]["visual_style"], "统一二维插画")
+        self.assertTrue(episode.json()["brief"]["visual_style"].startswith("统一二维插画"))
+        self.assertIn("禁止真人照片", episode.json()["brief"]["visual_style"])
 
     def test_scene_editor_preview_patch_and_conflict(self) -> None:
         project = router.project_service.create_project(ProjectBrief(title="场景编辑", story="奶奶在客厅"))
@@ -115,7 +116,19 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(saved["video_prompt"], "saved H3")
         self.assertEqual(saved["video_prompt_source"], "saved H3")
         self.assertEqual(saved["seedance_prompt"], "saved Seedance")
+        self.assertIsNone(saved["keyframe_reference_asset_ids"])
         self.assertGreater(saved["version"], shot.version)
+        response = self.client.patch(url, json={
+            "keyframe_prompt": "新首帧 Prompt",
+            "keyframe_reference_asset_ids": [],
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["keyframe_reference_asset_ids"], [])
+        materials = self.client.get(
+            f"/api/projects/{project['id']}/shots/{shot.id}/keyframe-materials"
+        )
+        self.assertEqual(materials.status_code, 200, materials.text)
+        self.assertEqual(materials.json()["selection_mode"], "manual")
         self.assertEqual(self.client.patch(url, json={"keyframe_prompt": " "}).status_code, 400)
         self.assertEqual(self.client.patch(url, json={"keyframe_prompt": "x" * 12001}).status_code, 422)
         self.assertEqual(self.client.patch(url, json={"keyframe_prompt": "x", "keyframe_revision_mode": "bad"}).status_code, 422)
@@ -123,6 +136,61 @@ class ProjectApiTests(unittest.TestCase):
             f"/api/projects/another-project/shots/{shot.id}/keyframe-prompt",
             json={"keyframe_prompt": "x"},
         ).status_code, 404)
+
+    def test_shot_split_preview_and_confirm_routes(self) -> None:
+        project = self.client.post("/api/projects", json={"title": "拆分接口", "story": "人物起身、开门并走出房间"}).json()
+        source = router.store.save_shot(Shot(
+            project_id=project["id"],
+            ordinal=1,
+            title="连续动作",
+            narrative="人物起身、开门并走出房间",
+            duration_seconds=6,
+            video_path="/tmp/source.mp4",
+            video_status="completed",
+        ))
+        tail = router.store.save_shot(Shot(project_id=project["id"], ordinal=2, title="下一镜", narrative="人物来到走廊"))
+
+        class LLM:
+            async def generate_json(self, *_args, **_kwargs):
+                return {
+                    "rationale": "每镜一个主动作",
+                    "segments": [
+                        {"title": "起身", "duration_seconds": 2, "narrative": "人物起身", "scene_description": "人物坐在椅上"},
+                        {"title": "开门走出", "duration_seconds": 4, "narrative": "人物开门走出房间", "scene_description": "人物站在门前"},
+                    ],
+                }
+
+        base = f"/api/projects/{project['id']}/shots/{source.id}"
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=LLM()):
+            response = self.client.post(base + "/split-preview", json={"segment_count": 2, "user_suggestions": "保持六秒"})
+        self.assertEqual(response.status_code, 200, response.text)
+        preview = response.json()
+        self.assertEqual(len(preview["segments"]), 2)
+        self.assertEqual(preview["proposed_duration_seconds"], 6)
+        self.assertEqual([shot.id for shot in router.store.list_shots(project["id"])], [source.id, tail.id])
+
+        preview["segments"][0]["title"] = "用户调整后起身"
+        running = router.store.save_job(RenderJob(
+            project_id=project["id"],
+            shot_id=source.id,
+            type=JobType.VIDEO,
+            status=JobStatus.RUNNING,
+        ))
+        blocked = self.client.post(base + "/split-confirm", json={"preview": preview, "prompt_targets": []})
+        self.assertEqual(blocked.status_code, 409, blocked.text)
+        self.assertIn("视频生成任务", blocked.json()["detail"])
+        router.store.delete_job(running.id)
+        response = self.client.post(base + "/split-confirm", json={"preview": preview, "prompt_targets": []})
+        self.assertEqual(response.status_code, 200, response.text)
+        created = response.json()
+        self.assertEqual(created[0]["title"], "用户调整后起身")
+        board = self.client.get(f"/api/projects/{project['id']}").json()["shots"]
+        self.assertEqual([shot["ordinal"] for shot in board], [1, 2, 3])
+        self.assertEqual(board[-1]["id"], tail.id)
+        self.assertEqual(board[-1]["ordinal"], 3)
+        self.assertTrue(all(shot["id"] != source.id for shot in board[:2]))
+        self.assertTrue(all(shot["video_path"] is None and shot["video_status"] == "pending" for shot in board[:2]))
+        self.assertEqual(self.client.post(base + "/split-confirm", json={"preview": preview}).status_code, 404)
 
     def test_conflicting_keyframe_operations_return_409_without_writing(self) -> None:
         project = self.client.post("/api/projects", json={"title": "首帧防重", "story": "人物开门"}).json()
@@ -448,6 +516,98 @@ class ProjectApiTests(unittest.TestCase):
 
         response = self.client.delete(f"/api/projects/{project_id}/jobs/{running_job.id}")
         self.assertEqual(response.status_code, 404)
+
+    def test_completed_render_selection_locks_video_and_continuity_tail(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="抽卡选片", story="连续两镜"))
+        video_a = Path(self.temp.name) / "card-a.mp4"
+        video_b = Path(self.temp.name) / "card-b.mp4"
+        tail_a_path = Path(self.temp.name) / "card-a-tail.png"
+        tail_b_path = Path(self.temp.name) / "card-b-tail.png"
+        video_a.write_bytes(b"video-a")
+        video_b.write_bytes(b"video-b")
+        tail_a_path.write_bytes(b"tail-a")
+        tail_b_path.write_bytes(b"tail-b")
+        tail_a = router.project_service.register_existing_asset(project.id, tail_a_path, AssetRole.LAST_FRAME, "A 尾帧")
+        tail_b = router.project_service.register_existing_asset(project.id, tail_b_path, AssetRole.LAST_FRAME, "B 尾帧")
+        first = router.store.save_shot(Shot(project_id=project.id, ordinal=1, title="第一镜"))
+        second = router.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=2,
+            title="第二镜",
+            continuity_mode=ShotContinuityMode.CONTINUOUS,
+            continuity_source_shot_id=first.id,
+        ))
+        card_a = router.store.save_job(RenderJob(
+            project_id=project.id,
+            shot_id=first.id,
+            type=JobType.VIDEO,
+            status=JobStatus.COMPLETED,
+            provider="ark_seedance",
+            output_path=str(video_a),
+            input_snapshot={"seedance_result": {"last_frame_asset_id": tail_a.id}},
+        ))
+        card_b = router.store.save_job(RenderJob(
+            project_id=project.id,
+            shot_id=first.id,
+            type=JobType.VIDEO,
+            status=JobStatus.COMPLETED,
+            provider="ark_seedance",
+            output_path=str(video_b),
+            input_snapshot={"output_artifacts": {"last_frame_asset_id": tail_b.id}},
+        ))
+        first.video_path = card_b.output_path
+        first.last_frame_asset_id = tail_b.id
+        first.video_status = "completed"
+        router.store.save_shot(first)
+
+        response = self.client.post(f"/api/projects/{project.id}/jobs/{card_a.id}/select", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        selected = router.store.get_shot(first.id)
+        self.assertEqual(selected.selected_video_job_id, card_a.id)
+        self.assertEqual(selected.video_path, str(video_a))
+        self.assertEqual(selected.last_frame_asset_id, tail_a.id)
+        self.assertEqual(
+            router.project_service.continuity_input_asset_id(project, second),
+            tail_a.id,
+        )
+
+        # A newly queued or completed candidate does not replace the adopted card.
+        router.render_queue._set_job_status_on_shot(selected, "queued")
+        self.assertEqual(selected.video_status, "completed")
+        candidate = RenderJob(
+            project_id=project.id,
+            shot_id=first.id,
+            type=JobType.VIDEO,
+            status=JobStatus.COMPLETED,
+            output_path=str(video_b),
+        )
+        router.render_queue._bind_completed_output(
+            selected,
+            candidate,
+            last_frame_asset_id=tail_b.id,
+            replace_tail=True,
+        )
+        self.assertEqual(selected.video_path, str(video_a))
+        self.assertEqual(selected.last_frame_asset_id, tail_a.id)
+
+        # Render metadata is server-owned and survives an ordinary editor save.
+        edited = selected.model_copy(update={"title": "第一镜改名"})
+        saved = router.project_service.update_shot(project.id, edited)
+        self.assertEqual(saved.selected_video_job_id, card_a.id)
+        self.assertEqual(saved.last_frame_asset_id, tail_a.id)
+
+        delete_selected = self.client.delete(f"/api/projects/{project.id}/jobs/{card_a.id}")
+        self.assertEqual(delete_selected.status_code, 409, delete_selected.text)
+        self.assertIn("当前采用版本", delete_selected.json()["detail"])
+
+        incomplete = router.store.save_job(RenderJob(
+            project_id=project.id,
+            shot_id=first.id,
+            type=JobType.VIDEO,
+            status=JobStatus.FAILED,
+        ))
+        rejected = self.client.post(f"/api/projects/{project.id}/jobs/{incomplete.id}/select", json={})
+        self.assertEqual(rejected.status_code, 400, rejected.text)
 
     def test_keyframe_upload_replaces_shot_binding(self) -> None:
         project = self.client.post(

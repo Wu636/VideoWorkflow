@@ -32,6 +32,7 @@ from src.video_workflow.domain import (
     ProjectStatus,
     Review,
     Shot,
+    ShotSplitPreview,
 )
 from src.video_workflow.integrations.comfyui import (
     ComfyUIClient,
@@ -53,7 +54,7 @@ from src.video_workflow.integrations.seedance import (
 from src.video_workflow.h3_prompt_skills import list_h3_prompt_skills
 from src.video_workflow.media_paths import resolve_media_path
 from src.video_workflow.services.finalize import Finalizer
-from src.video_workflow.services.projects import H3_DIRECTOR_VERSION, KeyframeBusyError, ProjectService, SceneReferenceConflictError, ShotVersionConflictError
+from src.video_workflow.services.projects import H3_DIRECTOR_VERSION, KeyframeBusyError, ProjectService, SceneReferenceConflictError, ShotSplitBusyError, ShotVersionConflictError
 from src.video_workflow.services.render_queue import RenderQueue
 from src.video_workflow.storage import ProjectStore
 
@@ -111,6 +112,7 @@ class CharacterReferencesGenerateRequest(BaseModel):
     image_model: str | None = None
     reference_asset_ids: list[str] | None = None
     appearance_profile_id: str | None = None
+    reference_strategy: Literal["identity", "project_style"] = "identity"
 
 
 class MissingCharacterReferencesGenerateRequest(BaseModel):
@@ -139,6 +141,17 @@ class ShotInsertRequest(BaseModel):
     after_shot_id: str | None = None
     user_suggestions: str = Field(min_length=1, max_length=4000)
     prompt_targets: list[Literal["h3", "seedance"]] = Field(default_factory=lambda: ["seedance"])
+    h3_skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
+
+
+class ShotSplitPreviewRequest(BaseModel):
+    user_suggestions: str = Field(default="", max_length=4000)
+    segment_count: Literal[2, 3, 4] | None = None
+
+
+class ShotSplitConfirmRequest(BaseModel):
+    preview: ShotSplitPreview
+    prompt_targets: list[Literal["h3", "seedance"]] = Field(default_factory=list)
     h3_skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
 
 
@@ -187,6 +200,7 @@ class KeyframePromptUpdateRequest(BaseModel):
     keyframe_prompt: str = Field(min_length=1, max_length=12000)
     keyframe_revision_suggestion_draft: str | None = Field(default=None, max_length=4000)
     keyframe_revision_mode: Literal["fresh", "iterate"] | None = None
+    keyframe_reference_asset_ids: list[str] | None = Field(default=None, max_length=20)
 
 
 class H3PromptGenerateRequest(BaseModel):
@@ -525,6 +539,7 @@ async def generate_character_references(project_id: str, request: CharacterRefer
             request.image_model,
             request.reference_asset_ids,
             request.appearance_profile_id,
+            reference_strategy=request.reference_strategy,
         )
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -811,6 +826,8 @@ async def update_keyframe_prompt(project_id: str, shot_id: str, request: Keyfram
             request.keyframe_prompt,
             request.keyframe_revision_suggestion_draft,
             request.keyframe_revision_mode,
+            request.keyframe_reference_asset_ids,
+            "keyframe_reference_asset_ids" in request.model_fields_set,
         )
     except KeyError as exc:
         raise _not_found(str(exc)) from exc
@@ -839,6 +856,47 @@ async def revise_shot(project_id: str, shot_id: str, request: ShotReviseRequest)
         raise HTTPException(status_code=500, detail=f"单镜 AI 重做失败: {exc}") from exc
 
 
+@router.post("/{project_id}/shots/{shot_id}/split-preview")
+async def preview_shot_split(project_id: str, shot_id: str, request: ShotSplitPreviewRequest):
+    try:
+        return await project_service.preview_shot_split(
+            project_id,
+            shot_id,
+            request.user_suggestions,
+            request.segment_count,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ShotVersionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的镜头 %s 生成拆分预览失败", project_id, shot_id)
+        raise HTTPException(status_code=500, detail=f"生成拆分预览失败: {exc}") from exc
+
+
+@router.post("/{project_id}/shots/{shot_id}/split-confirm")
+async def confirm_shot_split(project_id: str, shot_id: str, request: ShotSplitConfirmRequest):
+    try:
+        return await project_service.confirm_shot_split(
+            project_id,
+            shot_id,
+            request.preview,
+            request.prompt_targets,
+            request.h3_skill_id,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except (ShotVersionConflictError, ShotSplitBusyError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的镜头 %s 确认拆分失败", project_id, shot_id)
+        raise HTTPException(status_code=500, detail=f"确认拆分失败: {exc}") from exc
+
+
 @router.get("/{project_id}/shots/{shot_id}/seedance-materials")
 async def seedance_materials(project_id: str, shot_id: str):
     try:
@@ -847,6 +905,22 @@ async def seedance_materials(project_id: str, shot_id: str):
         if shot.project_id != project_id:
             raise KeyError("Shot not found")
         return project_service.seedance_material_diagnostics(
+            project,
+            shot,
+            store.list_assets(project_id),
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+
+
+@router.get("/{project_id}/shots/{shot_id}/keyframe-materials")
+async def keyframe_materials(project_id: str, shot_id: str):
+    try:
+        project = project_service.require_project(project_id)
+        shot = project_service.require_shot(shot_id)
+        if shot.project_id != project_id:
+            raise KeyError("Shot not found")
+        return project_service.keyframe_material_diagnostics(
             project,
             shot,
             store.list_assets(project_id),
@@ -956,6 +1030,12 @@ async def delete_asset(project_id: str, asset_id: str):
         changed = False
         if asset_id in shot.reference_asset_ids:
             shot.reference_asset_ids = [item for item in shot.reference_asset_ids if item != asset_id]
+            changed = True
+        if shot.keyframe_reference_asset_ids is not None and asset_id in shot.keyframe_reference_asset_ids:
+            shot.keyframe_reference_asset_ids = [item for item in shot.keyframe_reference_asset_ids if item != asset_id]
+            changed = True
+        if shot.video_reference_asset_ids is not None and asset_id in shot.video_reference_asset_ids:
+            shot.video_reference_asset_ids = [item for item in shot.video_reference_asset_ids if item != asset_id]
             changed = True
         if shot.keyframe_asset_id == asset_id:
             shot.keyframe_asset_id = None
@@ -1245,6 +1325,16 @@ async def cancel_job(project_id: str, job_id: str):
     return await render_queue.cancel(job_id)
 
 
+@router.post("/{project_id}/jobs/{job_id}/select")
+async def select_render_job(project_id: str, job_id: str):
+    try:
+        return await asyncio.to_thread(render_queue.select_output, project_id, job_id)
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.delete("/{project_id}/jobs/{job_id}")
 async def delete_job(project_id: str, job_id: str):
     job = store.get_job(job_id)
@@ -1252,17 +1342,44 @@ async def delete_job(project_id: str, job_id: str):
         raise _not_found("Job not found")
     if job.status not in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
         raise HTTPException(status_code=409, detail="任务仍在进行中，请先取消后再删除")
+    shot = store.get_shot(job.shot_id) if job.shot_id else None
+    if shot and shot.selected_video_job_id == job.id:
+        raise HTTPException(status_code=409, detail="该任务是当前采用版本，请先采用另一版本再删除")
+    was_current_output = bool(shot and job.output_path and shot.video_path == job.output_path)
     store.delete_job(job_id)
-    if job.shot_id:
-        shot = store.get_shot(job.shot_id)
-        if shot:
-            remaining = [item for item in store.list_jobs(project_id) if item.shot_id == job.shot_id]
-            if remaining:
-                latest = max(remaining, key=lambda item: item.updated_at)
-                shot.video_status = "failed" if latest.status == JobStatus.FAILED else latest.status.value
+    if shot:
+        remaining = [item for item in store.list_jobs(project_id) if item.shot_id == job.shot_id]
+        if was_current_output:
+            fallback = next(
+                (
+                    item for item in remaining
+                    if item.status == JobStatus.COMPLETED and item.output_path
+                ),
+                None,
+            )
+            if fallback:
+                shot.video_path = fallback.output_path
+                shot.last_frame_asset_id = render_queue.job_last_frame_asset_id(fallback)
+                shot.video_status = "completed"
             else:
-                shot.video_status = "pending"
-            store.save_shot(shot)
+                shot.video_path = None
+                shot.last_frame_asset_id = None
+                latest = remaining[0] if remaining else None
+                shot.video_status = (
+                    "failed" if latest and latest.status == JobStatus.FAILED
+                    else latest.status.value if latest
+                    else "pending"
+                )
+        elif shot.selected_video_job_id and shot.video_path:
+            shot.video_status = "completed"
+        elif not shot.video_path:
+            latest = remaining[0] if remaining else None
+            shot.video_status = (
+                "failed" if latest and latest.status == JobStatus.FAILED
+                else latest.status.value if latest
+                else "pending"
+            )
+        store.save_shot(shot)
     return {"deleted": True}
 
 

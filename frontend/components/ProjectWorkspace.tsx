@@ -27,6 +27,7 @@ import {
     Plus,
     RefreshCw,
     Save,
+    Scissors,
     Server,
     Settings2,
     Sparkles,
@@ -45,6 +46,7 @@ import {
     analyzeProjectStyle,
     cancelRenderJob,
     comfyPreflight,
+    confirmShotSplit,
     deleteProjectAsset,
     deleteRenderJob,
     deleteShot,
@@ -58,6 +60,7 @@ import {
     generateSeedancePrompts,
     generateKeyframes,
     generateStoryboard,
+    getKeyframeMaterials,
     getSeedanceMaterials,
     importStoryboard,
     insertShotWithAi,
@@ -68,12 +71,14 @@ import {
     estimateSeedance,
     getRenderJobs,
     planRender,
+    previewShotSplit,
     projectDownloadUrl,
     projectInlineUrl,
     reorderStoryboard,
     reviseShotWithAi,
     rewriteProjectScript,
     seedancePreflight,
+    selectRenderJob,
     saveProjectAsSeries,
     storyboardCsvUrl,
     updateProject,
@@ -85,7 +90,7 @@ import {
 } from "@/lib/api";
 import { isH3PromptBlocked, isKeyframeBusy } from "@/lib/production-busy";
 import SceneProfileCard from "@/components/SceneProfileCard";
-import type { Asset, AssetRole, CharacterProfile, Delivery, H3PromptSkill, Project, ProjectAnalysisDraft, ProjectBundle, RenderJob, ScriptRewriteDraft, SeedanceCatalog, SeedanceEstimate, SeedanceMaterialDiagnostics, Shot, StyleAnalysisDraft } from "@/types";
+import type { Asset, AssetRole, CharacterProfile, Delivery, H3PromptSkill, KeyframeMaterialDiagnostics, Project, ProjectAnalysisDraft, ProjectBundle, RenderJob, ScriptRewriteDraft, SeedanceCatalog, SeedanceEstimate, SeedanceMaterialDiagnostics, Shot, ShotSplitPreview, StyleAnalysisDraft } from "@/types";
 
 type Tab = "brief" | "storyboard" | "assets" | "production" | "review" | "delivery";
 
@@ -99,6 +104,61 @@ const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
 ];
 
 const ACTIVE_JOBS = new Set(["queued", "submitting", "running", "cancel_requested"]);
+
+function selectedSceneProfileIds(shot: Shot): string[] {
+    return Array.from(new Set([
+        ...(shot.scene_profile_ids || []),
+        ...(shot.scene_profile_id ? [shot.scene_profile_id] : []),
+    ])).slice(0, 2);
+}
+
+function sceneProfileSelectionPatch(
+    shot: Shot,
+    position: "start" | "destination",
+    profileId: string,
+): Pick<Shot, "use_scene_profile" | "scene_profile_id" | "scene_profile_ids"> {
+    const current = selectedSceneProfileIds(shot);
+    if (position === "start") {
+        if (!profileId) return { use_scene_profile: false, scene_profile_id: null, scene_profile_ids: [] };
+        const destination = current[1] && current[1] !== profileId ? current[1] : null;
+        const ids = [profileId, ...(destination ? [destination] : [])];
+        return { use_scene_profile: true, scene_profile_id: profileId, scene_profile_ids: ids };
+    }
+    const start = current[0];
+    if (!start) return { use_scene_profile: false, scene_profile_id: null, scene_profile_ids: [] };
+    const ids = profileId && profileId !== start ? [start, profileId] : [start];
+    return { use_scene_profile: true, scene_profile_id: start, scene_profile_ids: ids };
+}
+
+function applyAnalysisConfirmationDefaults(draft: ProjectAnalysisDraft): ProjectAnalysisDraft {
+    const characters = [...draft.characters];
+    const knownNames = new Set(characters.map((character) => character.name.trim().toLocaleLowerCase()));
+    let changed = false;
+    const analysisNotes = draft.analysis_notes.map((note) => {
+        const match = note.match(/([^，。；：]{1,36}?)(?:是否需要|是否要|需不需要)(?:单独|独立)(?:设定|设计)(?:形象|角色)?/);
+        if (!match) return note;
+        let name = match[1].trim();
+        for (const prefix of ["需确认", "确认", "剧中出现的", "剧中", "画面中的", "出现的", "中的"]) {
+            if (name.includes(prefix)) name = name.split(prefix).at(-1)?.trim() || name;
+        }
+        name = name.replace(/(?:角色|形象)$/, "").trim();
+        if (!name || name.length > 20) return note;
+        if (!knownNames.has(name.toLocaleLowerCase())) {
+            characters.push({
+                character_id: null,
+                name,
+                description: `根据剧本为${name}建立独立、稳定、可跨镜复用的固定形象；可在当前角色卡直接补充识别特征。`,
+                wardrobe: "无服装；如有项圈、挂件或其他固定配饰，可在当前角色卡补充。",
+                voice_description: "无台词；如有叫声或拟人台词，可在当前角色卡补充。",
+                reference_observations: `由确认项自动建档：${note}`,
+            });
+            knownNames.add(name.toLocaleLowerCase());
+        }
+        changed = true;
+        return `已默认将${name}作为独立固定形象建档；如不需要，可在上方角色草稿中删除。`;
+    });
+    return changed ? { ...draft, characters, analysis_notes: analysisNotes } : draft;
+}
 
 export default function ProjectWorkspace({ projectId }: { projectId: string }) {
     const [bundle, setBundle] = useState<ProjectBundle | null>(null);
@@ -152,10 +212,12 @@ export default function ProjectWorkspace({ projectId }: { projectId: string }) {
         if (!jobsActive) return;
         const timer = window.setInterval(async () => {
             const jobs = await getRenderJobs(projectId).catch(() => null);
-            if (jobs) setBundle((current) => current ? { ...current, jobs } : current);
+            if (!jobs) return;
+            setBundle((current) => current ? { ...current, jobs } : current);
+            if (!jobs.some((job) => ACTIVE_JOBS.has(job.status))) void refresh();
         }, 2500);
         return () => window.clearInterval(timer);
-    }, [jobsActive, projectId]);
+    }, [jobsActive, projectId, refresh]);
 
     const action = async (key: string, task: () => Promise<unknown>, success: string, reload = true) => {
         setBusy((current) => new Set(current).add(key));
@@ -230,6 +292,11 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
     const [seriesName, setSeriesName] = useState(project.brief.title);
     const [seriesDescription, setSeriesDescription] = useState("");
     const [selected, setSelected] = useState<Record<string, boolean>>({ visual_style: !project.series_id, pacing: true, audience: true, style_bible: !project.series_id, negative_prompt: !project.series_id, delivery_notes: true, shot_count: true, characters: true });
+    useEffect(() => {
+        if (!analysis) return;
+        const normalized = applyAnalysisConfirmationDefaults(analysis);
+        if (normalized !== analysis) setAnalysis(normalized);
+    }, [analysis]);
     const changeBrief = (key: keyof Project["brief"], value: string | number) => setLocal({ ...project, brief: { ...project.brief, [key]: value } });
     const changeAspect = (aspectRatio: string) => {
         const [width, height] = aspectRatio === "9:16" ? [768, 1344] : aspectRatio === "1:1" ? [1024, 1024] : [1344, 768];
@@ -334,6 +401,25 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
         catch (caught) { setAnalysisError(caught instanceof Error ? caught.message : String(caught)); }
         finally { setAnalysisBusy(""); }
     };
+    const updateAnalysisCharacter = (index: number, key: keyof ProjectAnalysisDraft["characters"][number], value: string) => {
+        if (!analysis) return;
+        setAnalysis({
+            ...analysis,
+            characters: analysis.characters.map((character, characterIndex) => characterIndex === index ? { ...character, [key]: value } : character),
+        });
+    };
+    const addAnalysisCharacter = () => {
+        if (!analysis) return;
+        setAnalysis({
+            ...analysis,
+            characters: [...analysis.characters, { character_id: null, name: "新角色", description: "", wardrobe: "", voice_description: "", reference_observations: "用户在确认阶段新增" }],
+        });
+        setSelected({ ...selected, characters: true });
+    };
+    const removeAnalysisCharacter = (index: number) => {
+        if (!analysis) return;
+        setAnalysis({ ...analysis, characters: analysis.characters.filter((_, characterIndex) => characterIndex !== index) });
+    };
     return <div className="grid gap-5 xl:grid-cols-[1.3fr_.7fr]">
         <section className="studio-panel">
             <div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><p className="studio-kicker">CLIENT BRIEF</p><h2 className="text-xl font-semibold">客户需求</h2></div><div className="flex flex-wrap gap-2"><label className="studio-secondary cursor-pointer"><input className="hidden" type="file" accept=".txt,.md,.markdown,.docx,.pdf" disabled={!!analysisBusy} onChange={(event) => event.target.files?.[0] && void uploadScript(event.target.files[0])} />{analysisBusy === "upload" ? <Loader2 className="animate-spin" size={15} /> : <Upload size={15} />}上传剧本</label><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => { setRewriteOpen(true); setRewriteDraft(null); }}><FilePenLine size={15} />AI 扩写/缩写</button><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => void runAnalysis()}>{analysisBusy === "analyze" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}AI 分析并回填</button><button className="studio-secondary" disabled={busy.has("series-sync")} onClick={() => project.series_id ? void syncSeries(false) : setSeriesOpen(true)}>{busy.has("series-sync") ? <Loader2 className="animate-spin" size={15} /> : <BookCopy size={15} />}{project.series_id ? "更新系列资料" : "建立系列资料"}</button><button className="studio-primary" disabled={busy.has("save-project")} onClick={() => void save(project)}>{busy.has("save-project") ? <Loader2 className="animate-spin" size={16} /> : <Save size={16} />} 保存</button></div></div>
@@ -390,7 +476,7 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
         {rewriteOpen && <div className="studio-modal" onMouseDown={closeRewrite}><section className="studio-dialog max-w-6xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI SCRIPT REWRITE</p><div className="mb-5 flex items-start justify-between gap-4"><div><h2 className="text-2xl font-semibold">按目标时长扩写或缩写剧本</h2><p className="mt-1 text-sm leading-6 text-white/45">目标成片 {project.brief.target_duration_seconds} 秒。AI 先生成预览，确认后才会覆盖并保存当前剧本。</p></div><button className="studio-secondary" disabled={!!analysisBusy} onClick={closeRewrite}>关闭</button></div>{!rewriteDraft ? <div className="space-y-5"><div className="grid gap-4 md:grid-cols-2"><Field label="改写方式"><select value={rewriteMode} onChange={(event) => setRewriteMode(event.target.value as typeof rewriteMode)}><option value="auto">AI 根据时长自动判断</option><option value="shorten">只缩写 · 保留核心剧情</option><option value="expand">只扩写 · 补足目标时长</option></select></Field><div className="rounded-lg border border-cyan-300/10 bg-cyan-300/[.035] px-4 py-3"><p className="text-xs text-white/35">当前约束</p><p className="mt-1 text-sm text-cyan-100/75">原稿 {project.brief.story.length} 字符 · 目标 {project.brief.target_duration_seconds} 秒 · 单镜 ≤15 秒</p></div></div><label><span className="studio-label">给 AI 的改写建议（可选）</span><textarea className="studio-input min-h-40 resize-y" maxLength={4000} value={rewriteSuggestions} onChange={(event) => setRewriteSuggestions(event.target.value)} placeholder="例如：保留所有关键问答，但合并重复流程；重点突出人物冲突和结尾反思。或者：增加开场铺垫、人物动机和两个情绪转折，不改变原结局……" autoFocus /></label><div className="flex items-center justify-between text-xs text-white/30"><span>建议会作为本次改写的高优先级要求</span><span>{rewriteSuggestions.length}/4000</span></div><div className="flex justify-end gap-2"><button className="studio-secondary" onClick={closeRewrite}>取消</button><button className="studio-primary" disabled={analysisBusy === "rewrite"} onClick={() => void runRewrite()}>{analysisBusy === "rewrite" ? <Loader2 className="animate-spin" size={16} /> : <WandSparkles size={16} />}生成改写预览</button></div></div> : <div><div className="mb-4 grid gap-3 sm:grid-cols-3"><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">改写方向</p><strong className="mt-1 block">{rewriteDraft.rewrite_mode === "expand" ? "扩写" : rewriteDraft.rewrite_mode === "shorten" ? "缩写" : "平衡改写"}</strong></div><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">预计可实现时长</p><strong className="mt-1 block text-cyan-200">{rewriteDraft.estimated_duration_seconds.toFixed(0)} 秒 / 目标 {project.brief.target_duration_seconds} 秒</strong></div><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">文本长度变化</p><strong className="mt-1 block">{project.brief.story.length} → {rewriteDraft.rewritten_story.length} 字符</strong></div></div><div className="mb-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] px-4 py-3"><p className="text-xs text-white/35">改动摘要</p><p className="mt-1 text-sm leading-6 text-white/70">{rewriteDraft.change_summary || "AI 未提供摘要"}</p></div>{rewriteDraft.feasibility_notes.length > 0 && <div className="mb-4 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-4 py-3"><p className="text-xs font-semibold text-amber-100/70">制作提醒</p><ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-white/55">{rewriteDraft.feasibility_notes.map((note) => <li key={note}>{note}</li>)}</ul></div>}<div className="grid gap-4 lg:grid-cols-2"><label><span className="studio-label">原始剧本（不会直接修改）</span><textarea className="studio-input min-h-[42vh] resize-y text-white/45" value={project.brief.story} readOnly /></label><label><span className="studio-label">AI 改写预览（应用前仍可手动调整）</span><textarea className="studio-input min-h-[42vh] resize-y" value={rewriteDraft.rewritten_story} onChange={(event) => setRewriteDraft({ ...rewriteDraft, rewritten_story: event.target.value })} /></label></div><div className="mt-5 flex flex-wrap justify-end gap-2"><button className="studio-secondary" disabled={!!analysisBusy} onClick={() => setRewriteDraft(null)}>返回调整建议</button><button className="studio-primary" disabled={analysisBusy === "apply-rewrite" || !rewriteDraft.rewritten_story.trim()} onClick={() => void applyRewrite()}>{analysisBusy === "apply-rewrite" ? <Loader2 className="animate-spin" size={16} /> : <Check size={16} />}应用并保存新剧本</button></div></div>}</section></div>}
         {analysis && <div className="studio-modal" onMouseDown={() => setAnalysis(null)}><section className="studio-dialog max-w-5xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI SCRIPT ANALYSIS</p><div className="mb-5 flex items-start justify-between gap-4"><div><h2 className="text-2xl font-semibold">选择要回填的分析结果</h2><p className="mt-1 text-sm text-white/40">当前表单不会立刻被覆盖；勾选后再应用并保存。</p></div><button className="studio-secondary" onClick={() => setAnalysis(null)}>关闭</button></div><div className="grid max-h-[65vh] gap-3 overflow-y-auto pr-1 md:grid-cols-2">{([
             ["visual_style", "视觉风格", analysis.visual_style], ["pacing", "叙事节奏", analysis.pacing], ["audience", "目标受众", analysis.audience], ["style_bible", "统一风格圣经", analysis.style_bible], ["negative_prompt", "负面提示词", analysis.negative_prompt], ["delivery_notes", "交付备注", analysis.delivery_notes],
-        ] as [string, string, string][]).map(([key, label, value]) => <label key={key} className="rounded-lg border border-white/8 bg-black/15 p-4"><div className="mb-2 flex items-center gap-2"><input type="checkbox" checked={selected[key]} onChange={(event) => setSelected({ ...selected, [key]: event.target.checked })} /><strong>{label}</strong></div><p className="whitespace-pre-wrap text-sm leading-6 text-white/55">{value || "AI 未提供"}</p></label>)}<label className="rounded-lg border border-cyan-300/15 bg-cyan-300/[.03] p-4"><div className="mb-2 flex items-center gap-2"><input type="checkbox" checked={selected.shot_count} onChange={(event) => setSelected({ ...selected, shot_count: event.target.checked })} /><strong>AI 推荐分镜数：{analysis.recommended_shot_count} 镜</strong></div><p className="text-sm leading-6 text-white/55">{analysis.shot_count_reason}</p></label><label className="rounded-lg border border-cyan-300/15 bg-cyan-300/[.03] p-4 md:col-span-2"><div className="mb-3 flex items-center gap-2"><input type="checkbox" checked={selected.characters} onChange={(event) => setSelected({ ...selected, characters: event.target.checked })} /><strong>角色一致性草稿（{analysis.characters.length} 个角色）</strong></div><div className="grid gap-3 md:grid-cols-2">{analysis.characters.map((character, index) => <div key={`${character.character_id}-${index}`} className="rounded border border-white/8 p-3"><strong>{character.name}</strong><p className="mt-2 text-xs leading-5 text-white/55">{character.description}</p><p className="mt-2 text-xs leading-5 text-white/45">服装：{character.wardrobe}</p><p className="mt-2 text-xs leading-5 text-white/45">声音：{character.voice_description}</p>{character.reference_observations && <p className="mt-2 text-[11px] leading-5 text-cyan-100/45">参考图观察：{character.reference_observations}</p>}</div>)}</div></label>{analysis.analysis_notes.length > 0 && <div className="rounded-lg border border-amber-300/15 bg-amber-300/[.03] p-4 md:col-span-2"><strong className="text-amber-100/80">需要确认</strong><ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-white/50">{analysis.analysis_notes.map((note) => <li key={note}>{note}</li>)}</ul></div>}</div><div className="mt-5 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setAnalysis(null)}>暂不应用</button><button className="studio-primary" disabled={analysisBusy === "apply"} onClick={() => void applyAnalysis()}>{analysisBusy === "apply" ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}应用所选并保存</button></div></section></div>}
+        ] as [string, string, string][]).map(([key, label, value]) => <label key={key} className="rounded-lg border border-white/8 bg-black/15 p-4"><div className="mb-2 flex items-center gap-2"><input type="checkbox" checked={selected[key]} onChange={(event) => setSelected({ ...selected, [key]: event.target.checked })} /><strong>{label}</strong></div><p className="whitespace-pre-wrap text-sm leading-6 text-white/55">{value || "AI 未提供"}</p></label>)}<label className="rounded-lg border border-cyan-300/15 bg-cyan-300/[.03] p-4"><div className="mb-2 flex items-center gap-2"><input type="checkbox" checked={selected.shot_count} onChange={(event) => setSelected({ ...selected, shot_count: event.target.checked })} /><strong>AI 推荐分镜数：{analysis.recommended_shot_count} 镜</strong></div><p className="text-sm leading-6 text-white/55">{analysis.shot_count_reason}</p></label><div className="rounded-lg border border-cyan-300/15 bg-cyan-300/[.03] p-4 md:col-span-2"><div className="mb-2 flex flex-wrap items-center justify-between gap-2"><label className="flex items-center gap-2"><input type="checkbox" checked={selected.characters} onChange={(event) => setSelected({ ...selected, characters: event.target.checked })} /><strong>角色一致性草稿（{analysis.characters.length} 个角色）</strong></label><button type="button" className="studio-secondary px-3 py-1.5 text-xs" onClick={addAnalysisCharacter}><Plus size={13} />添加角色 / 动物</button></div><p className="mb-3 text-xs leading-5 text-white/40">这里可以直接修改 AI 推荐档案；人物、动物、鬼魂等需要跨镜一致的主体都会保存为独立角色。</p><div className="grid gap-3 md:grid-cols-2">{analysis.characters.map((character, index) => <div key={`${character.character_id}-${index}`} className="rounded border border-white/8 p-3"><div className="mb-2 flex gap-2"><input className="studio-input font-semibold" value={character.name} onChange={(event) => updateAnalysisCharacter(index, "name", event.target.value)} placeholder="角色名称，例如：老黄狗" /><button type="button" className="rounded px-2 text-white/25 hover:text-red-300" onClick={() => removeAnalysisCharacter(index)} title="删除此角色草稿"><Trash2 size={14} /></button></div><textarea className="studio-input mb-2" rows={3} value={character.description} onChange={(event) => updateAnalysisCharacter(index, "description", event.target.value)} placeholder="固定外貌；动物请写品种、体型、毛色斑纹、耳尾和眼睛" /><textarea className="studio-input mb-2" rows={2} value={character.wardrobe} onChange={(event) => updateAnalysisCharacter(index, "wardrobe", event.target.value)} placeholder="固定服装、项圈、配饰或无服装" /><textarea className="studio-input" rows={2} value={character.voice_description} onChange={(event) => updateAnalysisCharacter(index, "voice_description", event.target.value)} placeholder="声音设定；不说话可填写无台词" />{character.reference_observations && <p className="mt-2 text-[11px] leading-5 text-cyan-100/45">分析依据：{character.reference_observations}</p>}</div>)}</div></div>{analysis.analysis_notes.length > 0 && <div className="rounded-lg border border-amber-300/15 bg-amber-300/[.03] p-4 md:col-span-2"><strong className="text-amber-100/80">AI 已先采用推荐方案</strong><p className="mt-1 text-xs leading-5 text-white/40">这些是需要你留意的推断，推荐值已经写入上方对应字段或角色卡；满意即可直接应用，也可以在本窗口修改。</p><ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-white/50">{analysis.analysis_notes.map((note) => <li key={note}>{note}</li>)}</ul></div>}</div><div className="mt-5 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setAnalysis(null)}>暂不应用</button><button className="studio-primary" disabled={analysisBusy === "apply" || (selected.characters && analysis.characters.some((character) => !character.name.trim()))} onClick={() => void applyAnalysis()}>{analysisBusy === "apply" ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}应用所选并保存</button></div></section></div>}
     </div>;
 }
 
@@ -411,6 +497,12 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
     const [insertOpen, setInsertOpen] = useState(false);
     const [insertAfterShotId, setInsertAfterShotId] = useState("");
     const [insertSuggestions, setInsertSuggestions] = useState("");
+    const [splitShot, setSplitShot] = useState<Shot | null>(null);
+    const [splitSuggestions, setSplitSuggestions] = useState("");
+    const [splitCount, setSplitCount] = useState<"" | 2 | 3 | 4>("");
+    const [splitPreview, setSplitPreview] = useState<ShotSplitPreview | null>(null);
+    const [splitBusy, setSplitBusy] = useState<"" | "preview" | "confirm">("");
+    const [splitError, setSplitError] = useState("");
     const duration = bundle.shots.reduce((sum, shot) => sum + shot.duration_seconds, 0);
     const isRedo = bundle.shots.length > 0;
     const patchShot = (id: string, patch: Partial<Shot>) => updateLocal(bundle.shots.map((shot) => shot.id === id ? { ...shot, ...patch } : shot));
@@ -461,6 +553,56 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
             `已在${insertionLabel}新增 1 个完整分镜，原有镜头和生成结果均已保留`,
         ).then(refresh);
     };
+    const openSplit = (shot: Shot) => {
+        setSplitShot(shot);
+        setSplitSuggestions("");
+        setSplitCount("");
+        setSplitPreview(null);
+        setSplitError("");
+    };
+    const closeSplit = () => {
+        if (splitBusy) return;
+        setSplitShot(null);
+        setSplitPreview(null);
+        setSplitError("");
+    };
+    const generateSplitPreview = async () => {
+        if (!splitShot) return;
+        setSplitBusy("preview");
+        setSplitError("");
+        try {
+            setSplitPreview(await previewShotSplit(bundle.project.id, splitShot.id, {
+                userSuggestions: splitSuggestions.trim(),
+                segmentCount: splitCount || null,
+            }));
+        } catch (caught) {
+            setSplitError(caught instanceof Error ? caught.message : String(caught));
+        } finally {
+            setSplitBusy("");
+        }
+    };
+    const patchSplitSegment = (index: number, patch: Partial<ShotSplitPreview["segments"][number]>) => {
+        setSplitPreview((current) => {
+            if (!current) return current;
+            const segments = current.segments.map((segment, segmentIndex) => segmentIndex === index ? { ...segment, ...patch } : segment);
+            return { ...current, segments, proposed_duration_seconds: Number(segments.reduce((sum, segment) => sum + segment.duration_seconds, 0).toFixed(2)) };
+        });
+    };
+    const applySplit = async () => {
+        if (!splitShot || !splitPreview) return;
+        setSplitBusy("confirm");
+        setSplitError("");
+        try {
+            await confirmShotSplit(bundle.project.id, splitShot.id, splitPreview, promptTargets);
+            setSplitShot(null);
+            setSplitPreview(null);
+            await refresh();
+        } catch (caught) {
+            setSplitError(caught instanceof Error ? caught.message : String(caught));
+        } finally {
+            setSplitBusy("");
+        }
+    };
     return <div>
         <section className="studio-panel mb-5 flex flex-wrap items-center justify-between gap-4">
             <div><p className="studio-kicker">STORYBOARD V{bundle.project.storyboard_version}</p><h2 className="text-xl font-semibold">详细分镜设计表</h2><p className="mt-1 text-sm text-white/40">{bundle.shots.length} 镜 · 合计 {duration.toFixed(1)} 秒 · 每镜强制 ≤15 秒</p></div>
@@ -479,9 +621,11 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
                         <Field label="镜头标题"><input value={shot.title} onChange={(event) => patchShot(shot.id, { title: event.target.value })} /></Field>
                         <Field label="时长（0.25–15秒）"><input type="number" min={0.25} max={15} step={0.25} value={shot.duration_seconds} onChange={(event) => patchShot(shot.id, { duration_seconds: Math.min(15, Math.max(.25, Number(event.target.value))) })} /></Field>
                         <Field label="生成策略"><select value={shot.generation_mode} onChange={(event) => patchShot(shot.id, { generation_mode: event.target.value as Shot["generation_mode"] })}><option value="auto">自动判断</option><option value="i2v">首帧 I2V</option><option value="r2v">全能参考 R2V</option></select></Field>
-                        <Field label="场景一致性（按需）"><select value={shot.use_scene_profile ? (shot.scene_profile_id || "") : "off"} onChange={(event) => patchShot(shot.id, event.target.value === "off" ? { use_scene_profile: false } : { use_scene_profile: true, scene_profile_id: event.target.value })}><option value="off">不使用场景档案 · 保持原链路</option>{bundle.project.scene_profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.approved ? " · 已有场景母版" : " · 待生成母版"}</option>)}</select><span className="mt-1 block text-[11px] leading-5 text-white/35">只有客户要求同一空间连续时才启用；关闭后仍按本镜首帧直接生成视频。</span></Field>
+                        <Field label="首帧完整度" hint="仅影响 Seedance 自动参考策略。完整表示首帧已包含本镜需要保持的全部人物、场景和固定物品。"><select value={shot.first_frame_completeness || "unknown"} onChange={(event) => patchShot(shot.id, { first_frame_completeness: event.target.value as Shot["first_frame_completeness"], seedance_reference_mode: "auto" })}><option value="unknown">未确认 · 默认全模态</option><option value="complete">完整 · 自动严格首帧</option><option value="incomplete">不完整 · 自动全模态</option></select></Field>
+                        <Field label="起始场景模板（按需）"><select value={shot.use_scene_profile ? (selectedSceneProfileIds(shot)[0] || "") : ""} onChange={(event) => patchShot(shot.id, sceneProfileSelectionPatch(shot, "start", event.target.value))}><option value="">不使用场景档案 · 保持原链路</option>{bundle.project.scene_profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.approved ? " · 已有场景母版" : " · 待生成母版"}</option>)}</select><span className="mt-1 block text-[11px] leading-5 text-white/35">首帧和转场前的空间；普通单场景镜头只选这一项。</span></Field>
+                        <Field label="转场后场景模板（可选）"><select disabled={!shot.use_scene_profile || !selectedSceneProfileIds(shot)[0]} value={selectedSceneProfileIds(shot)[1] || ""} onChange={(event) => patchShot(shot.id, sceneProfileSelectionPatch(shot, "destination", event.target.value))}><option value="">无 · 本镜不跨场景</option>{bundle.project.scene_profiles.filter((profile) => profile.id !== selectedSceneProfileIds(shot)[0]).map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.approved ? " · 已有场景母版" : " · 待生成母版"}</option>)}</select><span className="mt-1 block text-[11px] leading-5 text-white/35">跨空间镜头按“起始→目标”执行，两套环境不会同时混在同一阶段。</span></Field>
                         <Field label="Seedance 镜头衔接"><select value={shot.continuity_mode} onChange={(event) => patchShot(shot.id, { continuity_mode: event.target.value as Shot["continuity_mode"], continuity_source_shot_id: event.target.value === "continuous" ? (bundle.shots[index - 1]?.id || null) : null })}><option value="independent">独立镜头 · 正常切镜</option><option value="same_scene">同场景切镜 · 不硬接尾帧</option><option value="continuous" disabled={index === 0}>连续长镜头 · 上一镜尾帧续接</option></select><span className="mt-1 block text-[11px] leading-5 text-white/35">“连续长镜头”会把上一镜真实尾帧作为本镜严格首帧；普通对话换机位选“同场景切镜”。</span></Field>
-                        <Field label="Seedance 人物参考策略"><select value={shot.seedance_reference_mode} onChange={(event) => patchShot(shot.id, { seedance_reference_mode: event.target.value as Shot["seedance_reference_mode"] })}><option value="multimodal_reference">全模态参考 · 默认带全部人设图</option><option value="auto">兼容自动 · 同样按全模态</option><option value="strict_first_frame">严格首帧 · 特殊情况仅发构图图</option></select><span className="mt-1 block text-[11px] leading-5 text-white/35">系统默认提交首帧、场景图和本镜全部出场角色的人物形象图；严格首帧只作为手动特例保留。</span></Field>
+                        <Field label="Seedance 参考策略"><select value={shot.seedance_reference_mode} onChange={(event) => patchShot(shot.id, { seedance_reference_mode: event.target.value as Shot["seedance_reference_mode"] })}><option value="auto">自动 · 按首帧完整度选择</option><option value="multimodal_reference">手动全模态参考</option><option value="strict_first_frame">手动严格首帧</option></select><span className="mt-1 block text-[11px] leading-5 text-white/35">自动模式会读取下方首帧完整度；跨场景或首帧信息不足时保留全模态。</span></Field>
                         <Field label="画面叙事" wide><textarea rows={3} value={shot.narrative} onChange={(event) => patchShot(shot.id, { narrative: event.target.value })} /></Field>
                         <Field label="对白/旁白"><textarea rows={3} value={shot.dialogue} onChange={(event) => patchShot(shot.id, { dialogue: event.target.value, dialogue_turns: [] })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">修改整段对白后，系统会在保存/编译计划时重新分析逐句发言者。</span></Field>
                         <Field label="本镜发言者"><select value={shot.dialogue_speaker_id || ""} onChange={(event) => patchShot(shot.id, { dialogue_speaker_id: event.target.value || null, dialogue_turns: [] })}><option value="">旁白 / 自动推断</option>{bundle.project.characters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}</select><span className="mt-1 block text-[11px] leading-5 text-white/35">单人对白可直接指定；多人问答请在下方逐句确认。</span></Field>
@@ -501,9 +645,38 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
                         <Field label={`MiniMax H3 Prompt · ${shot.h3_prompt_skill_id || "h3-prompt-writing"}`} wide><textarea rows={6} value={shot.video_prompt} onChange={(event) => patchShot(shot.id, { video_prompt: event.target.value })} /><span className="mt-1 block text-[11px] leading-5 text-white/35">可手动微调；在“视频生成”页可选择官方风格 Skill 批量重新生成。</span></Field>
                         <Field label={`Seedance 2.0 全模态 Prompt${shot.seedance_prompt_version ? ` · ${shot.seedance_prompt_version}` : ""}`} wide><textarea rows={7} value={shot.seedance_prompt} onChange={(event) => patchShot(shot.id, { seedance_prompt: event.target.value })} placeholder="在“视频生成”页点击编译 Seedance Prompt 后自动生成，也可在这里手动微调。" /><span className="mt-1 block text-[11px] leading-5 text-white/35">使用图片1/视频1/音频1编号，与方舟 content 数组顺序严格一致；不会覆盖 H3 Prompt。</span></Field>
                     </div>
-                    <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="studio-secondary" disabled={!!busy} onClick={() => { setReviseShot(shot); setReviseSuggestions(""); }}><WandSparkles size={14} />AI 重做本镜</button><button className="studio-secondary px-3" disabled={index === 0 || !!busy} onClick={() => moveShot(index, -1)}><ChevronUp size={14} />上移</button><button className="studio-secondary px-3" disabled={index === bundle.shots.length - 1 || !!busy} onClick={() => moveShot(index, 1)}><ChevronDown size={14} />下移</button><button className="studio-danger" onClick={() => void action(`delete-${shot.id}`, () => deleteShot(bundle.project.id, shot.id), `镜头 ${shot.ordinal} 已删除`)}><Trash2 size={14} />删除</button><button className="studio-primary" disabled={busy === `shot-${shot.id}`} onClick={() => void action(`shot-${shot.id}`, () => updateShot(shot), `镜头 ${shot.ordinal} 已保存且三个下游 Prompt 已同步`, false).then(refresh)}>{busy === `shot-${shot.id}` ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}保存镜头</button></div>
+                    <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="studio-secondary" disabled={!!busy || !!splitBusy} onClick={() => openSplit(shot)}><Scissors size={14} />AI 拆分本镜</button><button className="studio-secondary" disabled={!!busy || !!splitBusy} onClick={() => { setReviseShot(shot); setReviseSuggestions(""); }}><WandSparkles size={14} />AI 重做本镜</button><button className="studio-secondary px-3" disabled={index === 0 || !!busy || !!splitBusy} onClick={() => moveShot(index, -1)}><ChevronUp size={14} />上移</button><button className="studio-secondary px-3" disabled={index === bundle.shots.length - 1 || !!busy || !!splitBusy} onClick={() => moveShot(index, 1)}><ChevronDown size={14} />下移</button><button className="studio-danger" disabled={!!splitBusy} onClick={() => void action(`delete-${shot.id}`, () => deleteShot(bundle.project.id, shot.id), `镜头 ${shot.ordinal} 已删除`)}><Trash2 size={14} />删除</button><button className="studio-primary" disabled={busy === `shot-${shot.id}` || !!splitBusy} onClick={() => void action(`shot-${shot.id}`, () => updateShot(shot), `镜头 ${shot.ordinal} 已保存且三个下游 Prompt 已同步`, false).then(refresh)}>{busy === `shot-${shot.id}` ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}保存镜头</button></div>
                 </div>}
             </article>)}
+        </div>}
+        {splitShot && <div className="studio-modal" onMouseDown={closeSplit}>
+            <section className="studio-dialog max-h-[92vh] max-w-5xl overflow-y-auto" onMouseDown={(event) => event.stopPropagation()}>
+                <p className="studio-kicker">AI SPLIT ONE SHOT</p>
+                <div className="mb-5 flex items-start justify-between gap-4">
+                    <div className="flex items-start gap-3"><span className="rounded-xl bg-cyan-300/10 p-3 text-cyan-200"><Scissors size={22} /></span><div><h2 className="text-2xl font-semibold">拆分镜头 {splitShot.ordinal}</h2><p className="mt-1 text-sm leading-6 text-white/45">{splitPreview ? `AI 已生成 ${splitPreview.segments.length} 镜预览；确认前可直接修改标题、剧情、首帧和时长。` : "AI 先生成可编辑预览；未点击确认时不会修改现有分镜。"}</p></div></div>
+                    <button className="studio-secondary px-3" disabled={!!splitBusy} onClick={closeSplit}><X size={15} />关闭</button>
+                </div>
+                {splitError && <div className="studio-error mb-4">{splitError}</div>}
+                {!splitPreview ? <div className="space-y-5">
+                    <div className="grid gap-4 md:grid-cols-[220px_1fr]">
+                        <Field label="拆成几镜"><select value={splitCount} onChange={(event) => setSplitCount(event.target.value ? Number(event.target.value) as 2 | 3 | 4 : "")}><option value="">AI 根据节拍判断（2–4 镜）</option><option value="2">固定拆成 2 镜</option><option value="3">固定拆成 3 镜</option><option value="4">固定拆成 4 镜</option></select></Field>
+                        <div className="rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-4 py-3 text-sm leading-6 text-amber-100/70"><strong>原镜 {splitShot.duration_seconds} 秒</strong><span className="ml-2 text-white/45">{splitShot.title || splitShot.narrative}</span><p className="mt-1 text-xs text-white/40">拆分后使用全新镜头 ID；原镜已有首帧和成片不会误绑到新镜头。</p></div>
+                    </div>
+                    <label><span className="studio-label">给 AI 的拆分要求（可选）</span><textarea className="studio-input min-h-40 resize-y" maxLength={4000} value={splitSuggestions} onChange={(event) => setSplitSuggestions(event.target.value)} placeholder="例如：第一镜只保留人物发现异常，第二镜改成道具特写，第三镜再呈现人物反应；总时长保持不变。" autoFocus /></label>
+                    <div className="flex justify-end gap-2"><button className="studio-secondary" disabled={!!splitBusy} onClick={closeSplit}>取消</button><button className="studio-primary" disabled={!!splitBusy} onClick={() => void generateSplitPreview()}>{splitBusy === "preview" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}生成拆分预览</button></div>
+                </div> : <div>
+                    <div className="mb-4 grid gap-3 sm:grid-cols-3"><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">原镜时长</p><strong className="mt-1 block">{splitPreview.original_duration_seconds.toFixed(2)} 秒</strong></div><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">拆分后</p><strong className="mt-1 block text-cyan-200">{splitPreview.segments.length} 镜 · {splitPreview.proposed_duration_seconds.toFixed(2)} 秒</strong></div><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">时长变化</p><strong className="mt-1 block">{(splitPreview.proposed_duration_seconds - splitPreview.original_duration_seconds).toFixed(2)} 秒</strong></div></div>
+                    {splitPreview.rationale && <div className="mb-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] px-4 py-3 text-sm leading-6 text-white/55"><strong className="text-cyan-100/70">拆分依据：</strong>{splitPreview.rationale}</div>}
+                    <div className="space-y-4">{splitPreview.segments.map((segment, index) => <article key={index} className="rounded-xl border border-white/8 bg-black/15 p-4">
+                        <div className="mb-3 flex items-center gap-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-cyan-300/10 font-mono text-xs text-cyan-200">{splitPreview.source_ordinal + index}</span><strong className="min-w-0 flex-1">拆分镜头 {index + 1}</strong><span className="text-xs text-white/30">{segment.character_names.join("、") || "无固定角色"}</span></div>
+                        <div className="grid gap-4 md:grid-cols-[1fr_150px]"><Field label="镜头标题"><input value={segment.title} onChange={(event) => patchSplitSegment(index, { title: event.target.value })} /></Field><Field label="时长（0.25–15秒）"><input type="number" min={0.25} max={15} step={0.25} value={segment.duration_seconds} onChange={(event) => patchSplitSegment(index, { duration_seconds: Math.min(15, Math.max(.25, Number(event.target.value) || .25)) })} /></Field></div>
+                        <div className="mt-4 grid gap-4 md:grid-cols-2"><Field label="剧情内容 / 本镜事件"><textarea rows={4} value={segment.narrative} onChange={(event) => patchSplitSegment(index, { narrative: event.target.value })} /></Field><Field label="0 秒首帧状态"><textarea rows={4} value={segment.scene_description} onChange={(event) => patchSplitSegment(index, { scene_description: event.target.value })} /></Field></div>
+                        <details className="mt-3 rounded-lg border border-white/8 px-3 py-2 text-xs text-white/45"><summary className="cursor-pointer">查看 AI 镜头设计</summary><div className="mt-2 grid gap-2 sm:grid-cols-2"><span>场景：{segment.scene_profile_name || "沿用原镜"}</span><span>景别 / 机位：{segment.shot_size} · {segment.camera_angle}</span><span>镜头 / 运镜：{segment.lens} · {segment.camera_motion}</span><span>节拍：{segment.visual_beats.length} 段动作 · {segment.voice_events.length} 段声音</span></div></details>
+                    </article>)}</div>
+                    <div className="mt-5 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-4 py-3 text-xs leading-5 text-amber-100/70">确认后，原镜会被这 {splitPreview.segments.length} 个新镜头原位替换，后续镜号自动顺延。新镜头会重新编译首帧、H3 和 Seedance Prompt，不继承原镜的已生成媒体。</div>
+                    <div className="mt-5 flex flex-wrap justify-end gap-2"><button className="studio-secondary" disabled={!!splitBusy} onClick={() => { setSplitPreview(null); setSplitError(""); }}>返回重新生成</button><button className="studio-primary" disabled={!!splitBusy || splitPreview.segments.some((segment) => !segment.narrative.trim())} onClick={() => void applySplit()}>{splitBusy === "confirm" ? <Loader2 className="animate-spin" size={15} /> : <Check size={15} />}确认替换为 {splitPreview.segments.length} 镜</button></div>
+                </div>}
+            </section>
         </div>}
         {insertOpen && <div className="studio-modal" onMouseDown={() => setInsertOpen(false)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI INSERT ONE SHOT</p><div className="mb-5 flex items-start gap-3"><span className="rounded-xl bg-cyan-300/10 p-3 text-cyan-200"><Plus size={22} /></span><div><h2 className="text-2xl font-semibold">单独新增一个完整分镜</h2><p className="mt-1 text-sm leading-6 text-white/45">只生成并插入这一镜；现有分镜、首帧、H3 Prompt、Seedance Prompt 和视频结果都保留。</p></div></div><div className="grid gap-4"><Field label="插入位置"><select value={insertAfterShotId} onChange={(event) => setInsertAfterShotId(event.target.value)}><option value="">作为新的结尾镜头</option>{bundle.shots.slice(0, -1).map((shot) => <option key={shot.id} value={shot.id}>插在镜头 {shot.ordinal} 后</option>)}</select></Field><label><span className="studio-label">新增镜头要求</span><textarea className="studio-input min-h-44 resize-y" maxLength={4000} value={insertSuggestions} onChange={(event) => setInsertSuggestions(event.target.value)} placeholder="例如：结尾切回地府大厅，人挤人排着长队，队伍延伸到画面深处；用大全景揭示规模，形成荒诞喜剧反差，不新增主角对白。" autoFocus /></label><div className="rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-4"><span className="studio-label">同时生成哪些视频 Prompt</span><div className="mt-2 flex flex-wrap gap-5 text-sm text-white/65"><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("h3")} onChange={() => setPromptTargets(toggle(promptTargets, "h3") as ("h3" | "seedance")[])} />MiniMax H3（按需）</label><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("seedance")} onChange={() => setPromptTargets(toggle(promptTargets, "seedance") as ("h3" | "seedance")[])} />Seedance 2.x（本地编译）</label></div></div></div><div className="mt-6 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setInsertOpen(false)}>取消</button><button className="studio-primary" disabled={!insertSuggestions.trim() || !!busy} onClick={submitInsert}>{busy === "insert-shot" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}生成并插入这一镜</button></div></section></div>}
         {showGenerate && <div className="studio-modal" onMouseDown={() => setShowGenerate(false)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI STORYBOARD DIRECTION</p><div className="mb-5 flex items-start gap-3"><span className="rounded-xl bg-cyan-300/10 p-3 text-cyan-200"><MessageSquareText size={22} /></span><div><h2 className="text-2xl font-semibold">{isRedo ? "让 AI 按建议重新修改分镜" : "生成分镜前补充你的建议"}</h2><p className="mt-1 text-sm leading-6 text-white/45">你的文字会和剧情脚本、角色设定、视觉风格一起交给当前分镜模型，并作为本次生成的高优先级要求。</p></div></div>{isRedo && <div className="mb-4 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-4 py-3 text-sm leading-6 text-amber-100/70">本次会重新生成并替换当前 {bundle.shots.length} 个镜头。需要保留的剧情、镜头或对白，请在建议中明确写出。</div>}<div className="mb-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-4"><span className="studio-label">同时生成哪些视频 Prompt</span><div className="mt-2 flex flex-wrap gap-5 text-sm text-white/65"><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("h3")} onChange={() => setPromptTargets(toggle(promptTargets, "h3") as ("h3" | "seedance")[])} />MiniMax H3（按需）</label><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("seedance")} onChange={() => setPromptTargets(toggle(promptTargets, "seedance") as ("h3" | "seedance")[])} />Seedance 2.x（本地编译）</label></div><p className="mt-2 text-[11px] text-white/35">默认只编译 Seedance；H3 可在这里勾选，或到“视频生成”页只为选中的镜头补生成。</p></div><label><span className="studio-label">给 AI 的本次建议（可选）</span><textarea className="studio-input min-h-40 resize-y" maxLength={4000} value={userSuggestions} onChange={(event) => setUserSuggestions(event.target.value)} placeholder={isRedo ? "例如：保留前 3 镜的剧情；中段减少对白、增加动作；结尾改成角色回头的近景，并让节奏更紧凑……" : "例如：前 3 秒必须有强钩子；人物多用近景；减少旁白、用动作推进；整体保持压抑悬疑感……"} autoFocus /></label><div className="mt-2 flex flex-wrap items-center justify-between gap-3 text-xs text-white/30"><span>{countMode === "ai" ? "AI 会结合这份建议重新判断镜头数" : `本次固定生成 ${count} 个镜头`}</span><span>{userSuggestions.length}/4000</span></div><div className="mt-6 flex flex-wrap justify-end gap-2"><button className="studio-secondary" onClick={() => setShowGenerate(false)}>取消</button><button className="studio-primary" onClick={submitGeneration}><WandSparkles size={16} />{userSuggestions.trim() ? (isRedo ? "按建议重新生成" : "按建议生成分镜") : (isRedo ? "不填建议直接重做" : "不填建议直接生成")}</button></div></section></div>}
@@ -527,7 +700,10 @@ function AssetsPanel({ project, assets, shots, busy, action }: { project: Projec
     const [targetCharacterId, setTargetCharacterId] = useState(project.characters[0]?.id || "");
     const [targetAppearanceId, setTargetAppearanceId] = useState("");
     const [characterSuggestions, setCharacterSuggestions] = useState("");
+    const [characterReferenceStrategy, setCharacterReferenceStrategy] = useState<"identity" | "project_style">("project_style");
     const [batchCharacterSuggestions, setBatchCharacterSuggestions] = useState("");
+    const [propBindingAssetId, setPropBindingAssetId] = useState<string | null>(null);
+    const [propBindingShotIds, setPropBindingShotIds] = useState<string[]>([]);
     const upload = (files: File[]) => action("upload", () => Promise.all(files.map((file) => uploadProjectAsset(project.id, file, role))), `已上传 ${files.length} 个参考素材`);
     const selectedAssets = assets.filter((asset) => selectedAssetIds.includes(asset.id));
     const characterImageIds = new Set(assets.filter((asset) => asset.type === "image" && asset.role === "character").map((asset) => asset.id));
@@ -564,11 +740,22 @@ function AssetsPanel({ project, assets, shots, busy, action }: { project: Projec
             ? "已重新扫描剧本，并按统一风格为缺失角色生成人物参考图"
             : "已重新扫描剧本，并结合现有人物图补齐其他缺失角色");
     };
+    const recommendedCharacterStrategy = (characterId: string, appearanceId = ""): "identity" | "project_style" => {
+        const character = project.characters.find((item) => item.id === characterId);
+        if (!character) return "project_style";
+        const appearance = character.appearance_profiles.find((item) => item.id === appearanceId);
+        const referenceIds = appearance ? appearance.reference_asset_ids : character.reference_asset_ids;
+        const inheritedFromSeries = referenceIds.some((assetId) => assets.some((asset) => asset.id === assetId && asset.tags.some((tag) => tag.startsWith("series:"))));
+        if (project.series_id && !inheritedFromSeries) return "project_style";
+        return referenceIds.length > 0 ? "identity" : "project_style";
+    };
     const openCharacterAction = (mode: "generate" | "analyze") => {
+        const firstCharacterId = project.characters[0]?.id || "";
         setCharacterAction(mode);
-        setTargetCharacterId(project.characters[0]?.id || "");
+        setTargetCharacterId(firstCharacterId);
         setTargetAppearanceId("");
         setCharacterSuggestions("");
+        setCharacterReferenceStrategy(recommendedCharacterStrategy(firstCharacterId));
     };
     const submitCharacterAction = () => {
         if (!characterAction) return;
@@ -577,26 +764,61 @@ function AssetsPanel({ project, assets, shots, busy, action }: { project: Projec
         const selectedImageIds = selectedAssets.filter((asset) => asset.type === "image").map((asset) => asset.id);
         const appearance = character.appearance_profiles.find((item) => item.id === targetAppearanceId);
         const fallbackIds = appearance ? appearance.reference_asset_ids : character.reference_asset_ids;
-        const referenceIds = selectedImageIds.length ? selectedImageIds : fallbackIds;
+        const referenceIds = characterAction === "generate" && characterReferenceStrategy === "project_style"
+            ? selectedImageIds
+            : selectedImageIds.length ? selectedImageIds : fallbackIds;
         const taskKey = `character-${characterAction}-${character.id}-${targetAppearanceId || "base"}`;
         if (busy.has(taskKey)) return;
         setCharacterAction(null);
         if (characterAction === "analyze") {
             void action(taskKey, () => analyzeCharacterReferences(project.id, character.id, referenceIds, { appearanceProfileId: targetAppearanceId || null, appearanceLabel: appearance?.label || "", userSuggestions: characterSuggestions }), `已根据所选参考图回填“${character.name}”角色设定`);
         } else {
-            void action(taskKey, () => generateCharacterReferencesWithOptions(project.id, { characterIds: [character.id], referenceAssetIds: referenceIds, appearanceProfileId: targetAppearanceId || null, userSuggestions: characterSuggestions }), `已根据所选参考图生成“${character.name}”形象补全图`);
+            void action(taskKey, () => generateCharacterReferencesWithOptions(project.id, { characterIds: [character.id], referenceAssetIds: referenceIds, appearanceProfileId: targetAppearanceId || null, userSuggestions: characterSuggestions, referenceStrategy: characterReferenceStrategy }), characterReferenceStrategy === "project_style" ? `已按同项目/系列角色画风重做“${character.name}”，旧图仍保留在素材库` : `已根据本角色参考图生成“${character.name}”形象补全图`);
         }
     };
     const characterGenerateCount = Array.from(busy).filter((key) => key.startsWith("character-generate-")).length;
     const characterAnalyzeCount = Array.from(busy).filter((key) => key.startsWith("character-analyze-")).length;
     const targetCharacterTaskKey = characterAction ? `character-${characterAction}-${targetCharacterId}-${targetAppearanceId || "base"}` : "";
     const targetCharacterBusy = !!targetCharacterTaskKey && busy.has(targetCharacterTaskKey);
+    const bindingProp = propBindingAssetId ? assets.find((asset) => asset.id === propBindingAssetId && asset.role === "prop") : undefined;
+    const openPropBinding = (asset: Asset) => {
+        setPropBindingAssetId(asset.id);
+        setPropBindingShotIds(shots.filter((shot) => shot.reference_asset_ids.includes(asset.id)).map((shot) => shot.id));
+    };
+    const savePropBinding = () => {
+        if (!bindingProp) return;
+        const targetIds = new Set(propBindingShotIds);
+        const changedShots = shots.filter((shot) => {
+            const shouldInclude = targetIds.has(shot.id);
+            return shot.reference_asset_ids.includes(bindingProp.id) !== shouldInclude
+                || (shot.keyframe_reference_asset_ids !== null && shot.keyframe_reference_asset_ids.includes(bindingProp.id) !== shouldInclude)
+                || (shot.video_reference_asset_ids !== null && shot.video_reference_asset_ids.includes(bindingProp.id) !== shouldInclude);
+        });
+        const asset = bindingProp;
+        setPropBindingAssetId(null);
+        void action(`prop-bind-${asset.id}`, () => Promise.all(changedShots.map((shot) => updateShot({
+            ...shot,
+            reference_asset_ids: targetIds.has(shot.id)
+                ? Array.from(new Set([...shot.reference_asset_ids, asset.id]))
+                : shot.reference_asset_ids.filter((assetId) => assetId !== asset.id),
+            keyframe_reference_asset_ids: shot.keyframe_reference_asset_ids === null
+                ? null
+                : targetIds.has(shot.id)
+                    ? Array.from(new Set([...shot.keyframe_reference_asset_ids, asset.id]))
+                    : shot.keyframe_reference_asset_ids.filter((assetId) => assetId !== asset.id),
+            video_reference_asset_ids: shot.video_reference_asset_ids === null
+                ? null
+                : targetIds.has(shot.id)
+                    ? Array.from(new Set([...shot.video_reference_asset_ids, asset.id]))
+                    : shot.video_reference_asset_ids.filter((assetId) => assetId !== asset.id),
+        }))), `已把固定物品“${asset.name}”应用到 ${targetIds.size} 个镜头；首帧、H3 与 Seedance Prompt 已同步`);
+    };
     return <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
         <section className="studio-panel h-fit">
             <p className="studio-kicker">REFERENCE LIBRARY</p>
             <h2 className="mb-5 text-xl font-semibold">上传参考素材</h2>
             <Field label="素材用途">
-                <select value={role} onChange={(event) => { setRole(event.target.value as AssetRole); setShowAll(false); }}><option value="character">人物形象</option><option value="style">画风截图 / 参考视频</option><option value="scene">场景参考</option><option value="motion">动作/运镜视频</option><option value="voice">声音参考</option><option value="music">背景音乐</option><option value="sound_effect">音效</option><option value="other">其他</option></select>
+                <select value={role} onChange={(event) => { setRole(event.target.value as AssetRole); setShowAll(false); }}><option value="character">人物形象</option><option value="prop">固定物品 / 道具</option><option value="style">画风截图 / 参考视频</option><option value="scene">场景参考</option><option value="motion">动作/运镜视频</option><option value="voice">声音参考</option><option value="music">背景音乐</option><option value="sound_effect">音效</option><option value="other">其他</option></select>
                 <p className="mt-1 text-[11px] text-cyan-100/45">右侧已切换为当前分类，共 {roleAssets.length} 项</p>
             </Field>
             <label className="studio-empty mt-4 min-h-44 cursor-pointer"><input className="hidden" type="file" multiple accept="image/*,video/*,audio/*,.srt,.vtt" disabled={busy.has("upload")} onChange={(event) => { const files = Array.from(event.target.files || []); if (files.length) void upload(files); event.target.value = ""; }} />{busy.has("upload") ? <Loader2 className="animate-spin text-cyan-300" /> : <Upload className="text-cyan-300" />}<strong>批量选择图片、视频或音频</strong><span>可一次多选；全部按上方用途归档</span></label>
@@ -617,7 +839,7 @@ function AssetsPanel({ project, assets, shots, busy, action }: { project: Projec
             </div>
             <p className="mt-4 text-xs leading-5 text-white/35">{shots.length === 0 ? "请先生成或导入分镜。场景档案需要从已有分镜中归纳重复空间。" : "第一步识别空间文字规范；第二步生成并修正场景母版；最后在下方一键应用到所有已归类镜头，不需要逐镜勾选。"}</p>
         </section>
-        <section className="studio-panel"><div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><p className="studio-kicker">{visibleAssets.length} / {assets.length} ASSETS</p><h2 className="text-xl font-semibold">项目素材库 · {assetRoleLabel(role)}</h2><p className="mt-1 text-xs text-white/35">点击卡片左上角可多选，供画风分析、角色回填或形象补全使用；已选 {selectedAssetIds.length} 项。</p></div><button className="studio-secondary" onClick={() => setShowAll(!showAll)}>{showAll ? "只看当前分类" : "显示全部素材"}</button></div>{visibleAssets.length === 0 ? <div className="studio-empty"><ImageIcon className="text-cyan-300" /><strong>当前分类还没有素材</strong><span>左侧上传后会立即出现在这里</span></div> : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{visibleAssets.map((asset) => <AssetCard key={asset.id} asset={asset} projectId={project.id} selected={selectedAssetIds.includes(asset.id)} select={() => setSelectedAssetIds(toggle(selectedAssetIds, asset.id))} preview={() => setPreview({ name: asset.name, url: projectDownloadUrl(project.id, "asset", asset.id), description: asset.description })} remove={() => action(`asset-${asset.id}`, () => deleteProjectAsset(project.id, asset.id), "素材记录已删除")} />)}</div>}</section>
+        <section className="studio-panel"><div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><p className="studio-kicker">{visibleAssets.length} / {assets.length} ASSETS</p><h2 className="text-xl font-semibold">项目素材库 · {assetRoleLabel(role)}</h2><p className="mt-1 text-xs text-white/35">人物、场景和固定物品都可成为逐镜参考；物品卡片可批量设置出现范围。已选 {selectedAssetIds.length} 项。</p></div><button className="studio-secondary" onClick={() => setShowAll(!showAll)}>{showAll ? "只看当前分类" : "显示全部素材"}</button></div>{visibleAssets.length === 0 ? <div className="studio-empty"><ImageIcon className="text-cyan-300" /><strong>当前分类还没有素材</strong><span>左侧上传后会立即出现在这里</span></div> : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{visibleAssets.map((asset) => <div key={asset.id} className="min-w-0"><AssetCard asset={asset} projectId={project.id} selected={selectedAssetIds.includes(asset.id)} select={() => setSelectedAssetIds(toggle(selectedAssetIds, asset.id))} preview={() => setPreview({ name: asset.name, url: projectDownloadUrl(project.id, "asset", asset.id), description: asset.description })} remove={() => action(`asset-${asset.id}`, () => deleteProjectAsset(project.id, asset.id), "素材记录已删除")} />{asset.role === "prop" && <button type="button" className="studio-secondary mt-2 w-full text-xs" onClick={() => openPropBinding(asset)}><LayoutList size={13} />已绑定 {shots.filter((shot) => shot.reference_asset_ids.includes(asset.id)).length} 镜 · 设置出现范围</button>}</div>)}</div>}</section>
         {(project.style_profile || project.scene_profiles.length > 0) && <section className="studio-panel xl:col-span-2">
             {project.style_profile && <div className="mb-5 rounded-xl border border-cyan-300/12 bg-cyan-300/[.025] p-4"><div className="flex flex-wrap items-start justify-between gap-2"><div><p className="studio-kicker">ACTIVE STYLE · 已自动回填</p><strong>{project.style_profile.name}</strong></div><span className="studio-status text-emerald-200">项目统一风格生效中</span></div><p className="mt-2 text-sm leading-6 text-white/55">{project.style_profile.analysis_summary}</p><div className="mt-3 grid gap-2 text-xs text-white/40 md:grid-cols-2"><p><span className="text-white/60">媒介 / 质感：</span>{project.style_profile.medium}；{project.style_profile.texture}</p><p><span className="text-white/60">色彩 / 光影：</span>{project.style_profile.palette}；{project.style_profile.lighting}</p><p><span className="text-white/60">镜头 / 构图：</span>{project.style_profile.camera_language}；{project.style_profile.composition}</p><p><span className="text-white/60">动作 / 剪辑：</span>{project.style_profile.motion_language}</p></div><p className="mt-3 text-xs leading-5 text-rose-100/45"><span className="text-rose-100/65">避免项：</span>{project.style_profile.negative_constraints}</p></div>}
             <div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><p className="studio-kicker">SCENE CONTINUITY ASSETS</p><h3 className="text-lg font-semibold">场景档案（文字规范）与场景母版图</h3><p className="mt-1 text-xs leading-5 text-white/38">修正档案和母版后，可按已经识别的镜头归属一次性同步首帧与 Seedance Prompt；不会调用图片或 H3 接口。</p></div><button className="studio-primary shrink-0" disabled={sceneApplyBusy || mappedSceneShotCount === 0} onClick={() => void action("scene-apply", () => applySceneProfiles(project.id), `已把 ${project.scene_profiles.length} 个场景档案批量应用到 ${mappedSceneShotCount} 个镜头；原 H3 和已有图片均已保留`)}>{sceneApplyBusy ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}{appliedSceneShotCount === mappedSceneShotCount && mappedSceneShotCount > 0 ? `重新同步 ${mappedSceneShotCount} 镜` : `一键应用到 ${mappedSceneShotCount} 镜`}</button></div>
@@ -629,14 +851,16 @@ function AssetsPanel({ project, assets, shots, busy, action }: { project: Projec
             <section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}>
                 <p className="studio-kicker">CHARACTER REFERENCES</p>
                 <h2 className="text-2xl font-semibold">{characterAction === "analyze" ? "按参考图 AI 回填角色设定" : "按参考图生成 / 补全人物形象"}</h2>
-                <p className="mt-2 text-sm leading-6 text-white/45">优先使用右侧已勾选的图片；未勾选时使用角色设定中已绑定的基础或时期参考图。{characterAction === "generate" ? "默认生成横向四视图设定板：左侧大正脸，右侧为同一人物的全身正面、侧面和背面。" : ""}提交后会转入后台，可马上继续选择其他角色或时期。</p>
-                <div className="mt-5 grid gap-4 sm:grid-cols-2"><Field label="目标角色"><select value={targetCharacterId} onChange={(event) => { setTargetCharacterId(event.target.value); setTargetAppearanceId(""); }}>{project.characters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}</select></Field><Field label="目标时期形象"><select value={targetAppearanceId} onChange={(event) => setTargetAppearanceId(event.target.value)}><option value="">基础形象</option>{project.characters.find((item) => item.id === targetCharacterId)?.appearance_profiles.map((appearance) => <option key={appearance.id} value={appearance.id}>{appearance.label}</option>)}</select></Field></div>
+                <p className="mt-2 text-sm leading-6 text-white/45">{characterAction === "generate" ? "生成横向四视图设定板：左侧大正脸，右侧为同一角色的全身正面、侧面和背面。可以沿用本角色身份，也可以忽略错误旧图、按同系列已确认角色画风重做。" : "优先使用右侧已勾选的图片；未勾选时使用角色设定中已绑定的基础或时期参考图。"}提交后会转入后台，可马上继续选择其他角色或时期。</p>
+                <div className="mt-5 grid gap-4 sm:grid-cols-2"><Field label="目标角色"><select value={targetCharacterId} onChange={(event) => { const nextId = event.target.value; setTargetCharacterId(nextId); setTargetAppearanceId(""); if (characterAction === "generate") setCharacterReferenceStrategy(recommendedCharacterStrategy(nextId)); }}>{project.characters.map((character) => <option key={character.id} value={character.id}>{character.name}</option>)}</select></Field><Field label="目标时期形象"><select value={targetAppearanceId} onChange={(event) => { const nextAppearanceId = event.target.value; setTargetAppearanceId(nextAppearanceId); if (characterAction === "generate") setCharacterReferenceStrategy(recommendedCharacterStrategy(targetCharacterId, nextAppearanceId)); }}><option value="">基础形象</option>{project.characters.find((item) => item.id === targetCharacterId)?.appearance_profiles.map((appearance) => <option key={appearance.id} value={appearance.id}>{appearance.label}</option>)}</select></Field></div>
+                {characterAction === "generate" && <div className="mt-4"><span className="studio-label">参考策略</span><div className="mt-2 grid gap-2 sm:grid-cols-2"><label className={`cursor-pointer rounded-lg border p-3 text-sm ${characterReferenceStrategy === "identity" ? "border-cyan-300/35 bg-cyan-300/[.06]" : "border-white/8 bg-black/15"}`}><span className="flex items-center gap-2 font-medium"><input type="radio" name="character-reference-strategy" checked={characterReferenceStrategy === "identity"} onChange={() => setCharacterReferenceStrategy("identity")} />沿用本角色身份</span><span className="mt-1 block text-xs leading-5 text-white/40">使用右侧所选图，未选择时沿用该角色已绑定图；适合补角度、微调服装。</span></label><label className={`cursor-pointer rounded-lg border p-3 text-sm ${characterReferenceStrategy === "project_style" ? "border-cyan-300/35 bg-cyan-300/[.06]" : "border-white/8 bg-black/15"}`}><span className="flex items-center gap-2 font-medium"><input type="radio" name="character-reference-strategy" checked={characterReferenceStrategy === "project_style"} onChange={() => setCharacterReferenceStrategy("project_style")} />按同系列画风重做</span><span className="mt-1 block text-xs leading-5 text-white/40">忽略本角色旧图，优先参考本项目/系列其他已确认角色；成功后新图成为绑定图，旧图仍留在素材库。</span></label></div></div>}
                 <label className="mt-4 block"><span className="studio-label">{characterAction === "generate" ? "生成建议（可选）" : "回填建议（可选）"}</span><textarea className="studio-input min-h-32 resize-y" maxLength={4000} value={characterSuggestions} onChange={(event) => setCharacterSuggestions(event.target.value)} placeholder={characterAction === "generate" ? "例如：保留参考图脸型与五官；眼神更锐利，衣料增加磨损细节。四视图排版由系统自动保持。" : "例如：识别为 18 岁偏瘦时期，不要沿用盛年妆造。"} /><span className="mt-1 block text-right text-[10px] text-white/25">{characterSuggestions.length}/4000</span></label>
-                <div className="mt-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-3 text-xs leading-5 text-cyan-100/55">{targetCharacterBusy ? "当前这个角色/时期已经在后台处理中；可切换到其他角色继续提交。" : <>本次右侧已选 {selectedAssets.filter((asset) => asset.type === "image").length} 张图片。{characterAction === "analyze" && selectedAssets.filter((asset) => asset.type === "image").length === 0 ? "回填至少需要一张参考图。" : "生成会同时结合项目剧本和统一视觉风格。"}</>}</div>
+                <div className="mt-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-3 text-xs leading-5 text-cyan-100/55">{targetCharacterBusy ? "当前这个角色/时期已经在后台处理中；可切换到其他角色继续提交。" : <>本次右侧已选 {selectedAssets.filter((asset) => asset.type === "image").length} 张图片。{characterAction === "analyze" && selectedAssets.filter((asset) => asset.type === "image").length === 0 ? "回填至少需要一张参考图。" : characterAction === "generate" && characterReferenceStrategy === "project_style" ? "系统会把其他已确认角色图置于普通风格图之前，并明确排除真人照片与 3D 写实人物。" : "生成会同时结合项目剧本和统一视觉风格。"}</>}</div>
                 <div className="mt-5 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setCharacterAction(null)}>取消</button><button className="studio-primary" disabled={targetCharacterBusy || !targetCharacterId || (characterAction === "analyze" && selectedAssets.filter((asset) => asset.type === "image").length === 0)} onClick={submitCharacterAction}>{targetCharacterBusy ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}{targetCharacterBusy ? "此形象处理中" : characterAction === "analyze" ? "分析并回填" : "生成四视图"}</button></div>
             </section>
         </div>}
         {sceneHelpOpen && <div className="studio-modal" onMouseDown={() => setSceneHelpOpen(false)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">SCENE CONTINUITY</p><h2 className="text-2xl font-semibold">场景文字档案与母版图怎么用</h2><ol className="mt-4 list-decimal space-y-3 pl-5 text-sm leading-6 text-white/55"><li>“AI 识别场景文字档案”只分析分镜并生成空间说明，不会调用图片模型，所以这一步得到的是文字。</li><li>文字档案会立即显示在页面下方；点击对应档案的“生成母版图”，才会生成一张无人物环境图并直接显示预览。</li><li>修正所有档案后，点击“一键应用到全部镜头”，系统会按识别好的归属批量启用并重编译本地 Prompt。</li><li>生成首帧时会同时参考对应母版：镜头角度可以变化，房间布局、陈设、材质和本场景光线会保持。</li></ol><p className="mt-4 rounded-lg border border-amber-300/10 bg-amber-300/[.035] p-3 text-xs leading-5 text-amber-100/55">批量应用不会调用生图或 H3 接口，也不会删除已有结果。旧首帧如果已经画出了错误混光，可到视频生成页只选择这些镜头重生。</p><div className="mt-5 flex justify-end"><button className="studio-primary" onClick={() => setSceneHelpOpen(false)}>知道了</button></div></section></div>}
+        {bindingProp && <div className="studio-modal" role="dialog" aria-modal="true" aria-labelledby="prop-binding-title" onMouseDown={() => setPropBindingAssetId(null)}><section className="studio-dialog my-0 flex max-h-[calc(100dvh-2rem)] min-h-0 max-w-3xl flex-col overflow-hidden" onMouseDown={(event) => event.stopPropagation()}><div className="shrink-0"><p className="studio-kicker">FIXED PROP CONTINUITY</p><div className="mb-4 flex items-start justify-between gap-3"><div><h2 id="prop-binding-title" className="text-2xl font-semibold">设置“{bindingProp.name}”出现范围</h2><p className="mt-1 text-sm leading-6 text-white/45">勾选后，该物品图会同时进入本镜首帧、Seedance 全模态参考和 H3 R2V 参考，并把物品尺寸约束写进 Prompt。</p></div><button type="button" className="rounded-lg p-2 text-white/35 hover:bg-white/8 hover:text-white" aria-label="关闭" onClick={() => setPropBindingAssetId(null)}><X size={20} /></button></div><div className="mb-3 flex flex-wrap gap-2"><button type="button" className="studio-secondary text-xs" onClick={() => setPropBindingShotIds(shots.map((shot) => shot.id))}>全选</button><button type="button" className="studio-secondary text-xs" onClick={() => setPropBindingShotIds([])}>清空</button><span className="self-center text-xs text-white/35">已选 {propBindingShotIds.length}/{shots.length} 镜</span></div></div><div className="min-h-0 flex-1 space-y-1 overflow-y-auto rounded-xl border border-white/8 bg-black/15 p-2">{shots.map((shot) => <label key={shot.id} className="flex cursor-pointer items-start gap-3 rounded-lg px-3 py-2.5 hover:bg-white/[.035]"><input className="mt-1" type="checkbox" checked={propBindingShotIds.includes(shot.id)} onChange={() => setPropBindingShotIds(toggle(propBindingShotIds, shot.id))} /><span className="min-w-0"><strong className="block text-sm">镜头 {shot.ordinal} · {shot.title.replace(/^镜头\s*\d+\s*[·.:：-]?\s*/, "")}</strong><span className="mt-0.5 line-clamp-2 block text-xs leading-5 text-white/35">{shot.scene_description || shot.narrative}</span></span></label>)}</div><div className="mt-5 flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-4"><p className="text-xs text-white/30">只更新素材绑定和本地 Prompt，不会自动调用生图或视频接口。</p><div className="flex gap-2"><button type="button" className="studio-secondary" onClick={() => setPropBindingAssetId(null)}>取消</button><button type="button" className="studio-primary" disabled={busy.has(`prop-bind-${bindingProp.id}`)} onClick={savePropBinding}><Save size={15} />保存出现范围</button></div></div></section></div>}
         {preview && <MediaPreview preview={preview} onClose={() => setPreview(null)} />}
     </div>;
 }
@@ -647,6 +871,7 @@ type KeyframeEditorState = {
     prompt: string;
     suggestions: string;
     revisionMode: "fresh" | "iterate";
+    referenceAssetIds: string[] | null;
 };
 type MediaPreviewState = { name: string; url: string; description?: string };
 type VideoPreviewState = { name: string; url: string; downloadUrl: string; provider: string };
@@ -802,7 +1027,20 @@ function SeedanceShotCard({ shot, project, assets, checked, busy, toggleChecked,
     }, [projectId, shot.id, shot.updated_at, shot.seedance_reference_mode]);
     const assetIds = [shot.keyframe_asset_id, ...shot.reference_asset_ids].filter((value): value is string => !!value);
     const refs = [...new Set(assetIds)].map((id) => assets.find((asset) => asset.id === id)).filter((asset): asset is Asset => !!asset && ["image", "video", "audio"].includes(asset.type));
-    const resolvedMaterials = diagnostics?.materials || refs;
+    const availableMaterials = diagnostics?.available_materials || assets.filter((asset) => ["image", "video", "audio"].includes(asset.type) && asset.role !== "output");
+    const effectiveVideoReferenceIds = draft.video_reference_asset_ids ?? diagnostics?.materials.map((item) => item.id) ?? refs.map((item) => item.id);
+    const manuallySelectedMaterials = effectiveVideoReferenceIds.map((id) => availableMaterials.find((item) => item.id === id) || assets.find((item) => item.id === id)).filter((item) => !!item);
+    const resolvedMaterials = draft.video_reference_asset_ids === null || draft.video_reference_asset_ids === undefined
+        ? diagnostics?.materials || refs
+        : diagnostics?.resolved_mode === "strict_first_frame"
+            ? diagnostics.materials
+            : manuallySelectedMaterials;
+    const materialCounters = { image: 0, video: 0, audio: 0 };
+    const numberedMaterials = resolvedMaterials.map((asset) => {
+        const kind = asset.type as "image" | "video" | "audio";
+        materialCounters[kind] += 1;
+        return { ...asset, label: `${kind === "image" ? "图片" : kind === "video" ? "视频" : "音频"}${materialCounters[kind]}` };
+    });
     const counts = {
         image: resolvedMaterials.filter((asset) => asset.type === "image").length,
         video: resolvedMaterials.filter((asset) => asset.type === "video").length,
@@ -814,10 +1052,10 @@ function SeedanceShotCard({ shot, project, assets, checked, busy, toggleChecked,
             <div className="min-w-48 flex-1"><strong>#{shot.ordinal} {shot.title}</strong><p className="mt-1 text-xs text-white/35">{shot.duration_seconds.toFixed(2)} 秒 · 图片 {counts.image} / 视频 {counts.video} / 音频 {counts.audio}</p></div>
             <span className="studio-status">{draft.seedance_prompt_version || "待编译"}</span>
         </div>
-        {resolvedMaterials.length === 0 && <div className="mt-3 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-3 py-2 text-xs leading-5 text-amber-50/60">本镜还没有分镜图或参考素材；Seedance 全模态提交前会拦截，请先生成首帧或在“参考素材”页绑定素材。</div>}
-        {diagnostics && <div className="mt-3 rounded-lg border border-cyan-300/10 bg-cyan-300/[.025] px-3 py-2 text-xs leading-5 text-cyan-50/55"><strong>{diagnostics.resolved_mode === "strict_first_frame" ? "实际提交：严格首帧" : "实际提交：全模态参考"}</strong><span className="ml-2">{diagnostics.materials.map((item) => item.name).join("、") || "无素材"}</span>{diagnostics.warnings.map((warning) => <p key={warning} className="mt-1 text-amber-100/75">{warning}</p>)}</div>}
-        <div className="mt-3 max-w-md"><Field label="Seedance 人物参考策略" hint="项目默认使用全模态：首帧、场景图和本镜全部角色人设图都会真实提交。"><select value={draft.seedance_reference_mode} onChange={(event) => setDraft((current) => ({ ...current, seedance_reference_mode: event.target.value as Shot["seedance_reference_mode"] }))}><option value="multimodal_reference">全模态 · 默认带全部人设图</option><option value="auto">兼容自动 · 同样按全模态</option><option value="strict_first_frame">严格首帧 · 特殊情况仅 1 图</option></select></Field></div>
-        <div className="mt-4 grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]"><ShotKeyframeSummary shot={shot} keyframe={keyframe} projectId={projectId} generating={generatingKeyframe} edit={editKeyframe} preview={previewKeyframe} /><div><label className="block"><span className="studio-label">Seedance 2.0 全模态 Prompt</span><textarea className="studio-input min-h-64 resize-y" value={draft.seedance_prompt} onChange={(event) => setDraft((current) => ({ ...current, seedance_prompt: event.target.value }))} placeholder="点击上方“编译所选 Prompt”，系统会按图片1/视频1/音频1的真实发送顺序生成 Seedance 专用提示词。" /></label><div className="mt-3 grid gap-3 md:grid-cols-2"><Field label="场景一致性（可选）" hint="关闭时完全沿用原首帧→视频链路；仅固定空间连续时才选择场景档案。"><select value={draft.use_scene_profile ? draft.scene_profile_id || "" : ""} onChange={(event) => setDraft((current) => ({ ...current, use_scene_profile: !!event.target.value, scene_profile_id: event.target.value || null }))}><option value="">关闭 · 保持原链路</option>{project.scene_profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.approved ? " · 已有母版" : " · 待生成母版"}</option>)}</select></Field><Field label="镜头连续方式" hint="连续续接会读取上一镜尾帧作为构图起点，并与场景图、人物形象图一起全模态提交。"><select value={draft.continuity_mode} onChange={(event) => setDraft((current) => ({ ...current, continuity_mode: event.target.value as Shot["continuity_mode"], continuity_source_shot_id: event.target.value === "continuous" ? current.continuity_source_shot_id : null }))}><option value="independent">独立镜头</option><option value="same_scene">同场景但允许切机位</option><option value="continuous" disabled={shot.ordinal === 1}>连续长镜头 · 接上一镜尾帧</option></select></Field></div>{draft.continuity_mode === "continuous" && <p className="mt-2 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] px-3 py-2 text-xs leading-5 text-cyan-50/55">本镜提交时会等待并读取上一镜的 Seedance 尾帧，并继续携带本镜全部角色人设图。按顺序批量提交最稳；单独提交前请确保上一镜已完成。</p>}</div></div>
+        {resolvedMaterials.length === 0 && <div className="mt-3 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-3 py-2 text-xs leading-5 text-amber-50/60">本镜还没有分镜图或参考素材；Seedance 提交前会拦截，请先生成首帧或在“参考素材”页绑定素材。</div>}
+        {diagnostics && <details className="mt-3 rounded-lg border border-cyan-300/10 bg-cyan-300/[.025] px-3 py-2 text-xs leading-5 text-cyan-50/55"><summary className="cursor-pointer font-semibold">{diagnostics.resolved_mode === "strict_first_frame" ? "实际提交：严格首帧" : "实际提交：全模态参考"} · {numberedMaterials.length} 项素材</summary><p className="mt-2 text-cyan-100/55">首帧完整度：{diagnostics.first_frame_completeness === "complete" ? "已确认完整" : diagnostics.first_frame_completeness === "incomplete" ? "已标记不完整" : "未确认"} · {diagnostics.reference_mode_reason}</p><div className="mt-2 space-y-1">{numberedMaterials.map((item) => <div key={item.id} className="flex items-center gap-2"><span className="rounded bg-cyan-300/10 px-1.5 py-0.5 font-mono text-cyan-100/70">{item.label}</span><span className="min-w-0 flex-1 truncate">{item.name}</span><span className="text-white/25">{assetRoleLabel(item.role)}</span></div>)}{numberedMaterials.length === 0 && <p className="text-amber-100/65">当前没有视频参考素材。</p>}</div><div className="mt-3 flex items-center justify-between gap-2"><strong className="text-white/50">选择或取消本镜视频参考</strong><button type="button" className="studio-secondary px-2 py-1 text-[11px]" onClick={() => setDraft((current) => ({ ...current, video_reference_asset_ids: null }))}>恢复自动选择</button></div><div className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-md border border-white/8 p-2">{availableMaterials.map((asset) => <label key={asset.id} className="flex items-center gap-2 rounded px-1 py-0.5 text-white/55 hover:bg-white/[.03]"><input type="checkbox" checked={effectiveVideoReferenceIds.includes(asset.id)} onChange={() => setDraft((current) => ({ ...current, video_reference_asset_ids: toggle(current.video_reference_asset_ids ?? effectiveVideoReferenceIds, asset.id) }))} /><span className="min-w-0 flex-1 truncate">{asset.name}</span><span className="text-white/25">{assetRoleLabel(asset.role)}</span></label>)}</div><p className="mt-2 text-[11px] text-white/30">{draft.video_reference_asset_ids == null ? "自动选择中" : "已切换为本镜手动清单；保存或提交时会按新编号重编译 Prompt。"}</p>{diagnostics.warnings.map((warning) => <p key={warning} className="mt-1 text-amber-100/75">{warning}</p>)}</details>}
+        <div className="mt-3 grid gap-3 md:grid-cols-2"><Field label="首帧完整度" hint="完整表示首帧已经包含本镜所需人物、场景和固定物品；自动模式会据此选择提交方式。"><select value={draft.first_frame_completeness || "unknown"} onChange={(event) => setDraft((current) => ({ ...current, first_frame_completeness: event.target.value as Shot["first_frame_completeness"], seedance_reference_mode: "auto" }))}><option value="unknown">未确认 · 默认全模态</option><option value="complete">完整 · 自动严格首帧</option><option value="incomplete">不完整 · 自动全模态</option></select></Field><Field label="Seedance 参考策略" hint="严格首帧只提交当前首帧；全模态会同时提交场景、人物、固定物品等选定素材。"><select value={draft.seedance_reference_mode} onChange={(event) => setDraft((current) => ({ ...current, seedance_reference_mode: event.target.value as Shot["seedance_reference_mode"] }))}><option value="auto">自动 · 按首帧完整度选择</option><option value="multimodal_reference">手动全模态参考</option><option value="strict_first_frame">手动严格首帧</option></select></Field></div>
+        <div className="mt-4 grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]"><ShotKeyframeSummary shot={shot} keyframe={keyframe} projectId={projectId} generating={generatingKeyframe} edit={editKeyframe} preview={previewKeyframe} /><div><label className="block"><span className="studio-label">Seedance 2.0 Prompt</span><textarea className="studio-input min-h-64 resize-y" value={draft.seedance_prompt} onChange={(event) => setDraft((current) => ({ ...current, seedance_prompt: event.target.value }))} placeholder="点击上方“编译所选 Prompt”，系统会按图片1/视频1/音频1的真实发送顺序生成 Seedance 专用提示词。" /></label><div className="mt-3 grid gap-3 md:grid-cols-2"><Field label="起始场景模板（可选）" hint="首帧与转场前只使用这一场景；单场景镜头只需选择这里。"><select value={draft.use_scene_profile ? selectedSceneProfileIds(draft)[0] || "" : ""} onChange={(event) => setDraft((current) => ({ ...current, ...sceneProfileSelectionPatch(current, "start", event.target.value) }))}><option value="">关闭 · 保持原链路</option>{project.scene_profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.approved ? " · 已有母版" : " · 待生成母版"}</option>)}</select></Field><Field label="转场后场景模板（可选）" hint="角色完成穿门、穿墙或传送后只使用目标场景，系统会按顺序提交第二张场景母版。"><select disabled={!draft.use_scene_profile || !selectedSceneProfileIds(draft)[0]} value={selectedSceneProfileIds(draft)[1] || ""} onChange={(event) => setDraft((current) => ({ ...current, ...sceneProfileSelectionPatch(current, "destination", event.target.value) }))}><option value="">无 · 本镜不跨场景</option>{project.scene_profiles.filter((profile) => profile.id !== selectedSceneProfileIds(draft)[0]).map((profile) => <option key={profile.id} value={profile.id}>{profile.name}{profile.approved ? " · 已有母版" : " · 待生成母版"}</option>)}</select></Field><Field label="镜头连续方式" hint="连续续接会读取上一镜已采用版本的尾帧作为构图起点，并与场景图、人物形象图一起提交。"><select value={draft.continuity_mode} onChange={(event) => setDraft((current) => ({ ...current, continuity_mode: event.target.value as Shot["continuity_mode"], continuity_source_shot_id: event.target.value === "continuous" ? current.continuity_source_shot_id : null }))}><option value="independent">独立镜头</option><option value="same_scene">同场景但允许切机位</option><option value="continuous" disabled={shot.ordinal === 1}>连续长镜头 · 接上一镜尾帧</option></select></Field></div>{selectedSceneProfileIds(draft).length > 1 && <p className="mt-2 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] px-3 py-2 text-xs leading-5 text-cyan-50/55">跨场景模式已启用：首帧只按起始场景生成；视频提交时同时携带两张母版，并明确要求转场前后分别使用，禁止把两套房间和光影拼在一起。</p>}{draft.continuity_mode === "continuous" && <p className="mt-2 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] px-3 py-2 text-xs leading-5 text-cyan-50/55">本镜提交时会等待并读取上一镜已采用版本的尾帧；若尚未手动采用，则使用上一镜最近一次成功结果。按顺序批量提交最稳；单独提交前请确保上一镜已完成。</p>}</div></div>
         <div className="mt-3 flex flex-wrap items-center justify-between gap-3"><p className="text-[11px] leading-5 text-white/30">编号与提交给方舟的同类素材顺序共用同一编译器，不会覆盖 MiniMax H3 Prompt。</p><div className="flex gap-2"><button type="button" className="studio-secondary" disabled={busy || !draft.seedance_prompt.trim()} onClick={() => void save(draft)}>{busy ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}保存本镜</button><button type="button" className="studio-primary" disabled={busy || !canSubmit || !draft.seedance_prompt.trim()} title={canSubmit ? "提交后会产生方舟费用" : "请先配置方舟并载入模型目录"} onClick={() => void submit(draft)}>{busy ? <Loader2 className="animate-spin" size={14} /> : <Play size={14} />}提交本镜</button></div></div>
     </article>;
 }
@@ -841,6 +1079,7 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
     const [keyframeBoardOpen, setKeyframeBoardOpen] = useState(false);
     const [seedancePromptsOpen, setSeedancePromptsOpen] = useState(false);
     const [keyframeEditor, setKeyframeEditor] = useState<KeyframeEditorState | null>(null);
+    const [keyframeMaterials, setKeyframeMaterials] = useState<KeyframeMaterialDiagnostics | null>(null);
     const [keyframePreview, setKeyframePreview] = useState<MediaPreviewState | null>(null);
     const [videoPreview, setVideoPreview] = useState<VideoPreviewState | null>(null);
     const [pendingKeyframes, setPendingKeyframes] = useState<string[]>([]);
@@ -860,6 +1099,14 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
     const allGeneratedSelected = generatedShotIds.length > 0 && selectedKeyframes.length === generatedShotIds.length;
     const editorShot = keyframeEditor ? bundle.shots.find((shot) => shot.id === keyframeEditor.shotId) : undefined;
     const editorKeyframe = editorShot?.keyframe_asset_id ? keyframeAssets.get(editorShot.keyframe_asset_id) : undefined;
+    const effectiveKeyframeReferenceIds = keyframeEditor?.referenceAssetIds
+        ?? keyframeMaterials?.materials.map((item) => item.id)
+        ?? [];
+    const keyframeMaterialOptions = keyframeMaterials?.available_materials
+        ?? bundle.assets.filter((asset) => asset.type === "image" && ["character", "prop", "scene", "style"].includes(asset.role));
+    const selectedKeyframeMaterials = effectiveKeyframeReferenceIds
+        .map((id) => keyframeMaterialOptions.find((item) => item.id === id) || bundle.assets.find((item) => item.id === id))
+        .filter((item) => !!item);
     const selectedPromptSkill = promptSkills.find((skill) => skill.id === promptSkillId);
     const selectedSeedanceModel = seedanceCatalog?.models.find((model) => model.id === seedanceModel);
     const missingH3ShotIds = bundle.shots.filter((shot) => (
@@ -977,6 +1224,7 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
     );
     const openKeyframeEditor = (shot: Shot) => {
         const currentKeyframe = shot.keyframe_asset_id ? keyframeAssets.get(shot.keyframe_asset_id) : undefined;
+        setKeyframeMaterials(null);
         setKeyframeEditor({
             shotId: shot.id,
             prompt: shot.keyframe_prompt || currentKeyframe?.description || shot.scene_description || shot.visual_prompt,
@@ -984,6 +1232,17 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
             revisionMode: shot.keyframe_revision_suggestion_draft
                 ? shot.keyframe_revision_mode
                 : currentKeyframe ? "iterate" : "fresh",
+            referenceAssetIds: shot.keyframe_reference_asset_ids ?? null,
+        });
+        void getKeyframeMaterials(bundle.project.id, shot.id)
+            .then(setKeyframeMaterials)
+            .catch(() => setKeyframeMaterials(null));
+    };
+    const toggleKeyframeMaterial = (assetId: string) => {
+        setKeyframeEditor((current) => {
+            if (!current) return current;
+            const base = current.referenceAssetIds ?? effectiveKeyframeReferenceIds;
+            return { ...current, referenceAssetIds: toggle(base, assetId) };
         });
     };
     const saveKeyframePrompt = async () => {
@@ -993,7 +1252,10 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
         await action(
             `keyframe-prompt-${editorShot.id}`,
             async () => {
-                await updateKeyframePrompt(bundle.project.id, editorShot.id, { keyframe_prompt: keyframeEditor.prompt.trim() });
+                await updateKeyframePrompt(bundle.project.id, editorShot.id, {
+                    keyframe_prompt: keyframeEditor.prompt.trim(),
+                    keyframe_reference_asset_ids: keyframeEditor.referenceAssetIds,
+                });
                 completed = true;
             },
             `镜头 ${editorShot.ordinal} 的首帧 Prompt 已保存。`,
@@ -1043,6 +1305,7 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
                 keyframe_prompt: prompt,
                 keyframe_revision_suggestion_draft: suggestionToSend,
                 keyframe_revision_mode: revisionMode,
+                keyframe_reference_asset_ids: keyframeEditor.referenceAssetIds,
             });
             saved = true;
         }, `镜头 ${shot.ordinal} 的首帧设置已保存。`, false);
@@ -1169,23 +1432,41 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
             const name = shot ? `镜头 ${shot.ordinal}${shotTitle ? ` · ${shotTitle}` : ""}` : `生成视频 ${job.id.slice(-6)}`;
             const seedance = (job.input_snapshot?.seedance || {}) as Record<string, unknown>;
             const provider = job.provider === "ark_seedance" ? String(seedance.model_label || "Seedance 2.0") : "MiniMax H3";
-            return <JobRow key={job.id} job={job} projectId={bundle.project.id} shotLabel={shot ? `镜头 ${shot.ordinal}` : "未绑定镜头"} preview={() => setVideoPreview({ name, url: projectInlineUrl(bundle.project.id, "job", job.id), downloadUrl: projectDownloadUrl(bundle.project.id, "job", job.id), provider })} cancel={() => action(`cancel-${job.id}`, () => cancelRenderJob(bundle.project.id, job.id), "已发送取消请求")} remove={() => action(`delete-${job.id}`, () => deleteRenderJob(bundle.project.id, job.id), "已删除该渲染任务记录")} />;
+            const selected = shot?.selected_video_job_id === job.id;
+            const currentOutput = !!shot?.video_path && shot.video_path === job.output_path;
+            return <JobRow key={job.id} job={job} projectId={bundle.project.id} shotLabel={shot ? `镜头 ${shot.ordinal}` : "未绑定镜头"} selected={selected} currentOutput={currentOutput} preview={() => setVideoPreview({ name, url: projectInlineUrl(bundle.project.id, "job", job.id), downloadUrl: projectDownloadUrl(bundle.project.id, "job", job.id), provider })} adopt={shot ? () => action(`select-${job.id}`, () => selectRenderJob(bundle.project.id, job.id), `镜头 ${shot.ordinal} 已采用此版本；对应尾帧已锁定。`) : undefined} cancel={() => action(`cancel-${job.id}`, () => cancelRenderJob(bundle.project.id, job.id), "已发送取消请求")} remove={() => action(`delete-${job.id}`, () => deleteRenderJob(bundle.project.id, job.id), "已删除该渲染任务记录")} />;
         })}</div>}</section>
         {keyframeEditor && editorShot && <div className="studio-modal" role="dialog" aria-modal="true" aria-labelledby="keyframe-editor-title" onMouseDown={() => setKeyframeEditor(null)}>
-            <section className="studio-dialog max-w-5xl" onMouseDown={(event) => event.stopPropagation()}>
-                <div className="mb-5 flex items-start justify-between gap-4">
+            <section className="studio-dialog my-0 flex max-h-[calc(100dvh-2rem)] min-h-0 max-w-5xl flex-col overflow-hidden" onMouseDown={(event) => event.stopPropagation()}>
+                <div className="shrink-0">
+                    <div className="mb-5 flex items-start justify-between gap-4">
                     <div><p className="studio-kicker">KEYFRAME REVISION</p><h2 id="keyframe-editor-title" className="text-2xl font-semibold">镜头 {editorShot.ordinal} · 首帧 Prompt 与重新生成</h2><p className="mt-1 text-sm leading-6 text-white/45">可先修改完整 Prompt，再补充本次修改建议，并决定是否把当前首帧作为视觉参考。</p></div>
                     <button type="button" className="rounded-lg p-2 text-white/35 hover:bg-white/8 hover:text-white" aria-label="关闭" onClick={() => setKeyframeEditor(null)}><X size={20} /></button>
+                    </div>
                 </div>
-                <div className="grid gap-5 lg:grid-cols-[minmax(260px,.72fr)_minmax(0,1.28fr)]">
+                <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+                    <div className="grid gap-5 lg:grid-cols-[minmax(260px,.72fr)_minmax(0,1.28fr)]">
                     <div>
                         <div className="flex aspect-video items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-black/35">
                             {editorKeyframe ? <img className="h-full w-full object-contain" src={projectDownloadUrl(bundle.project.id, "asset", editorKeyframe.id)} alt={`镜头 ${editorShot.ordinal} 当前首帧`} /> : <div className="flex flex-col items-center gap-2 text-white/25"><ImageIcon size={30} /><span className="text-xs">当前还没有首帧图</span></div>}
                         </div>
                         {editorKeyframe && <button type="button" className="studio-secondary mt-3 w-full" onClick={() => setKeyframePreview({ name: `镜头 ${editorShot.ordinal} 当前首帧`, url: projectDownloadUrl(bundle.project.id, "asset", editorKeyframe.id), description: editorKeyframe.description || keyframeEditor.prompt })}><Maximize2 size={14} />查看当前原图</button>}
-                        <div className="mt-4 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] p-3 text-xs leading-5 text-cyan-50/50">系统只会附加本镜实际出场角色的外观设定和参考图，不再附加其他角色或声音信息；下面的模式只控制是否额外参考当前生成图。</div>
+                        <div className="mt-4 rounded-lg border border-cyan-300/12 bg-cyan-300/[.03] p-3 text-xs leading-5 text-cyan-50/50">首帧参考与视频参考分别保存。本次首帧生成只提交右侧勾选的场景母版、人物形象图和固定物品图；“基于当前图修改”还会把当前首帧置于参考图 1。</div>
                     </div>
                     <div className="space-y-4">
+                        <div className="rounded-xl border border-cyan-300/12 bg-cyan-300/[.025] p-3">
+                            <div className="flex flex-wrap items-center justify-between gap-2"><div><span className="studio-label">本次首帧实际参考素材与编号</span><p className="text-[11px] leading-5 text-white/35">编号就是提交给图片模型的顺序；取消勾选后不会发送该图。</p></div><button type="button" className="studio-secondary px-2.5 py-1.5 text-xs" onClick={() => setKeyframeEditor((current) => current ? { ...current, referenceAssetIds: null } : current)}>恢复自动选择</button></div>
+                            <div className="mt-2 space-y-1.5 rounded-lg border border-white/8 bg-black/15 p-2.5 text-xs">
+                                {keyframeEditor.revisionMode === "iterate" && editorKeyframe && <div className="flex items-center gap-2 text-cyan-100/70"><span className="rounded bg-cyan-300/10 px-1.5 py-0.5 font-mono">参考图 1</span><span>当前首帧 · 仅“基于当前图修改”时提交</span></div>}
+                                {selectedKeyframeMaterials.map((asset, index) => <div key={asset.id} className="flex items-center gap-2 text-white/60"><span className="rounded bg-white/6 px-1.5 py-0.5 font-mono">参考图 {index + 1 + (keyframeEditor.revisionMode === "iterate" && editorKeyframe ? 1 : 0)}</span><span className="min-w-0 flex-1 truncate">{asset.name}</span><span className="text-white/25">{assetRoleLabel(asset.role)}</span></div>)}
+                                {selectedKeyframeMaterials.length === 0 && !(keyframeEditor.revisionMode === "iterate" && editorKeyframe) && <p className="text-amber-100/60">当前不提交任何图片参考，只使用文字 Prompt。</p>}
+                            </div>
+                            <div className="mt-3 max-h-44 space-y-1 overflow-y-auto rounded-lg border border-white/8 p-2">
+                                {keyframeMaterialOptions.map((asset) => <label key={asset.id} className="flex items-center gap-2 rounded-md px-1 py-1 text-xs text-white/60 hover:bg-white/[.03]"><input type="checkbox" checked={effectiveKeyframeReferenceIds.includes(asset.id)} onChange={() => toggleKeyframeMaterial(asset.id)} /><span className="min-w-0 flex-1 truncate">{asset.name}</span><span className="text-white/25">{assetRoleLabel(asset.role)}</span></label>)}
+                                {!keyframeMaterials && <p className="px-1 py-2 text-white/30">正在读取该镜头的自动参考清单…</p>}
+                            </div>
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]"><span className="studio-status">{keyframeEditor.referenceAssetIds === null ? "自动选择" : "手动选择"}</span>{keyframeMaterials?.warnings.map((warning) => <span key={warning} className="text-amber-100/65">{warning}</span>)}</div>
+                        </div>
                         <label><span className="studio-label">首帧图详细 Prompt（可直接修改）</span><textarea className="studio-input min-h-44 resize-y" maxLength={12000} value={keyframeEditor.prompt} onChange={(event) => setKeyframeEditor((current) => current ? { ...current, prompt: event.target.value } : current)} placeholder="描述人物、动作瞬间、环境、构图、机位、光线、色彩和材质…" /></label>
                         <div className="flex justify-end text-[11px] text-white/25">{keyframeEditor.prompt.length}/12000</div>
                         <label><span className="studio-label">本次修改建议（可选，只写变化）</span><textarea className="studio-input min-h-28 resize-y" maxLength={4000} value={keyframeEditor.suggestions} onChange={(event) => setKeyframeEditor((current) => current ? { ...current, suggestions: event.target.value } : current)} placeholder="只填写相对上方 Prompt 需要改变的内容，不要重复粘贴完整 Prompt。例如：人物表情更克制；门口增加逆光；去掉右侧多余人物……" /></label>
@@ -1198,8 +1479,9 @@ function ProductionPanel({ bundle, busy, busyTasks, error, notice, action, refre
                             </div>
                         </div>
                     </div>
+                    </div>
                 </div>
-                <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
+                <div className="mt-6 flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-white/8 pt-5">
                     <p className="text-xs text-white/30">点击生成后可直接关闭弹窗继续操作；后台生成成功后会保留旧图文件，并把新图自动绑定为本镜 I2V 首帧。</p>
                     <div className="flex flex-wrap gap-2"><button type="button" className="studio-secondary" disabled={keyframeBusy(editorShot) || !keyframeEditor.prompt.trim()} onClick={() => void saveKeyframePrompt()}>{busyTasks.has(`keyframe-prompt-${editorShot.id}`) ? <Loader2 className="animate-spin" size={15} /> : <Save size={15} />}仅保存 Prompt</button><button type="button" className="studio-primary" disabled={keyframeBusy(editorShot) || !keyframeEditor.prompt.trim()} onClick={() => void regenerateKeyframe()}>{pendingKeyframes.includes(editorShot.id) ? <Loader2 className="animate-spin" size={15} /> : <Sparkles size={15} />}{pendingKeyframes.includes(editorShot.id) ? "后台生成中…" : editorKeyframe ? "按以上设置重新生成" : "按以上设置生成首帧"}</button></div>
                 </div>
@@ -1267,7 +1549,7 @@ function formatJobTime(iso: string | null | undefined): string {
     return date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
-function JobRow({ job, projectId, shotLabel, preview, cancel, remove }: { job: RenderJob; projectId: string; shotLabel: string; preview: () => void; cancel: () => Promise<void>; remove: () => Promise<void> }) {
+function JobRow({ job, projectId, shotLabel, selected, currentOutput, preview, adopt, cancel, remove }: { job: RenderJob; projectId: string; shotLabel: string; selected: boolean; currentOutput: boolean; preview: () => void; adopt?: () => Promise<void>; cancel: () => Promise<void>; remove: () => Promise<void> }) {
     const color = job.status === "completed" ? "text-emerald-300" : job.status === "failed" ? "text-red-300" : ACTIVE_JOBS.has(job.status) ? "text-cyan-200" : "text-white/40";
     const params = (job.input_snapshot?.h3_parameters || {}) as Record<string, unknown>;
     const seedance = (job.input_snapshot?.seedance || {}) as Record<string, unknown>;
@@ -1275,7 +1557,7 @@ function JobRow({ job, projectId, shotLabel, preview, cancel, remove }: { job: R
         ? `${seedance.model_label || seedance.model_id || "Seedance"} · ${seedance.resolution || "720p"} · ${seedance.duration || "-"}s · ${seedance.generate_audio === false ? "无声" : "同步声音"}`
         : params.width ? `${params.width}×${params.height} · ${params.frames}帧 · ${params.steps}步 · ${params.scheduler} · ${params.model_profile || "旧模型"}+${params.text_encoder_profile || "旧编码器"}` : "历史任务默认参数";
     const providerLabel = job.provider === "ark_seedance" ? "SEEDANCE API" : job.provider === "atlas_h3" ? "ATLAS H3 API" : job.provider === "metaso_h3" ? "METASO H3 API" : job.mode?.toUpperCase() || "H3";
-    return <div className="rounded-lg border border-white/8 bg-black/15 p-3"><div className="flex flex-wrap items-center gap-3"><span className={`w-24 text-xs font-semibold uppercase ${color}`}>{job.status}</span><div className="h-1.5 min-w-32 flex-1 overflow-hidden rounded bg-white/8"><div className="h-full bg-cyan-300" style={{ width: `${Math.round(job.progress * 100)}%` }} /></div><span className="w-10 text-right font-mono text-xs text-white/35">{Math.round(job.progress * 100)}%</span>{job.status === "completed" && <div className="flex gap-1.5"><button type="button" className="studio-secondary px-2.5 py-1.5 text-xs" onClick={preview}><Play size={13} />预览</button><a className="studio-secondary px-2.5 py-1.5 text-xs" href={projectDownloadUrl(projectId, "job", job.id)}><Download size={13} />下载</a></div>}{ACTIVE_JOBS.has(job.status) && <button className="rounded p-1.5 text-white/30 hover:text-red-300" title="取消该任务" onClick={() => void cancel()}><Trash2 size={14} /></button>}{!ACTIVE_JOBS.has(job.status) && <button className="rounded p-1.5 text-white/30 hover:text-red-300" title="删除该任务记录" onClick={() => void remove()}><Trash2 size={14} /></button>}</div>{job.error && <p className={`mt-2 text-xs ${ACTIVE_JOBS.has(job.status) ? "text-cyan-100/55" : "text-red-300/80"}`}>{job.error}</p>}<p className="mt-1 text-[11px] text-white/25">{shotLabel} · {providerLabel} · {parameterText} · seed {job.seed} · 预估 ¥{(job.estimated_cost || 0).toFixed(2)} · {job.elapsed_seconds ? `${job.elapsed_seconds.toFixed(0)}s` : "等待计时"} · 开始生成 {formatJobTime(job.started_at || job.created_at)}</p></div>;
+    return <div className={`rounded-lg border p-3 ${selected ? "border-emerald-300/25 bg-emerald-300/[.035]" : "border-white/8 bg-black/15"}`}><div className="flex flex-wrap items-center gap-3"><span className={`w-24 text-xs font-semibold uppercase ${color}`}>{job.status}</span>{selected ? <span className="inline-flex items-center gap-1 rounded-md bg-emerald-300/12 px-2 py-1 text-[11px] font-semibold text-emerald-200"><Check size={12} />已采用</span> : currentOutput ? <span className="rounded-md bg-cyan-300/10 px-2 py-1 text-[11px] text-cyan-100/65">当前自动版本</span> : null}<div className="h-1.5 min-w-32 flex-1 overflow-hidden rounded bg-white/8"><div className="h-full bg-cyan-300" style={{ width: `${Math.round(job.progress * 100)}%` }} /></div><span className="w-10 text-right font-mono text-xs text-white/35">{Math.round(job.progress * 100)}%</span>{job.status === "completed" && <div className="flex gap-1.5"><button type="button" className="studio-secondary px-2.5 py-1.5 text-xs" onClick={preview}><Play size={13} />预览</button><a className="studio-secondary px-2.5 py-1.5 text-xs" href={projectDownloadUrl(projectId, "job", job.id)}><Download size={13} />下载</a>{!selected && adopt && <button type="button" className="studio-primary px-2.5 py-1.5 text-xs" onClick={() => void adopt()}><PackageCheck size={13} />{currentOutput ? "锁定此版" : "采用此版本"}</button>}</div>}{ACTIVE_JOBS.has(job.status) && <button className="rounded p-1.5 text-white/30 hover:text-red-300" title="取消该任务" onClick={() => void cancel()}><Trash2 size={14} /></button>}{!ACTIVE_JOBS.has(job.status) && !selected && <button className="rounded p-1.5 text-white/30 hover:text-red-300" title="删除该任务记录" onClick={() => void remove()}><Trash2 size={14} /></button>}</div>{job.error && <p className={`mt-2 text-xs ${ACTIVE_JOBS.has(job.status) ? "text-cyan-100/55" : "text-red-300/80"}`}>{job.error}</p>}<p className="mt-1 text-[11px] text-white/25">{shotLabel} · {providerLabel} · {parameterText} · seed {job.seed} · 预估 ¥{(job.estimated_cost || 0).toFixed(2)} · {job.elapsed_seconds ? `${job.elapsed_seconds.toFixed(0)}s` : "等待计时"} · 开始生成 {formatJobTime(job.started_at || job.created_at)}</p></div>;
 }
 
 function DeliveryCard({ delivery, projectId }: { delivery: Delivery; projectId: string }) {
@@ -1285,7 +1567,7 @@ function DeliveryCard({ delivery, projectId }: { delivery: Delivery; projectId: 
 
 function Field({ label, hint, wide, children }: { label: string; hint?: string; wide?: boolean; children: React.ReactNode }) { return <label className={wide ? "md:col-span-2" : ""}><span className="studio-label">{label}</span><div className="studio-field">{children}</div>{hint && <span className="mt-1.5 block text-[11px] leading-5 text-white/32">{hint}</span>}</label>; }
 function assetRoleLabel(role: AssetRole) {
-    return ({ character: "人物形象", style: "画风参考", scene: "场景参考", keyframe: "首帧", last_frame: "尾帧", motion: "动作/运镜", voice: "声音参考", music: "背景音乐", sound_effect: "音效", output: "输出", other: "其他" } as Record<AssetRole, string>)[role] || role;
+    return ({ character: "人物形象", prop: "固定物品", style: "画风参考", scene: "场景参考", keyframe: "首帧", last_frame: "尾帧", motion: "动作/运镜", voice: "声音参考", music: "背景音乐", sound_effect: "音效", output: "输出", other: "其他" } as Record<AssetRole, string>)[role] || role;
 }
 function toggle(values: string[], value: string) { return values.includes(value) ? values.filter((item) => item !== value) : [...values, value]; }
 type BusyState = ReadonlySet<string>;

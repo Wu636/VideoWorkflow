@@ -6,6 +6,7 @@ import type {
     Delivery,
     H3PromptSkill,
     ImageProviderOption,
+    KeyframeMaterialDiagnostics,
     Project,
     ProjectBrief,
     ProjectBundle,
@@ -20,6 +21,7 @@ import type {
     RenderJob,
     Review,
     Shot,
+    ShotSplitPreview,
     SceneProfile,
     StyleAnalysisDraft,
     Storyboard,
@@ -229,6 +231,7 @@ export async function generateCharacterReferencesWithOptions(
         userSuggestions?: string;
         referenceAssetIds?: string[];
         appearanceProfileId?: string | null;
+        referenceStrategy?: "identity" | "project_style";
     },
 ): Promise<Asset[]> {
     return api(`/projects/${projectId}/characters/references/generate`, {
@@ -238,6 +241,7 @@ export async function generateCharacterReferencesWithOptions(
             user_suggestions: options.userSuggestions || "",
             reference_asset_ids: options.referenceAssetIds || null,
             appearance_profile_id: options.appearanceProfileId || null,
+            reference_strategy: options.referenceStrategy || "identity",
         }),
     });
 }
@@ -357,7 +361,7 @@ export async function updateShot(shot: Shot): Promise<Shot> {
 export async function updateKeyframePrompt(
     projectId: string,
     shotId: string,
-    patch: Pick<Shot, "keyframe_prompt"> & Partial<Pick<Shot, "keyframe_revision_suggestion_draft" | "keyframe_revision_mode">>,
+    patch: Pick<Shot, "keyframe_prompt"> & Partial<Pick<Shot, "keyframe_revision_suggestion_draft" | "keyframe_revision_mode" | "keyframe_reference_asset_ids">>,
 ): Promise<Shot> {
     return api<Shot>(`/projects/${projectId}/shots/${shotId}/keyframe-prompt`, {
         method: "PATCH",
@@ -378,6 +382,33 @@ export async function reviseShotWithAi(
     });
 }
 
+export async function previewShotSplit(
+    projectId: string,
+    shotId: string,
+    options: { userSuggestions?: string; segmentCount?: 2 | 3 | 4 | null } = {},
+): Promise<ShotSplitPreview> {
+    return api(`/projects/${projectId}/shots/${shotId}/split-preview`, {
+        method: "POST",
+        body: JSON.stringify({
+            user_suggestions: options.userSuggestions || "",
+            segment_count: options.segmentCount || null,
+        }),
+    });
+}
+
+export async function confirmShotSplit(
+    projectId: string,
+    shotId: string,
+    preview: ShotSplitPreview,
+    promptTargets: ("h3" | "seedance")[] = [],
+    h3SkillId = "h3-prompt-writing",
+): Promise<Shot[]> {
+    return api(`/projects/${projectId}/shots/${shotId}/split-confirm`, {
+        method: "POST",
+        body: JSON.stringify({ preview, prompt_targets: promptTargets, h3_skill_id: h3SkillId }),
+    });
+}
+
 export async function insertShotWithAi(
     projectId: string,
     afterShotId: string | null,
@@ -393,6 +424,10 @@ export async function insertShotWithAi(
 
 export async function getSeedanceMaterials(projectId: string, shotId: string): Promise<SeedanceMaterialDiagnostics> {
     return api(`/projects/${projectId}/shots/${shotId}/seedance-materials`);
+}
+
+export async function getKeyframeMaterials(projectId: string, shotId: string): Promise<KeyframeMaterialDiagnostics> {
+    return api(`/projects/${projectId}/shots/${shotId}/keyframe-materials`);
 }
 
 export async function createShot(projectId: string, shot: Shot): Promise<Shot> {
@@ -549,6 +584,10 @@ export async function getRenderJobs(projectId: string): Promise<RenderJob[]> {
 
 export async function cancelRenderJob(projectId: string, jobId: string): Promise<RenderJob> {
     return api(`/projects/${projectId}/jobs/${jobId}/cancel`, { method: "POST", body: "{}" });
+}
+
+export async function selectRenderJob(projectId: string, jobId: string): Promise<Shot> {
+    return api(`/projects/${projectId}/jobs/${jobId}/select`, { method: "POST", body: "{}" });
 }
 
 export async function deleteRenderJob(projectId: string, jobId: string): Promise<{ deleted: boolean }> {

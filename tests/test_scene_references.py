@@ -9,7 +9,16 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from src.video_workflow.domain import AssetRole, ProjectBrief, SceneProfile, Shot, StyleProfile
+from src.video_workflow.domain import (
+    AssetRole,
+    CharacterProfile,
+    FirstFrameCompleteness,
+    ProjectBrief,
+    SceneProfile,
+    SeedanceReferenceMode,
+    Shot,
+    StyleProfile,
+)
 from src.video_workflow.generators.image import GrsaiImageGenerator, ImageDownloadError, download_generated_image
 from src.video_workflow.services.projects import ProjectService, SceneReferenceConflictError
 from src.video_workflow.storage import ProjectStore
@@ -113,6 +122,195 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["applied_count"], 1)
         self.assertEqual(result["h3_preserved_count"], 1)
         self.assertEqual(result["keyframes_preserved_count"], 1)
+
+    def test_cross_scene_shot_uses_start_for_keyframe_and_both_for_video(self):
+        home_path = self.root / "home.png"
+        office_path = self.root / "office.png"
+        for path in (home_path, office_path):
+            path.write_bytes(PNG)
+        home_asset = self.service.register_existing_asset(
+            self.project.id, home_path, AssetRole.SCENE, "奶奶家母版"
+        )
+        office_asset = self.service.register_existing_asset(
+            self.project.id, office_path, AssetRole.SCENE, "地府办公室母版"
+        )
+        project = self.service.require_project(self.project.id)
+        project.scene_profiles[0].reference_asset_ids = [home_asset.id]
+        project.scene_profiles[0].approved = True
+        project.scene_profiles[1].reference_asset_ids = [office_asset.id]
+        project.scene_profiles[1].approved = True
+        self.store.save_project(project)
+
+        shot = self.store.get_shot(self.shot.id)
+        shot.scene_profile_ids = [self.office.id, self.home.id]
+        shot.scene_profile_id = self.office.id
+        shot.use_scene_profile = True
+        shot.seedance_reference_mode = SeedanceReferenceMode.STRICT_FIRST_FRAME
+        shot.narrative = "张小差从地府办公室冲出，穿过通道后进入奶奶家客厅"
+        self.store.save_shot(shot)
+        project = self.service.require_project(self.project.id)
+        assets = self.store.list_assets(self.project.id)
+
+        keyframe_refs = self.service.keyframe_reference_assets(project, shot, assets, [])
+        self.assertEqual([asset.id for asset in keyframe_refs], [office_asset.id])
+
+        video_refs = self.service.seedance_reference_assets(shot, assets, project)
+        self.assertEqual(
+            [asset.id for asset in video_refs],
+            [office_asset.id, home_asset.id],
+        )
+        self.assertEqual(
+            self.service.resolve_seedance_reference_mode(project, shot, assets),
+            SeedanceReferenceMode.MULTIMODAL_REFERENCE,
+        )
+
+        seedance_prompt = self.service.compile_seedance_prompt(project, shot, assets)
+        self.assertIn("@图片1（地府办公室母版）", seedance_prompt)
+        self.assertIn("@图片2（奶奶家母版）", seedance_prompt)
+        self.assertIn("转场前的起始场景“地府”", seedance_prompt)
+        self.assertIn("转场完成后的目标场景“奶奶家”", seedance_prompt)
+        self.assertIn("禁止把两个房间拼贴在同一画面", seedance_prompt)
+
+        # Existing paid H3 text is intentionally durable; clear it only in
+        # this fixture to exercise the local H3 compiler contract.
+        shot.h3_prompt_skill_output = ""
+        h3_prompt = self.service.compile_h3_prompt(project, shot, assets)
+        self.assertIn("【跨场景档案｜严格按顺序执行】", h3_prompt)
+        self.assertIn("0.00 秒与转场前只使用起始场景“地府”", h3_prompt)
+        self.assertIn("只使用目标场景“奶奶家”", h3_prompt)
+
+    def test_seedance_auto_uses_strict_first_frame_only_after_completeness_confirmation(self):
+        keyframe_path = self.root / "complete-keyframe.png"
+        keyframe_path.write_bytes(PNG)
+        keyframe = self.service.register_existing_asset(
+            self.project.id, keyframe_path, AssetRole.KEYFRAME, "客厅双人完整首帧"
+        )
+        project = self.service.require_project(self.project.id)
+        shot = self.store.get_shot(self.shot.id)
+        shot.keyframe_asset_id = keyframe.id
+        shot.scene_profile_ids = [self.home.id]
+        shot.scene_profile_id = self.home.id
+        shot.use_scene_profile = True
+        shot.seedance_reference_mode = SeedanceReferenceMode.AUTO
+        assets = self.store.list_assets(self.project.id)
+
+        unknown = self.service.seedance_material_diagnostics(project, shot, assets)
+        self.assertEqual(unknown["resolved_mode"], SeedanceReferenceMode.MULTIMODAL_REFERENCE.value)
+        self.assertEqual(unknown["first_frame_completeness"], FirstFrameCompleteness.UNKNOWN.value)
+
+        shot.first_frame_completeness = FirstFrameCompleteness.COMPLETE
+        refs = self.service.seedance_reference_assets(shot, assets, project)
+        complete = self.service.seedance_material_diagnostics(project, shot, assets)
+        self.assertEqual(complete["resolved_mode"], SeedanceReferenceMode.STRICT_FIRST_FRAME.value)
+        self.assertEqual([asset.id for asset in refs], [keyframe.id])
+        self.assertIn("已确认包含", str(complete["reference_mode_reason"]))
+
+        shot.first_frame_completeness = FirstFrameCompleteness.INCOMPLETE
+        incomplete = self.service.seedance_material_diagnostics(project, shot, assets)
+        self.assertEqual(incomplete["resolved_mode"], SeedanceReferenceMode.MULTIMODAL_REFERENCE.value)
+        self.assertIn("信息不完整", str(incomplete["reference_mode_reason"]))
+
+    def test_legacy_scene_profile_id_migrates_to_ordered_scene_list(self):
+        shot = Shot.model_validate({
+            "project_id": self.project.id,
+            "ordinal": 2,
+            "scene_profile_id": self.office.id,
+        })
+        self.assertEqual(shot.scene_profile_ids, [self.office.id])
+        self.assertEqual(shot.scene_profile_id, self.office.id)
+
+    def test_keyframe_keeps_explicit_cast_when_story_uses_a_role_alias(self):
+        hero = CharacterProfile(name="张小差", description="主角详细外观" * 100)
+        elder = CharacterProfile(name="王德发", description="花白短发，藏蓝中山装")
+        dog = CharacterProfile(name="老黄狗", description="黄色短毛老犬")
+        crowd = CharacterProfile(name="排队鬼魂群像")
+        project = self.service.require_project(self.project.id)
+        project.characters = [hero, elder, dog, crowd]
+        self.store.save_project(project)
+        shot = self.store.get_shot(self.shot.id)
+        shot.character_ids = [hero.id, elder.id, dog.id]
+        shot.scene_description = "张小差站在客厅，王大爷坐在沙发上，老黄狗趴着。"
+
+        resolved = self.service.keyframe_character_ids(project, shot, shot.scene_description)
+        prompt = self.service.compile_keyframe_prompt(
+            project,
+            shot.scene_description,
+            resolved,
+        )
+
+        self.assertEqual(resolved, [hero.id, elder.id, dog.id])
+        self.assertIn("王德发：", prompt)
+        self.assertIn("老黄狗：", prompt)
+
+    def test_manual_reference_allowlists_override_keyframe_and_video_defaults(self):
+        home_path = self.root / "manual-home.png"
+        office_path = self.root / "manual-office.png"
+        for path in (home_path, office_path):
+            path.write_bytes(PNG)
+        home_asset = self.service.register_existing_asset(
+            self.project.id, home_path, AssetRole.SCENE, "奶奶家母版"
+        )
+        office_asset = self.service.register_existing_asset(
+            self.project.id, office_path, AssetRole.SCENE, "地府母版"
+        )
+        project = self.service.require_project(self.project.id)
+        project.scene_profiles[0].reference_asset_ids = [home_asset.id]
+        project.scene_profiles[0].approved = True
+        self.store.save_project(project)
+        shot = self.store.get_shot(self.shot.id)
+        shot.use_scene_profile = True
+        shot.keyframe_reference_asset_ids = [office_asset.id]
+        shot.video_reference_asset_ids = [home_asset.id, office_asset.id]
+        assets = self.store.list_assets(self.project.id)
+
+        keyframe_refs = self.service.keyframe_reference_assets(project, shot, assets, [])
+        video_refs = self.service.seedance_reference_assets(shot, assets, project)
+        keyframe_diagnostics = self.service.keyframe_material_diagnostics(project, shot, assets)
+        video_diagnostics = self.service.seedance_material_diagnostics(project, shot, assets)
+
+        self.assertEqual([item.id for item in keyframe_refs], [office_asset.id])
+        self.assertEqual([item.id for item in video_refs], [home_asset.id, office_asset.id])
+        self.assertEqual(keyframe_diagnostics["selection_mode"], "manual")
+        self.assertEqual(video_diagnostics["selection_mode"], "manual")
+        self.assertEqual(
+            [item["id"] for item in keyframe_diagnostics["materials"]],
+            [office_asset.id],
+        )
+
+    def test_fixed_prop_reference_is_available_to_still_and_video_compilers(self):
+        prop_path = self.root / "battery-sheet.png"
+        prop_path.write_bytes(PNG)
+        prop_asset = self.service.register_existing_asset(
+            self.project.id,
+            prop_path,
+            AssetRole.PROP,
+            "电动车铅酸电池组",
+            description="四块绿色 12V20Ah 电池组成 2×2 重型电池组，约两只鞋盒并排，橙色连接线",
+        )
+        project = self.service.require_project(self.project.id)
+        shot = self.store.get_shot(self.shot.id)
+        shot.scene_description = "客厅地面摆着正在充电的电动车电池组"
+        shot.reference_asset_ids = [prop_asset.id]
+        assets = self.store.list_assets(self.project.id)
+
+        keyframe_refs = self.service.keyframe_reference_assets(project, shot, assets, [])
+        video_refs = self.service.seedance_reference_assets(shot, assets, project)
+        anchored_prompt = self.service.apply_fixed_prop_anchor("【首帧画面】客厅地面", keyframe_refs)
+        seedance_prompt = self.service.compile_seedance_prompt(project, shot, assets)
+        diagnostics = self.service.keyframe_material_diagnostics(project, shot, assets)
+
+        self.assertIn(prop_asset.id, [asset.id for asset in keyframe_refs])
+        self.assertIn(prop_asset.id, [asset.id for asset in video_refs])
+        self.assertIn("【固定物锚点】", anchored_prompt)
+        self.assertIn("两只鞋盒并排", anchored_prompt)
+        self.assertIn("固定物品定义", seedance_prompt)
+        self.assertIn("禁止缩成掌心玩具", seedance_prompt)
+        self.assertIn(prop_asset.id, [item["id"] for item in diagnostics["available_materials"]])
+
+        shot.keyframe_reference_asset_ids = []
+        shot.video_reference_asset_ids = []
+        self.assertTrue(any("物品参考图未被勾选" in warning for warning in self.service.keyframe_material_diagnostics(project, shot, assets)["warnings"]))
+        self.assertTrue(any("物品参考图未被选入视频参考" in warning for warning in self.service.seedance_material_diagnostics(project, shot, assets)["warnings"]))
 
     async def test_exact_prompt_and_parallel_scenes_preserve_each_other(self):
         started = asyncio.Event()

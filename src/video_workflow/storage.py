@@ -251,6 +251,58 @@ class ProjectStore:
             )
         return shot
 
+    def replace_shot_with_many(
+        self,
+        project_id: str,
+        shot_id: str,
+        replacements: Iterable[Shot],
+        expected_version: int | None = None,
+    ) -> list[Shot]:
+        """Replace one shot with several fresh shots in a single transaction."""
+        new_items = list(replacements)
+        if len(new_items) < 2:
+            raise ValueError("拆分结果至少需要两个镜头")
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT data FROM shots WHERE project_id=? ORDER BY ordinal",
+                (project_id,),
+            ).fetchall()
+            existing = [Shot.model_validate_json(row["data"]) for row in rows]
+            source_index = next((index for index, item in enumerate(existing) if item.id == shot_id), None)
+            if source_index is None:
+                raise KeyError(f"Shot not found: {shot_id}")
+            source = existing[source_index]
+            if expected_version is not None and source.version != expected_version:
+                raise ValueError("本镜已有新的保存结果，请重新生成拆分预览")
+            existing_ids = {item.id for item in existing if item.id != shot_id}
+            replacement_ids = [item.id for item in new_items]
+            if len(set(replacement_ids)) != len(replacement_ids) or existing_ids.intersection(replacement_ids):
+                raise ValueError("拆分镜头标识发生冲突，请重新生成拆分预览")
+
+            now = utc_now()
+            for offset, item in enumerate(new_items):
+                item.project_id = project_id
+                item.ordinal = source.ordinal + offset
+                item.updated_at = now
+            self._archive_h3_prompt(conn, source)
+            for item in new_items:
+                self._archive_h3_prompt(conn, item)
+            conn.execute("DELETE FROM shots WHERE id=? AND project_id=?", (shot_id, project_id))
+            conn.executemany(
+                "INSERT INTO shots(id,project_id,ordinal,updated_at,data) VALUES(?,?,?,?,?)",
+                [(item.id, project_id, item.ordinal, item.updated_at, self._dump(item)) for item in new_items],
+            )
+            replacement_count_delta = len(new_items) - 1
+            for item in existing[source_index + 1:]:
+                self._archive_h3_prompt(conn, item)
+                item.ordinal += replacement_count_delta
+                item.updated_at = now
+                conn.execute(
+                    "UPDATE shots SET ordinal=?,updated_at=?,data=? WHERE id=? AND project_id=?",
+                    (item.ordinal, item.updated_at, self._dump(item), item.id, project_id),
+                )
+        return new_items
+
     @staticmethod
     def _archive_h3_prompt(conn: sqlite3.Connection, shot: Shot) -> None:
         if not shot.h3_prompt_skill_output.strip():
