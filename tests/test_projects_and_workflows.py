@@ -1981,6 +1981,107 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(captured["aspect_ratio"], "16:9")
         self.assertEqual(generated[0].image_status, "completed")
 
+    def test_project_cover_uses_context_references_suggestion_and_ratio(self) -> None:
+        project = self.service.create_project(ProjectBrief(
+            title="排插安全科普",
+            story="张小差发现老奶奶把取暖器、电视机和手机充电器插在同一个老化排插上。",
+            aspect_ratio="16:9",
+            visual_style="中式奇幻轻喜剧手绘插画",
+        ))
+        lead = CharacterProfile(
+            name="张小差",
+            description="年轻女性阴差，表情生动",
+            wardrobe="黑色制服和 404 工牌",
+        )
+        character_path = self.root / "zhang.png"
+        style_path = self.root / "style.png"
+        prop_path = self.root / "power-strip.png"
+        keyframe_path = self.root / "keyframe.png"
+        old_cover_path = self.root / "old-cover.png"
+        for path in (character_path, style_path, prop_path, keyframe_path, old_cover_path):
+            path.write_bytes(path.stem.encode("utf-8"))
+        character_asset = self.service.register_existing_asset(
+            project.id, character_path, AssetRole.CHARACTER, "张小差四视图"
+        )
+        character_asset.character_id = lead.id
+        self.store.save_asset(character_asset)
+        style_asset = self.service.register_existing_asset(
+            project.id, style_path, AssetRole.STYLE, "科普插画画风"
+        )
+        prop_asset = self.service.register_existing_asset(
+            project.id, prop_path, AssetRole.PROP, "老化排插"
+        )
+        keyframe_asset = self.service.register_existing_asset(
+            project.id, keyframe_path, AssetRole.KEYFRAME, "过载排插首帧"
+        )
+        old_cover = self.service.register_existing_asset(
+            project.id, old_cover_path, AssetRole.COVER, "旧封面"
+        )
+        lead.reference_asset_ids = [character_asset.id]
+        project.characters = [lead]
+        project.style_profile = StyleProfile(
+            name="项目画风",
+            medium="数字手绘",
+            reference_asset_ids=[style_asset.id],
+            approved=True,
+        )
+        self.store.save_project(project)
+        self.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=1,
+            title="排插过载",
+            narrative="张小差震惊地指向冒火花的排插。",
+            character_ids=[lead.id],
+            reference_asset_ids=[prop_asset.id],
+            keyframe_asset_id=keyframe_asset.id,
+        ))
+        captured: dict[str, object] = {}
+
+        class FakeImageGenerator:
+            async def generate_image(
+                self,
+                scene: Scene,
+                output_dir: str,
+                reference_image_path: str | None = None,
+                **kwargs: object,
+            ) -> str:
+                captured.update({"scene": scene, "references": reference_image_path, **kwargs})
+                output = Path(output_dir) / "cover.png"
+                output.write_bytes(b"generated-cover")
+                return str(output)
+
+        suggestion = "主标题改成“别让排插变火龙”，突出张小差的震惊表情"
+        with patch(
+            "src.video_workflow.services.projects.create_image_generator",
+            return_value=FakeImageGenerator(),
+        ):
+            generated = asyncio.run(self.service.generate_project_cover(
+                project.id,
+                user_suggestions=suggestion,
+                aspect_ratio="16:9",
+            ))
+
+        prompt = captured["scene"].visual_prompt  # type: ignore[union-attr]
+        references = str(captured["references"]).split(",")
+        self.assertEqual(generated.role, AssetRole.COVER)
+        self.assertEqual(captured["aspect_ratio"], "16:9")
+        self.assertIn("cover-ratio:16:9", generated.tags)
+        self.assertIn(suggestion, prompt)
+        self.assertIn("排插安全科普", prompt)
+        self.assertIn("顶部大标题", prompt)
+        self.assertEqual(
+            references,
+            [
+                str(character_path.resolve()),
+                str(style_path.resolve()),
+                str(prop_path.resolve()),
+                str(keyframe_path.resolve()),
+            ],
+        )
+        self.assertNotIn(str(old_cover_path.resolve()), references)
+        self.assertEqual(len(self.store.list_assets(project.id)), 6)
+        self.assertTrue(resolve_media_path(generated.path).is_file())
+
     def test_keyframe_revision_mode_controls_previous_image_reference(self) -> None:
         project = self.service.create_project(ProjectBrief(title="revision", story="story"))
         previous_path = self.root / "previous.png"
@@ -2110,6 +2211,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         jobs = queue.enqueue(project.id, [shot.id])
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].seed, 123456)
+        self.assertEqual(jobs[0].input_snapshot["duration_seconds"], shot.duration_seconds)
         self.assertEqual(jobs[0].input_snapshot["h3_parameters"]["width"], 608)
         self.assertTrue(jobs[0].input_snapshot["h3_parameters"]["turbo"])
         self.assertEqual(jobs[0].input_snapshot["h3_parameters"]["steps"], 6)

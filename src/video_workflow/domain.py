@@ -84,6 +84,7 @@ class AssetRole(str, Enum):
     PROP = "prop"
     STYLE = "style"
     SCENE = "scene"
+    COVER = "cover"
     KEYFRAME = "keyframe"
     LAST_FRAME = "last_frame"
     MOTION = "motion"

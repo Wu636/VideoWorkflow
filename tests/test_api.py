@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
-from src.video_workflow.domain import AssetRole, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, Shot, ShotContinuityMode, StyleProfile
+from src.video_workflow.domain import Asset, AssetRole, AssetType, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, Shot, ShotContinuityMode, StyleProfile
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
@@ -136,6 +136,45 @@ class ProjectApiTests(unittest.TestCase):
             f"/api/projects/another-project/shots/{shot.id}/keyframe-prompt",
             json={"keyframe_prompt": "x"},
         ).status_code, 404)
+
+    def test_project_cover_route_forwards_suggestion_and_ratio(self) -> None:
+        project = self.client.post(
+            "/api/projects",
+            json={"title": "排插安全科普", "story": "阴差上门排查老化排插"},
+        ).json()
+        cover = Asset(
+            project_id=project["id"],
+            type=AssetType.IMAGE,
+            role=AssetRole.COVER,
+            name="排插安全科普 · 项目封面 9:16",
+            path="/tmp/generated-cover.png",
+            tags=["generated-cover", "cover-ratio:9:16"],
+        )
+        generator = AsyncMock(return_value=cover)
+        with patch.object(router.project_service, "generate_project_cover", new=generator):
+            response = self.client.post(
+                f"/api/projects/{project['id']}/cover/generate",
+                json={
+                    "user_suggestions": "让危险排插占前景三分之一",
+                    "aspect_ratio": "9:16",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["role"], "cover")
+        self.assertIn("cover-ratio:9:16", response.json()["tags"])
+        generator.assert_awaited_once_with(
+            project["id"],
+            "让危险排插占前景三分之一",
+            "9:16",
+            None,
+            None,
+        )
+        invalid = self.client.post(
+            f"/api/projects/{project['id']}/cover/generate",
+            json={"aspect_ratio": "2:1"},
+        )
+        self.assertEqual(invalid.status_code, 422)
 
     def test_shot_split_preview_and_confirm_routes(self) -> None:
         project = self.client.post("/api/projects", json={"title": "拆分接口", "story": "人物起身、开门并走出房间"}).json()

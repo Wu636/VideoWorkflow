@@ -237,11 +237,16 @@ class SceneReferenceConflictError(ValueError):
     """A stale scene editor or duplicate generation must not overwrite work."""
 
 
+class ProjectCoverBusyError(ValueError):
+    """Only one paid cover generation may run for a project at a time."""
+
+
 class ProjectService:
     def __init__(self, store: ProjectStore):
         self.store = store
         self._active_keyframes: set[str] = set()
         self._active_scene_references: set[str] = set()
+        self._active_project_covers: set[str] = set()
 
     def create_project(self, brief: ProjectBrief) -> Project:
         project = Project(brief=brief)
@@ -6582,6 +6587,203 @@ Do not copy the full project bible or every character into the result. The autho
         if failures:
             raise RuntimeError("部分分镜图生成失败；成功结果已保留。" + "；".join(failures))
         return self.store.list_shots(project_id)
+
+    @staticmethod
+    def _cover_reference_assets(
+        project: Project,
+        shots: list[Shot],
+        assets: list[Asset],
+    ) -> list[Asset]:
+        """Pick a small, stable identity/style set for a project cover."""
+        assets_by_id = {asset.id: asset for asset in assets}
+        ordered_ids: list[str] = []
+
+        # Lead characters are ranked by storyboard appearances so a large cast
+        # does not crowd the cover or exhaust the provider's reference limit.
+        appearances = {
+            character.id: sum(character.id in shot.character_ids for shot in shots)
+            for character in project.characters
+        }
+        for character in sorted(
+            project.characters,
+            key=lambda item: (-appearances[item.id], project.characters.index(item)),
+        )[:4]:
+            candidates = [
+                *character.reference_asset_ids,
+                *[
+                    asset.id
+                    for asset in assets
+                    if asset.role == AssetRole.CHARACTER and asset.character_id == character.id
+                ],
+            ]
+            ordered_ids.extend(candidates[:1])
+
+        style_ids = [
+            *(project.style_profile.reference_asset_ids if project.style_profile and project.style_profile.approved else []),
+            *(
+                asset.id
+                for asset in assets
+                if asset.role == AssetRole.STYLE and asset.type == AssetType.IMAGE
+            ),
+        ]
+        ordered_ids.extend(list(dict.fromkeys(style_ids))[:2])
+
+        # Theme-defining props (for example an overloaded power strip) deserve
+        # their own identity reference instead of being inferred from prose.
+        prop_assets = [
+            asset
+            for asset in assets
+            if asset.role == AssetRole.PROP and asset.type == AssetType.IMAGE
+        ]
+        ordered_ids.extend(
+            asset.id
+            for asset in sorted(
+                prop_assets,
+                key=lambda asset: -sum(
+                    asset.id in shot.reference_asset_ids
+                    or asset.id in (shot.keyframe_reference_asset_ids or [])
+                    or asset.id in (shot.video_reference_asset_ids or [])
+                    for shot in shots
+                ),
+            )[:2]
+        )
+        scene_ids = [
+            asset_id
+            for profile in project.scene_profiles
+            if profile.approved
+            for asset_id in profile.reference_asset_ids[:1]
+        ]
+        ordered_ids.extend(list(dict.fromkeys(scene_ids))[:1])
+        ordered_ids.extend(
+            shot.keyframe_asset_id
+            for shot in sorted(shots, key=lambda item: (-len(item.character_ids), item.ordinal))
+            if shot.keyframe_asset_id
+        )
+
+        selected: list[Asset] = []
+        for asset_id in dict.fromkeys(ordered_ids):
+            asset = assets_by_id.get(asset_id)
+            if (
+                asset
+                and asset.type == AssetType.IMAGE
+                and asset.role != AssetRole.COVER
+                and resolve_media_path(asset.path).is_file()
+            ):
+                selected.append(asset)
+            if len(selected) >= 10:
+                break
+        return selected
+
+    @classmethod
+    def compile_project_cover_prompt(
+        cls,
+        project: Project,
+        shots: list[Shot],
+        references: list[Asset],
+        user_suggestions: str = "",
+        aspect_ratio: str = "16:9",
+    ) -> str:
+        title = project.brief.title.strip()
+        story = project.brief.story.strip()[:2400]
+        style = cls.project_style_text(project).strip()[:1800] or "沿用项目已有分镜的统一视觉风格"
+        character_lines = []
+        for character in project.characters[:6]:
+            details = "；".join(
+                item.strip()
+                for item in (character.description, character.wardrobe)
+                if item.strip()
+            )
+            character_lines.append(f"- {character.name}：{details[:500] or '沿用角色参考图中的固定身份与造型'}")
+        shot_clues = "\n".join(
+            f"- 镜头 {shot.ordinal}《{shot.title or '未命名'}》：{(shot.narrative or shot.scene_description)[:220]}"
+            for shot in shots[:16]
+            if shot.narrative.strip() or shot.scene_description.strip()
+        )[:2800]
+        role_labels = {
+            AssetRole.CHARACTER: "人物形象",
+            AssetRole.STYLE: "画风",
+            AssetRole.SCENE: "场景",
+            AssetRole.KEYFRAME: "分镜首帧",
+            AssetRole.PROP: "关键道具",
+        }
+        reference_lines = "\n".join(
+            f"- 参考图 {index}：{asset.name}（{role_labels.get(asset.role, '项目视觉参考')}）"
+            for index, asset in enumerate(references, start=1)
+        ) or "- 当前没有可用参考图，严格依据项目设定绘制"
+        suggestion_block = user_suggestions.strip() or "无额外建议，由系统选择故事冲突最强的瞬间"
+        return f"""【任务】为本视频项目生成一张可直接发布的高点击率中文主封面，不是普通分镜截图。
+【封面比例】{aspect_ratio}，横竖构图必须严格适配该比例，重要人物、标题和危险物件都留在安全区。
+【主标题】画面上方使用最大字号、强对比、粗描边的中文标题。若用户建议没有另行指定标题，文字必须准确写成“{title}”；若用户明确指定了新标题，以用户建议为准并准确呈现。
+【故事核心】{story}
+【主要角色】
+{chr(10).join(character_lines) or '- 本项目没有已建档角色，按故事中的主角关系设计'}
+【可用镜头线索】
+{shot_clues or '- 尚无分镜，从故事核心提炼视觉冲突'}
+【统一视觉风格】{style}
+【参考图顺序】
+{reference_lines}
+【本次用户建议｜最高优先级】{suggestion_block}
+【封面设计语言】参考成熟中文科普短片/剧情短视频海报：顶部大标题占约 20%，中心用主角的大幅强情绪反应形成第一视觉焦点，关键配角在侧后方形成态度对照；把最能说明主题的风险物件或事件放在前景并适度夸张，背景用环境细节补足故事世界。采用前景暖色风险光与背景冷色空间光的层次对比，轮廓清楚、构图饱满、信息一眼可读，兼具戏剧性、科普感和点击吸引力。
+【硬性限制】角色身份、年龄、发型、服装和画风必须服从参考图及项目设定；只允许出现上述准确主标题，除非用户建议明确要求，否则不要生成小字、标签、榜单、乱码、Logo、水印、边框或界面元素；不要把封面做成角色设定板、九宫格、拼贴或电影截图。""".strip()
+
+    async def generate_project_cover(
+        self,
+        project_id: str,
+        user_suggestions: str = "",
+        aspect_ratio: str = "16:9",
+        image_provider: str | None = None,
+        image_model: str | None = None,
+    ) -> Asset:
+        supported_ratios = {"16:9", "9:16", "1:1", "4:3", "3:4"}
+        if aspect_ratio not in supported_ratios:
+            raise ValueError(f"不支持的封面比例: {aspect_ratio}")
+        if project_id in self._active_project_covers:
+            raise ProjectCoverBusyError("本项目封面正在生成，请等待完成后再提交下一版")
+
+        project = self.require_project(project_id)
+        shots = self.store.list_shots(project_id)
+        assets = self.store.list_assets(project_id)
+        references = self._cover_reference_assets(project, shots, assets)
+        prompt = self.compile_project_cover_prompt(
+            project,
+            shots,
+            references,
+            user_suggestions,
+            aspect_ratio,
+        )
+        output_dir = self.project_dir(project_id) / "covers" / uuid4().hex
+        output_dir.mkdir(parents=True, exist_ok=True)
+        seed = random.randint(1, 2**31 - 1)
+        scene = Scene(
+            id=1,
+            narrative=project.brief.story[:1200],
+            visual_prompt=prompt,
+            motion_prompt="",
+            duration=5,
+        )
+        image_gen = create_image_generator(image_provider=image_provider, model=image_model)
+        self._active_project_covers.add(project_id)
+        try:
+            output = await image_gen.generate_image(
+                scene,
+                str(output_dir),
+                ",".join(str(resolve_media_path(asset.path)) for asset in references) or None,
+                seed=seed,
+                character_description="",
+                image_style="",
+                aspect_ratio=aspect_ratio,
+            )
+            asset = self.register_existing_asset(
+                project_id,
+                Path(output),
+                role=AssetRole.COVER,
+                name=f"{project.brief.title} · 项目封面 {aspect_ratio}",
+                description=prompt,
+            )
+            asset.tags = ["generated-cover", f"cover-ratio:{aspect_ratio}", f"seed:{seed}"]
+            return self.store.save_asset(asset)
+        finally:
+            self._active_project_covers.discard(project_id)
 
     def register_existing_asset(
         self,

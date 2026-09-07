@@ -54,7 +54,7 @@ from src.video_workflow.integrations.seedance import (
 from src.video_workflow.h3_prompt_skills import list_h3_prompt_skills
 from src.video_workflow.media_paths import resolve_media_path
 from src.video_workflow.services.finalize import Finalizer
-from src.video_workflow.services.projects import H3_DIRECTOR_VERSION, KeyframeBusyError, ProjectService, SceneReferenceConflictError, ShotSplitBusyError, ShotVersionConflictError
+from src.video_workflow.services.projects import H3_DIRECTOR_VERSION, KeyframeBusyError, ProjectCoverBusyError, ProjectService, SceneReferenceConflictError, ShotSplitBusyError, ShotVersionConflictError
 from src.video_workflow.services.render_queue import RenderQueue
 from src.video_workflow.storage import ProjectStore
 
@@ -190,6 +190,13 @@ class KeyframeRequest(BaseModel):
     image_model: str | None = None
     revision_mode: Literal["fresh", "iterate"] = "fresh"
     user_suggestions: str = Field(default="", max_length=4000)
+
+
+class ProjectCoverGenerateRequest(BaseModel):
+    user_suggestions: str = Field(default="", max_length=4000)
+    aspect_ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4"] = "16:9"
+    image_provider: str | None = None
+    image_model: str | None = None
 
 
 class KeyframeExportRequest(BaseModel):
@@ -1098,6 +1105,27 @@ async def generate_keyframes(project_id: str, request: KeyframeRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("项目 %s 的分镜首帧生成失败", project_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/cover/generate")
+async def generate_project_cover(project_id: str, request: ProjectCoverGenerateRequest):
+    try:
+        return await project_service.generate_project_cover(
+            project_id,
+            request.user_suggestions,
+            request.aspect_ratio,
+            request.image_provider,
+            request.image_model,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ProjectCoverBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的封面生成失败", project_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 

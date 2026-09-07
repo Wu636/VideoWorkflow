@@ -483,6 +483,19 @@ export async function generateKeyframes(
     });
 }
 
+export async function generateProjectCover(
+    projectId: string,
+    options: { userSuggestions?: string; aspectRatio?: "16:9" | "9:16" | "1:1" | "4:3" | "3:4" } = {},
+): Promise<Asset> {
+    return api(`/projects/${projectId}/cover/generate`, {
+        method: "POST",
+        body: JSON.stringify({
+            user_suggestions: options.userSuggestions || "",
+            aspect_ratio: options.aspectRatio || "16:9",
+        }),
+    });
+}
+
 export async function getH3PromptSkills(): Promise<{ default_skill_id: string; director_version: string; skills: H3PromptSkill[] }> {
     return api("/projects/h3-prompt-skills");
 }

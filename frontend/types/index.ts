@@ -22,6 +22,7 @@ export type AssetRole =
     | 'prop'
     | 'style'
     | 'scene'
+    | 'cover'
     | 'keyframe'
     | 'last_frame'
     | 'motion'

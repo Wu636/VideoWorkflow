@@ -314,6 +314,7 @@ class RenderQueue:
                 input_snapshot={
                     "shot_version": shot.version,
                     "storyboard_version": project.storyboard_version,
+                    "duration_seconds": shot.duration_seconds,
                     "h3_parameters": h3_parameters,
                     "quality_guard": quality_guard,
                 },
@@ -390,6 +391,7 @@ class RenderQueue:
                 input_snapshot={
                     "shot_version": shot.version,
                     "storyboard_version": project.storyboard_version,
+                    "duration_seconds": shot.duration_seconds,
                     "seedance": {
                         "model_id": model.id,
                         "model_label": model.label,
