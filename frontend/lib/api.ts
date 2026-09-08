@@ -12,6 +12,7 @@ import type {
     ProjectBundle,
     ProductionSeries,
     ProjectAnalysisDraft,
+    ScriptDurationAssessment,
     ScriptRewriteDraft,
     SeedanceCatalog,
     SeedanceEstimate,
@@ -314,6 +315,10 @@ export async function rewriteProjectScript(projectId: string, mode: "auto" | "ex
     });
 }
 
+export async function assessProjectScriptDuration(projectId: string): Promise<ScriptDurationAssessment> {
+    return api(`/projects/${projectId}/brief/duration-assess`, { method: "POST", body: "{}" });
+}
+
 export async function uploadProjectScript(projectId: string, file: File): Promise<{ asset: Asset; project: Project; extracted_characters: number }> {
     const data = new FormData();
     data.append("file", file);
@@ -485,13 +490,20 @@ export async function generateKeyframes(
 
 export async function generateProjectCover(
     projectId: string,
-    options: { userSuggestions?: string; aspectRatio?: "16:9" | "9:16" | "1:1" | "4:3" | "3:4" } = {},
+    options: {
+        userSuggestions?: string;
+        aspectRatio?: "16:9" | "9:16" | "1:1" | "4:3" | "3:4";
+        referenceMode?: "none" | "uploaded" | "previous";
+        referenceAssetId?: string | null;
+    } = {},
 ): Promise<Asset> {
     return api(`/projects/${projectId}/cover/generate`, {
         method: "POST",
         body: JSON.stringify({
             user_suggestions: options.userSuggestions || "",
             aspect_ratio: options.aspectRatio || "16:9",
+            reference_mode: options.referenceMode || "none",
+            reference_asset_id: options.referenceAssetId || null,
         }),
     });
 }

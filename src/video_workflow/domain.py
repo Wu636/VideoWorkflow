@@ -84,6 +84,7 @@ class AssetRole(str, Enum):
     PROP = "prop"
     STYLE = "style"
     SCENE = "scene"
+    COVER_REFERENCE = "cover_reference"
     COVER = "cover"
     KEYFRAME = "keyframe"
     LAST_FRAME = "last_frame"
@@ -320,6 +321,24 @@ class ScriptRewriteDraft(BaseModel):
     estimated_duration_seconds: float = Field(ge=1)
     change_summary: str = ""
     feasibility_notes: list[str] = Field(default_factory=list)
+
+
+class ScriptDurationAssessment(BaseModel):
+    """Natural finished runtime for a script without duration-padding beats."""
+
+    natural_duration_seconds: float = Field(ge=1)
+    natural_duration_min_seconds: float = Field(ge=1)
+    natural_duration_max_seconds: float = Field(ge=1)
+    target_duration_seconds: float = Field(ge=1)
+    difference_seconds: float
+    recommendation: Literal["expand", "shorten", "fit"]
+    content_density: Literal["sparse", "balanced", "dense"] = "balanced"
+    dialogue_and_narration_seconds: float = Field(default=0, ge=0)
+    visual_only_seconds: float = Field(default=0, ge=0)
+    transition_seconds: float = Field(default=0, ge=0)
+    summary: str = ""
+    assessment_basis: list[str] = Field(default_factory=list)
+    density_issues: list[str] = Field(default_factory=list)
 
 
 class ShotSplitSegment(BaseModel):

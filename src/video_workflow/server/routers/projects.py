@@ -31,6 +31,7 @@ from src.video_workflow.domain import (
     ProjectBrief,
     ProjectStatus,
     Review,
+    ScriptDurationAssessment,
     Shot,
     ShotSplitPreview,
 )
@@ -195,6 +196,8 @@ class KeyframeRequest(BaseModel):
 class ProjectCoverGenerateRequest(BaseModel):
     user_suggestions: str = Field(default="", max_length=4000)
     aspect_ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4"] = "16:9"
+    reference_mode: Literal["none", "uploaded", "previous"] = "none"
+    reference_asset_id: str | None = None
     image_provider: str | None = None
     image_model: str | None = None
 
@@ -580,6 +583,19 @@ async def rewrite_brief(project_id: str, request: ScriptRewriteRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AI 剧本改写失败: {exc}") from exc
+
+
+@router.post("/{project_id}/brief/duration-assess", response_model=ScriptDurationAssessment)
+async def assess_brief_duration(project_id: str):
+    try:
+        return await project_service.assess_story_duration(project_id)
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的剧本自然时长评估失败", project_id)
+        raise HTTPException(status_code=500, detail=f"AI 剧本自然时长评估失败: {exc}") from exc
 
 
 def _extract_script_text(filename: str, content: bytes) -> str:
@@ -1112,11 +1128,13 @@ async def generate_keyframes(project_id: str, request: KeyframeRequest):
 async def generate_project_cover(project_id: str, request: ProjectCoverGenerateRequest):
     try:
         return await project_service.generate_project_cover(
-            project_id,
-            request.user_suggestions,
-            request.aspect_ratio,
-            request.image_provider,
-            request.image_model,
+            project_id=project_id,
+            user_suggestions=request.user_suggestions,
+            aspect_ratio=request.aspect_ratio,
+            reference_mode=request.reference_mode,
+            reference_asset_id=request.reference_asset_id,
+            image_provider=request.image_provider,
+            image_model=request.image_model,
         )
     except KeyError as exc:
         raise _not_found(str(exc)) from exc

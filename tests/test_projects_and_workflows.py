@@ -1275,7 +1275,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertIn("图片1是上一镜真实尾帧", prompt)
         self.assertIn("图片2", prompt)
 
-    def test_single_shot_ai_redo_locks_only_identity_ordinal_and_duration(self) -> None:
+    def test_single_shot_ai_redo_keeps_identity_and_ordinal_but_can_change_duration(self) -> None:
         project = self.service.create_project(ProjectBrief(title="redo", story="原剧情"))
         shot = Shot(
             project_id=project.id,
@@ -1290,6 +1290,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         class FakeLLM:
             async def generate_json(self, *_: object, **__: object) -> dict[str, object]:
                 return {
+                    "duration_seconds": 5.5,
                     "title": "彻底重做",
                     "narrative": "角色来到室外",
                     "dialogue": "新的对白",
@@ -1313,7 +1314,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
 
         self.assertEqual(revised.id, shot.id)
         self.assertEqual(revised.ordinal, 3)
-        self.assertEqual(revised.duration_seconds, 7.25)
+        self.assertEqual(revised.duration_seconds, 5.5)
         self.assertEqual(revised.title, "彻底重做")
         self.assertEqual(revised.scene_description, "雨夜街道")
         self.assertEqual(revised.dialogue, "新的对白")
@@ -2082,6 +2083,76 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_assets(project.id)), 6)
         self.assertTrue(resolve_media_path(generated.path).is_file())
 
+    def test_project_cover_reference_modes_put_selected_cover_first(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="封面参考模式", story="主角发现居家安全隐患"))
+        uploaded_path = self.root / "uploaded-cover-reference.png"
+        previous_path = self.root / "previous-generated-cover.png"
+        uploaded_path.write_bytes(b"uploaded")
+        previous_path.write_bytes(b"previous")
+        uploaded = self.service.register_existing_asset(
+            project.id,
+            uploaded_path,
+            AssetRole.COVER_REFERENCE,
+            "用户上传封面参考",
+        )
+        previous = self.service.register_existing_asset(
+            project.id,
+            previous_path,
+            AssetRole.COVER,
+            "上一版生成封面",
+        )
+        previous.tags = ["generated-cover", "cover-ratio:16:9"]
+        self.store.save_asset(previous)
+        captured: list[dict[str, object]] = []
+
+        class FakeImageGenerator:
+            async def generate_image(
+                self,
+                scene: Scene,
+                output_dir: str,
+                reference_image_path: str | None = None,
+                **kwargs: object,
+            ) -> str:
+                captured.append({"scene": scene, "references": reference_image_path, **kwargs})
+                output = Path(output_dir) / "cover.png"
+                output.write_bytes(f"generated-{len(captured)}".encode())
+                return str(output)
+
+        with patch(
+            "src.video_workflow.services.projects.create_image_generator",
+            return_value=FakeImageGenerator(),
+        ):
+            uploaded_result = asyncio.run(self.service.generate_project_cover(
+                project.id,
+                user_suggestions="参考它的大字排版",
+                reference_mode="uploaded",
+                reference_asset_id=uploaded.id,
+            ))
+            previous_result = asyncio.run(self.service.generate_project_cover(
+                project.id,
+                user_suggestions="主角表情再紧张一点",
+                reference_mode="previous",
+            ))
+            fresh_result = asyncio.run(self.service.generate_project_cover(
+                project.id,
+                reference_mode="none",
+            ))
+
+        first_references = str(captured[0]["references"]).split(",")
+        second_references = str(captured[1]["references"]).split(",")
+        self.assertEqual(first_references[0], str(uploaded_path.resolve()))
+        self.assertIn("参考图 1 是用户上传", captured[0]["scene"].visual_prompt)  # type: ignore[union-attr]
+        self.assertEqual(second_references[0], str(resolve_media_path(uploaded_result.path)))
+        self.assertIn("参考图 1 是上一版", captured[1]["scene"].visual_prompt)  # type: ignore[union-attr]
+        self.assertIsNone(captured[2]["references"])
+        self.assertIn("全新构图", captured[2]["scene"].visual_prompt)  # type: ignore[union-attr]
+        self.assertIn(f"cover-reference-asset:{uploaded.id}", uploaded_result.tags)
+        self.assertIn(f"cover-reference-asset:{uploaded_result.id}", previous_result.tags)
+        self.assertIn("cover-reference-mode:none", fresh_result.tags)
+
+        with self.assertRaisesRegex(ValueError, "请先上传"):
+            asyncio.run(self.service.generate_project_cover(project.id, reference_mode="uploaded"))
+
     def test_keyframe_revision_mode_controls_previous_image_reference(self) -> None:
         project = self.service.create_project(ProjectBrief(title="revision", story="story"))
         previous_path = self.root / "previous.png"
@@ -2417,6 +2488,42 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertIn("目标成片时长：45 秒", str(captured["prompt"]))
         self.assertIn(suggestion, str(captured["prompt"]))
         self.assertIn("任一生成片段不得超过 15 秒", str(captured["prompt"]))
+
+    def test_story_duration_assessment_uses_natural_runtime_without_target_padding(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(
+                title="自然时长",
+                story="人物发现隐患，和住户完成一轮有信息量的劝说，最后把电池移到室外。",
+                target_duration_seconds=300,
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeLLM:
+            async def generate_json(self, system_prompt: str, user_prompt: str):
+                captured.update(system=system_prompt, prompt=user_prompt)
+                return {
+                    "natural_duration_seconds": 266,
+                    "natural_duration_min_seconds": 252,
+                    "natural_duration_max_seconds": 278,
+                    "dialogue_and_narration_seconds": 178,
+                    "visual_only_seconds": 82,
+                    "transition_seconds": 6,
+                    "content_density": "balanced",
+                    "summary": "现有有效内容自然支撑约 266 秒，距离目标仍缺少内容。",
+                    "assessment_basis": ["对白按正常语速计算"],
+                    "density_issues": ["结尾知识点略少"],
+                }
+
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()):
+            assessment = asyncio.run(self.service.assess_story_duration(project.id))
+
+        self.assertEqual(assessment.natural_duration_seconds, 266)
+        self.assertEqual(assessment.difference_seconds, -34)
+        self.assertEqual(assessment.recommendation, "expand")
+        self.assertEqual(assessment.dialogue_and_narration_seconds, 178)
+        self.assertIn("目标时长仅用于比较，不得反向拉伸评估", str(captured["prompt"]))
+        self.assertIn("静止等待、重复表情", str(captured["prompt"]))
 
 
 if __name__ == "__main__":

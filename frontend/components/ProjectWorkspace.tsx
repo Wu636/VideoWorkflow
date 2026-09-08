@@ -41,6 +41,7 @@ import {
 import {
     approveStoryboard,
     applySceneProfiles,
+    assessProjectScriptDuration,
     analyzeCharacterReferences,
     analyzeProjectBrief,
     analyzeProjectStyle,
@@ -92,10 +93,11 @@ import {
 import { summarizeRenderJobs } from "@/lib/render-job-stats";
 import { isH3PromptBlocked, isKeyframeBusy } from "@/lib/production-busy";
 import SceneProfileCard from "@/components/SceneProfileCard";
-import type { Asset, AssetRole, CharacterProfile, Delivery, H3PromptSkill, KeyframeMaterialDiagnostics, Project, ProjectAnalysisDraft, ProjectBundle, RenderJob, ScriptRewriteDraft, SeedanceCatalog, SeedanceEstimate, SeedanceMaterialDiagnostics, Shot, ShotSplitPreview, StyleAnalysisDraft } from "@/types";
+import type { Asset, AssetRole, CharacterProfile, Delivery, H3PromptSkill, KeyframeMaterialDiagnostics, Project, ProjectAnalysisDraft, ProjectBundle, RenderJob, ScriptDurationAssessment, ScriptRewriteDraft, SeedanceCatalog, SeedanceEstimate, SeedanceMaterialDiagnostics, Shot, ShotSplitPreview, StyleAnalysisDraft } from "@/types";
 
 type Tab = "brief" | "storyboard" | "assets" | "production" | "review" | "delivery";
 type CoverAspectRatio = "16:9" | "9:16" | "1:1" | "4:3" | "3:4";
+type CoverReferenceMode = "none" | "uploaded" | "previous";
 
 const COVER_ASPECT_RATIOS: CoverAspectRatio[] = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 
@@ -290,6 +292,7 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
     const [rewriteMode, setRewriteMode] = useState<"auto" | "expand" | "shorten">("auto");
     const [rewriteSuggestions, setRewriteSuggestions] = useState("");
     const [rewriteDraft, setRewriteDraft] = useState<ScriptRewriteDraft | null>(null);
+    const [durationAssessment, setDurationAssessment] = useState<ScriptDurationAssessment | null>(null);
     const [analysisBusy, setAnalysisBusy] = useState("");
     const [analysisError, setAnalysisError] = useState("");
     const [analysisNotice, setAnalysisNotice] = useState("");
@@ -302,7 +305,10 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
         const normalized = applyAnalysisConfirmationDefaults(analysis);
         if (normalized !== analysis) setAnalysis(normalized);
     }, [analysis]);
-    const changeBrief = (key: keyof Project["brief"], value: string | number) => setLocal({ ...project, brief: { ...project.brief, [key]: value } });
+    const changeBrief = (key: keyof Project["brief"], value: string | number) => {
+        if (key === "story" || key === "target_duration_seconds" || key === "pacing") setDurationAssessment(null);
+        setLocal({ ...project, brief: { ...project.brief, [key]: value } });
+    };
     const changeAspect = (aspectRatio: string) => {
         const [width, height] = aspectRatio === "9:16" ? [768, 1344] : aspectRatio === "1:1" ? [1024, 1024] : [1344, 768];
         setLocal({ ...project, brief: { ...project.brief, aspect_ratio: aspectRatio, width, height } });
@@ -347,7 +353,7 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
     };
     const uploadScript = async (file: File) => {
         setAnalysisBusy("upload"); setAnalysisError(""); setAnalysisNotice("");
-        try { const result = await uploadProjectScript(project.id, file); setLocal(result.project); setAnalysisNotice(`已从 ${file.name} 提取 ${result.extracted_characters} 个字符并填入剧情脚本。`); }
+        try { const result = await uploadProjectScript(project.id, file); setLocal(result.project); setDurationAssessment(null); setAnalysisNotice(`已从 ${file.name} 提取 ${result.extracted_characters} 个字符并填入剧情脚本。`); }
         catch (caught) { setAnalysisError(caught instanceof Error ? caught.message : String(caught)); }
         finally { setAnalysisBusy(""); }
     };
@@ -356,6 +362,17 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
         try { await save(project); setAnalysis(await analyzeProjectBrief(project.id)); }
         catch (caught) { setAnalysisError(caught instanceof Error ? caught.message : String(caught)); }
         finally { setAnalysisBusy(""); }
+    };
+    const runDurationAssessment = async () => {
+        setAnalysisBusy("duration"); setAnalysisError(""); setAnalysisNotice("");
+        try { setLocal(await updateProject(project)); setDurationAssessment(await assessProjectScriptDuration(project.id)); }
+        catch (caught) { setAnalysisError(caught instanceof Error ? caught.message : String(caught)); }
+        finally { setAnalysisBusy(""); }
+    };
+    const openRewrite = (mode: "auto" | "expand" | "shorten" = "auto") => {
+        setRewriteMode(mode);
+        setRewriteDraft(null);
+        setRewriteOpen(true);
     };
     const syncSeries = async (createNew = false) => {
         await action("series-sync", async () => {
@@ -380,12 +397,13 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
         if (!rewriteDraft) return;
         const next: Project = { ...project, brief: { ...project.brief, story: rewriteDraft.rewritten_story }, ai_recommended_shot_count: null };
         setLocal(next); setAnalysisBusy("apply-rewrite"); setAnalysisError("");
-        try { setLocal(await updateProject(next)); setRewriteOpen(false); setRewriteDraft(null); setAnalysisNotice("AI 改写剧本已应用并保存，原有 AI 镜头数建议已清空，可重新分析或生成分镜。"); }
+        try { setLocal(await updateProject(next)); setRewriteOpen(false); setRewriteDraft(null); setDurationAssessment(null); setAnalysisNotice("AI 改写剧本已应用并保存，原有 AI 镜头数建议已清空；请重新评估自然时长后再生成分镜。"); }
         catch (caught) { setAnalysisError(caught instanceof Error ? caught.message : String(caught)); }
         finally { setAnalysisBusy(""); }
     };
     const applyAnalysis = async () => {
         if (!analysis) return;
+        setDurationAssessment(null);
         const brief = { ...project.brief };
         for (const key of ["visual_style", "pacing", "audience", "negative_prompt", "delivery_notes"] as const) if (selected[key]) brief[key] = analysis[key];
         let characters = project.characters;
@@ -427,7 +445,7 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
     };
     return <div className="grid gap-5 xl:grid-cols-[1.3fr_.7fr]">
         <section className="studio-panel">
-            <div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><p className="studio-kicker">CLIENT BRIEF</p><h2 className="text-xl font-semibold">客户需求</h2></div><div className="flex flex-wrap gap-2"><label className="studio-secondary cursor-pointer"><input className="hidden" type="file" accept=".txt,.md,.markdown,.docx,.pdf" disabled={!!analysisBusy} onChange={(event) => event.target.files?.[0] && void uploadScript(event.target.files[0])} />{analysisBusy === "upload" ? <Loader2 className="animate-spin" size={15} /> : <Upload size={15} />}上传剧本</label><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => { setRewriteOpen(true); setRewriteDraft(null); }}><FilePenLine size={15} />AI 扩写/缩写</button><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => void runAnalysis()}>{analysisBusy === "analyze" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}AI 分析并回填</button><button className="studio-secondary" disabled={busy.has("series-sync")} onClick={() => project.series_id ? void syncSeries(false) : setSeriesOpen(true)}>{busy.has("series-sync") ? <Loader2 className="animate-spin" size={15} /> : <BookCopy size={15} />}{project.series_id ? "更新系列资料" : "建立系列资料"}</button><button className="studio-primary" disabled={busy.has("save-project")} onClick={() => void save(project)}>{busy.has("save-project") ? <Loader2 className="animate-spin" size={16} /> : <Save size={16} />} 保存</button></div></div>
+            <div className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><p className="studio-kicker">CLIENT BRIEF</p><h2 className="text-xl font-semibold">客户需求</h2></div><div className="flex flex-wrap gap-2"><label className="studio-secondary cursor-pointer"><input className="hidden" type="file" accept=".txt,.md,.markdown,.docx,.pdf" disabled={!!analysisBusy} onChange={(event) => event.target.files?.[0] && void uploadScript(event.target.files[0])} />{analysisBusy === "upload" ? <Loader2 className="animate-spin" size={15} /> : <Upload size={15} />}上传剧本</label><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => void runDurationAssessment()}>{analysisBusy === "duration" ? <Loader2 className="animate-spin" size={15} /> : <FileClock size={15} />}评估自然时长</button><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => openRewrite()}><FilePenLine size={15} />AI 扩写/缩写</button><button className="studio-secondary" disabled={!!analysisBusy || !project.brief.story.trim()} onClick={() => void runAnalysis()}>{analysisBusy === "analyze" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}AI 分析并回填</button><button className="studio-secondary" disabled={busy.has("series-sync")} onClick={() => project.series_id ? void syncSeries(false) : setSeriesOpen(true)}>{busy.has("series-sync") ? <Loader2 className="animate-spin" size={15} /> : <BookCopy size={15} />}{project.series_id ? "更新系列资料" : "建立系列资料"}</button><button className="studio-primary" disabled={busy.has("save-project")} onClick={() => void save(project)}>{busy.has("save-project") ? <Loader2 className="animate-spin" size={16} /> : <Save size={16} />} 保存</button></div></div>
             {analysisError && <div className="studio-error mb-4">{analysisError}</div>}{analysisNotice && <div className="studio-notice mb-4">{analysisNotice}</div>}
             {project.series_id && <div className="mb-4 rounded-lg border border-cyan-300/15 bg-cyan-300/[.035] px-4 py-3 text-sm text-cyan-100/70"><BookCopy className="mr-2 inline" size={15} />本项目属于系列第 {project.episode_number || 1} 集。AI 分析默认保留继承的画风、风格圣经和负面约束。</div>}
             <div className="grid gap-4 md:grid-cols-2">
@@ -436,6 +454,13 @@ function BriefPanel({ project, assets, busy, action, setLocal, save }: { project
                 <Field label="目标时长（秒）"><input type="number" min={1} value={project.brief.target_duration_seconds} onChange={(event) => changeBrief("target_duration_seconds", Number(event.target.value))} /></Field>
                 <Field label="画幅"><select value={project.brief.aspect_ratio} onChange={(event) => changeAspect(event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option></select><p className="mt-1 text-[11px] text-white/25">{project.brief.width}×{project.brief.height}</p></Field>
                 <Field label="剧情/故事脚本" wide><textarea rows={10} value={project.brief.story} onChange={(event) => changeBrief("story", event.target.value)} /></Field>
+                {durationAssessment && <div className="rounded-xl border border-cyan-300/15 bg-cyan-300/[.035] p-4 md:col-span-2">
+                    <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="studio-kicker">NATURAL RUNTIME</p><h3 className="font-semibold">剧本自然成片时长</h3><p className="mt-1 text-xs leading-5 text-white/38">按正常语速和有效动作估算，已排除凑时长的静止等待、重复反应和机械留白。</p></div><span className={`studio-status ${durationAssessment.recommendation === "fit" ? "text-emerald-200" : "text-amber-100"}`}>{durationAssessment.recommendation === "expand" ? "建议扩写" : durationAssessment.recommendation === "shorten" ? "建议缩写" : "时长合适"}</span></div>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-3"><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">自然时长</p><strong className="mt-1 block text-xl text-cyan-100">{durationAssessment.natural_duration_seconds.toFixed(0)} 秒</strong><span className="text-[11px] text-white/30">合理范围 {durationAssessment.natural_duration_min_seconds.toFixed(0)}–{durationAssessment.natural_duration_max_seconds.toFixed(0)} 秒</span></div><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">客户目标</p><strong className="mt-1 block text-xl">{durationAssessment.target_duration_seconds.toFixed(0)} 秒</strong><span className="text-[11px] text-white/30">差距按自然估值计算</span></div><div className="rounded-lg border border-white/8 bg-black/15 p-3"><p className="text-xs text-white/35">需要调整</p><strong className="mt-1 block text-xl">{Math.abs(durationAssessment.difference_seconds).toFixed(0)} 秒</strong><span className="text-[11px] text-white/30">{durationAssessment.recommendation === "expand" ? "补充有效内容" : durationAssessment.recommendation === "shorten" ? "压缩重复内容" : "可直接进入分镜"}</span></div></div>
+                    <div className="mt-3 grid gap-3 lg:grid-cols-[.8fr_1.2fr]"><div className="rounded-lg border border-white/8 bg-black/15 p-3 text-xs leading-5 text-white/45"><strong className="text-white/65">有效时间构成</strong><p className="mt-1">对白 / 旁白 {durationAssessment.dialogue_and_narration_seconds.toFixed(0)} 秒 · 纯视觉动作 {durationAssessment.visual_only_seconds.toFixed(0)} 秒 · 转场 {durationAssessment.transition_seconds.toFixed(0)} 秒</p><p>内容密度：{durationAssessment.content_density === "sparse" ? "偏稀" : durationAssessment.content_density === "dense" ? "偏密" : "均衡"}</p></div><div className="rounded-lg border border-white/8 bg-black/15 p-3 text-sm leading-6 text-white/60">{durationAssessment.summary || "已完成自然时长评估。"}</div></div>
+                    {(durationAssessment.assessment_basis.length > 0 || durationAssessment.density_issues.length > 0) && <details className="mt-3 rounded-lg border border-white/8 px-3 py-2 text-xs text-white/45"><summary className="cursor-pointer">查看评估依据和密度问题</summary>{durationAssessment.assessment_basis.length > 0 && <ul className="mt-2 list-disc space-y-1 pl-5">{durationAssessment.assessment_basis.map((item) => <li key={item}>{item}</li>)}</ul>}{durationAssessment.density_issues.length > 0 && <div className="mt-3 border-t border-white/8 pt-2"><strong className="text-amber-100/70">需要留意</strong><ul className="mt-1 list-disc space-y-1 pl-5">{durationAssessment.density_issues.map((item) => <li key={item}>{item}</li>)}</ul></div>}</details>}
+                    <div className="mt-4 flex flex-wrap justify-end gap-2"><button className="studio-secondary" disabled={!!analysisBusy} onClick={() => void runDurationAssessment()}><RefreshCw size={14} />重新评估</button>{durationAssessment.recommendation === "expand" && <button className="studio-primary" onClick={() => openRewrite("expand")}><FilePenLine size={14} />去扩写补足内容</button>}{durationAssessment.recommendation === "shorten" && <button className="studio-primary" onClick={() => openRewrite("shorten")}><FilePenLine size={14} />去缩写压缩内容</button>}</div>
+                </div>}
                 <div className="rounded-xl border border-cyan-300/12 bg-cyan-300/[.025] p-4 md:col-span-2">
                     <div className="flex flex-wrap items-start justify-between gap-3"><div><p className="studio-kicker">STYLE REFERENCE</p><h3 className="font-semibold">用一张风格参考图 AI 回填</h3><p className="mt-1 text-xs leading-5 text-white/38">可直接上传图片，也可选择素材库中已归档为“画风截图 / 参考视频”的素材。完成后会自动保存并更新下方三个字段以及已有分镜 Prompt。</p></div>{project.style_profile?.approved && <span className="studio-status text-emerald-200">已启用：{project.style_profile.name}</span>}</div>
                     <div className="mt-4 grid gap-3 lg:grid-cols-[140px_1fr_auto]">
@@ -533,7 +558,7 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
         void action(
             `ai-revise-${target.id}`,
             () => reviseShotWithAi(bundle.project.id, target.id, reviseSuggestions.trim(), promptTargets),
-            `镜头 ${target.ordinal} 已按建议重做，时长和镜号保持不变`,
+            `镜头 ${target.ordinal} 已按建议重做，AI 已按新内容重新判断时长`,
         ).then(refresh);
     };
     const submitImport = () => {
@@ -685,7 +710,7 @@ function StoryboardPanel({ bundle, busy, action, refresh, updateLocal }: { bundl
         </div>}
         {insertOpen && <div className="studio-modal" onMouseDown={() => setInsertOpen(false)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI INSERT ONE SHOT</p><div className="mb-5 flex items-start gap-3"><span className="rounded-xl bg-cyan-300/10 p-3 text-cyan-200"><Plus size={22} /></span><div><h2 className="text-2xl font-semibold">单独新增一个完整分镜</h2><p className="mt-1 text-sm leading-6 text-white/45">只生成并插入这一镜；现有分镜、首帧、H3 Prompt、Seedance Prompt 和视频结果都保留。</p></div></div><div className="grid gap-4"><Field label="插入位置"><select value={insertAfterShotId} onChange={(event) => setInsertAfterShotId(event.target.value)}><option value="">作为新的结尾镜头</option>{bundle.shots.slice(0, -1).map((shot) => <option key={shot.id} value={shot.id}>插在镜头 {shot.ordinal} 后</option>)}</select></Field><label><span className="studio-label">新增镜头要求</span><textarea className="studio-input min-h-44 resize-y" maxLength={4000} value={insertSuggestions} onChange={(event) => setInsertSuggestions(event.target.value)} placeholder="例如：结尾切回地府大厅，人挤人排着长队，队伍延伸到画面深处；用大全景揭示规模，形成荒诞喜剧反差，不新增主角对白。" autoFocus /></label><div className="rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-4"><span className="studio-label">同时生成哪些视频 Prompt</span><div className="mt-2 flex flex-wrap gap-5 text-sm text-white/65"><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("h3")} onChange={() => setPromptTargets(toggle(promptTargets, "h3") as ("h3" | "seedance")[])} />MiniMax H3（按需）</label><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("seedance")} onChange={() => setPromptTargets(toggle(promptTargets, "seedance") as ("h3" | "seedance")[])} />Seedance 2.x（本地编译）</label></div></div></div><div className="mt-6 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setInsertOpen(false)}>取消</button><button className="studio-primary" disabled={!insertSuggestions.trim() || !!busy} onClick={submitInsert}>{busy === "insert-shot" ? <Loader2 className="animate-spin" size={15} /> : <WandSparkles size={15} />}生成并插入这一镜</button></div></section></div>}
         {showGenerate && <div className="studio-modal" onMouseDown={() => setShowGenerate(false)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI STORYBOARD DIRECTION</p><div className="mb-5 flex items-start gap-3"><span className="rounded-xl bg-cyan-300/10 p-3 text-cyan-200"><MessageSquareText size={22} /></span><div><h2 className="text-2xl font-semibold">{isRedo ? "让 AI 按建议重新修改分镜" : "生成分镜前补充你的建议"}</h2><p className="mt-1 text-sm leading-6 text-white/45">你的文字会和剧情脚本、角色设定、视觉风格一起交给当前分镜模型，并作为本次生成的高优先级要求。</p></div></div>{isRedo && <div className="mb-4 rounded-lg border border-amber-300/15 bg-amber-300/[.04] px-4 py-3 text-sm leading-6 text-amber-100/70">本次会重新生成并替换当前 {bundle.shots.length} 个镜头。需要保留的剧情、镜头或对白，请在建议中明确写出。</div>}<div className="mb-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-4"><span className="studio-label">同时生成哪些视频 Prompt</span><div className="mt-2 flex flex-wrap gap-5 text-sm text-white/65"><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("h3")} onChange={() => setPromptTargets(toggle(promptTargets, "h3") as ("h3" | "seedance")[])} />MiniMax H3（按需）</label><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("seedance")} onChange={() => setPromptTargets(toggle(promptTargets, "seedance") as ("h3" | "seedance")[])} />Seedance 2.x（本地编译）</label></div><p className="mt-2 text-[11px] text-white/35">默认只编译 Seedance；H3 可在这里勾选，或到“视频生成”页只为选中的镜头补生成。</p></div><label><span className="studio-label">给 AI 的本次建议（可选）</span><textarea className="studio-input min-h-40 resize-y" maxLength={4000} value={userSuggestions} onChange={(event) => setUserSuggestions(event.target.value)} placeholder={isRedo ? "例如：保留前 3 镜的剧情；中段减少对白、增加动作；结尾改成角色回头的近景，并让节奏更紧凑……" : "例如：前 3 秒必须有强钩子；人物多用近景；减少旁白、用动作推进；整体保持压抑悬疑感……"} autoFocus /></label><div className="mt-2 flex flex-wrap items-center justify-between gap-3 text-xs text-white/30"><span>{countMode === "ai" ? "AI 会结合这份建议重新判断镜头数" : `本次固定生成 ${count} 个镜头`}</span><span>{userSuggestions.length}/4000</span></div><div className="mt-6 flex flex-wrap justify-end gap-2"><button className="studio-secondary" onClick={() => setShowGenerate(false)}>取消</button><button className="studio-primary" onClick={submitGeneration}><WandSparkles size={16} />{userSuggestions.trim() ? (isRedo ? "按建议重新生成" : "按建议生成分镜") : (isRedo ? "不填建议直接重做" : "不填建议直接生成")}</button></div></section></div>}
-        {reviseShot && <div className="studio-modal" onMouseDown={() => setReviseShot(null)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI REDO ONE SHOT</p><h2 className="text-2xl font-semibold">AI 重做镜头 {reviseShot.ordinal}</h2><p className="mt-2 text-sm leading-6 text-white/45">镜头编号与时长 {reviseShot.duration_seconds} 秒固定；人物、对白、场景、动作和构图都可根据你的建议变化。保存后首帧、H3 与 Seedance Prompt 会同步更新。</p><label className="mt-5 block"><span className="studio-label">本镜修改建议</span><textarea className="studio-input min-h-44 resize-y" maxLength={4000} value={reviseSuggestions} onChange={(event) => setReviseSuggestions(event.target.value)} placeholder="例如：让 D 改成画外旁白，场景切到走廊；或者保留人物但重写对白和动作……" autoFocus /></label><div className="mt-5 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setReviseShot(null)}>取消</button><button className="studio-primary" disabled={!reviseSuggestions.trim() || !!busy} onClick={submitShotRevision}><WandSparkles size={15} />重做并同步所选 Prompt</button></div></section></div>}
+        {reviseShot && <div className="studio-modal" onMouseDown={() => setReviseShot(null)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">AI REDO ONE SHOT</p><h2 className="text-2xl font-semibold">AI 重做镜头 {reviseShot.ordinal}</h2><p className="mt-2 text-sm leading-6 text-white/45">镜头编号保持不变；原时长 {reviseShot.duration_seconds} 秒仅作参考，AI 会按新内容重新选择 2–15 秒的自然时长，不用停顿或静止画面补齐。保存后总时长、首帧、H3 与 Seedance Prompt 会同步更新。</p><label className="mt-5 block"><span className="studio-label">本镜修改建议</span><textarea className="studio-input min-h-44 resize-y" maxLength={4000} value={reviseSuggestions} onChange={(event) => setReviseSuggestions(event.target.value)} placeholder="例如：让 D 改成画外旁白，场景切到走廊；或者保留人物但重写对白和动作，时长按内容自然调整……" autoFocus /></label><div className="mt-5 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setReviseShot(null)}>取消</button><button className="studio-primary" disabled={!reviseSuggestions.trim() || !!busy} onClick={submitShotRevision}><WandSparkles size={15} />重做并同步所选 Prompt</button></div></section></div>}
         {importOpen && <div className="studio-modal" onMouseDown={() => setImportOpen(false)}><section className="studio-dialog max-w-2xl" onMouseDown={(event) => event.stopPropagation()}><p className="studio-kicker">IMPORT STORYBOARD</p><h2 className="text-2xl font-semibold">导入客户分镜表</h2><p className="mt-2 text-sm leading-6 text-white/45">支持 CSV、XLSX、XLSM。表格有的内容会原样保留；系统缺少的角色、景别、运镜、声音、首帧及视频 Prompt 会结合当前剧本和角色设定由 AI 补全，行数不会改变。</p><label className="studio-empty mt-5 min-h-32 cursor-pointer"><input className="hidden" type="file" accept=".csv,.xlsx,.xlsm" onChange={(event) => setImportFile(event.target.files?.[0] || null)} /><Upload className="text-cyan-300" /><strong>{importFile?.name || "选择分镜表文件"}</strong><span>首行为表头；可使用中文列名</span></label><label className="mt-4 block"><span className="studio-label">给 AI 的补全建议（可选）</span><textarea className="studio-input min-h-32 resize-y" value={importSuggestions} onChange={(event) => setImportSuggestions(event.target.value)} placeholder="例如：客户表中对白和时长不可改；缺失镜头语言按古装纪录片风格补齐；只生成 Seedance Prompt……" /></label><div className="mt-4 rounded-lg border border-cyan-300/10 bg-cyan-300/[.03] p-3"><span className="studio-label">同时补生成视频 Prompt</span><div className="mt-2 flex gap-5 text-sm text-white/60"><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("h3")} onChange={() => setPromptTargets(toggle(promptTargets, "h3") as ("h3" | "seedance")[])} />MiniMax H3（按需）</label><label className="flex items-center gap-2"><input type="checkbox" checked={promptTargets.includes("seedance")} onChange={() => setPromptTargets(toggle(promptTargets, "seedance") as ("h3" | "seedance")[])} />Seedance（本地编译）</label></div><p className="mt-2 text-[11px] text-white/35">默认仅编译 Seedance，H3 可在这里单独选择。</p></div><div className="mt-5 flex justify-end gap-2"><button className="studio-secondary" onClick={() => setImportOpen(false)}>取消</button><button className="studio-primary" disabled={!importFile || !!busy} onClick={submitImport}><WandSparkles size={15} />导入并 AI 补全</button></div></section></div>}
     </div>;
 }
@@ -823,7 +848,7 @@ function AssetsPanel({ project, assets, shots, busy, action }: { project: Projec
             <p className="studio-kicker">REFERENCE LIBRARY</p>
             <h2 className="mb-5 text-xl font-semibold">上传参考素材</h2>
             <Field label="素材用途">
-                <select value={role} onChange={(event) => { setRole(event.target.value as AssetRole); setShowAll(false); }}><option value="character">人物形象</option><option value="prop">固定物品 / 道具</option><option value="style">画风截图 / 参考视频</option><option value="scene">场景参考</option><option value="cover">项目封面</option><option value="motion">动作/运镜视频</option><option value="voice">声音参考</option><option value="music">背景音乐</option><option value="sound_effect">音效</option><option value="other">其他</option></select>
+                <select value={role} onChange={(event) => { setRole(event.target.value as AssetRole); setShowAll(false); }}><option value="character">人物形象</option><option value="prop">固定物品 / 道具</option><option value="style">画风截图 / 参考视频</option><option value="scene">场景参考</option><option value="cover_reference">封面参考图</option><option value="motion">动作/运镜视频</option><option value="voice">声音参考</option><option value="music">背景音乐</option><option value="sound_effect">音效</option><option value="other">其他</option></select>
                 <p className="mt-1 text-[11px] text-cyan-100/45">右侧已切换为当前分类，共 {roleAssets.length} 项</p>
             </Field>
             <label className="studio-empty mt-4 min-h-44 cursor-pointer"><input className="hidden" type="file" multiple accept="image/*,video/*,audio/*,.srt,.vtt" disabled={busy.has("upload")} onChange={(event) => { const files = Array.from(event.target.files || []); if (files.length) void upload(files); event.target.value = ""; }} />{busy.has("upload") ? <Loader2 className="animate-spin text-cyan-300" /> : <Upload className="text-cyan-300" />}<strong>批量选择图片、视频或音频</strong><span>可一次多选；全部按上方用途归档</span></label>
@@ -1512,6 +1537,8 @@ function DeliveryPanel({ bundle, busy, action }: { bundle: ProjectBundle; busy: 
     const [crossfade, setCrossfade] = useState(0);
     const [makePreview, setMakePreview] = useState(true);
     const [coverSuggestions, setCoverSuggestions] = useState("");
+    const [coverReferenceMode, setCoverReferenceMode] = useState<CoverReferenceMode>("none");
+    const [coverReferenceAssetId, setCoverReferenceAssetId] = useState("");
     const [coverAspectRatio, setCoverAspectRatio] = useState<CoverAspectRatio>(
         COVER_ASPECT_RATIOS.includes(bundle.project.brief.aspect_ratio as CoverAspectRatio)
             ? bundle.project.brief.aspect_ratio as CoverAspectRatio
@@ -1520,7 +1547,15 @@ function DeliveryPanel({ bundle, busy, action }: { bundle: ProjectBundle; busy: 
     const [coverPreview, setCoverPreview] = useState<MediaPreviewState | null>(null);
     const completed = bundle.shots.filter((shot) => shot.video_status === "completed" && !!shot.video_path).length;
     const coverAssets = bundle.assets.filter((asset) => asset.type === "image" && asset.role === "cover");
-    const currentCover = coverAssets.at(-1);
+    const generatedCoverAssets = coverAssets.filter((asset) => asset.tags.includes("generated-cover"));
+    const currentCover = generatedCoverAssets.at(-1) || coverAssets.at(-1);
+    const previousGeneratedCover = generatedCoverAssets.at(-1);
+    const coverReferenceAssets = bundle.assets.filter((asset) => asset.type === "image" && asset.role === "cover_reference");
+    const effectiveCoverReferenceAssetId = coverReferenceAssets.some((asset) => asset.id === coverReferenceAssetId)
+        ? coverReferenceAssetId
+        : coverReferenceAssets.at(-1)?.id || "";
+    const selectedCoverReference = coverReferenceAssets.find((asset) => asset.id === effectiveCoverReferenceAssetId);
+    const coverReferenceMissing = coverReferenceMode === "uploaded" && !selectedCoverReference;
     const ratioTag = currentCover?.tags.find((tag) => tag.startsWith("cover-ratio:"));
     const currentCoverRatio = ratioTag?.slice("cover-ratio:".length) || coverAspectRatio;
     const createCover = () => action(
@@ -1528,8 +1563,24 @@ function DeliveryPanel({ bundle, busy, action }: { bundle: ProjectBundle; busy: 
         () => generateProjectCover(bundle.project.id, {
             userSuggestions: coverSuggestions,
             aspectRatio: coverAspectRatio,
+            referenceMode: coverReferenceMode,
+            referenceAssetId: coverReferenceMode === "uploaded" ? effectiveCoverReferenceAssetId : null,
         }),
         currentCover ? "新封面已生成，上一版仍保留在素材库" : "项目封面已生成并保存到素材库",
+    );
+    const uploadCoverReference = (file: File) => action(
+        "cover-reference-upload",
+        async () => {
+            const asset = await uploadProjectAsset(
+                bundle.project.id,
+                file,
+                "cover_reference",
+                { name: `封面参考 · ${file.name}` },
+            );
+            setCoverReferenceAssetId(asset.id);
+            setCoverReferenceMode("uploaded");
+        },
+        "封面参考图已上传并选中",
     );
 
     return <div className="space-y-5">
@@ -1544,9 +1595,27 @@ function DeliveryPanel({ bundle, busy, action }: { bundle: ProjectBundle; busy: 
                 </div>
                 <div className="space-y-4 rounded-xl border border-cyan-300/10 bg-cyan-300/[.025] p-4">
                     <Field label="封面图比例" hint="默认跟随项目比例；横版视频通常选择 16:9。"><select value={coverAspectRatio} disabled={!!busy} onChange={(event) => setCoverAspectRatio(event.target.value as CoverAspectRatio)}>{COVER_ASPECT_RATIOS.map((ratio) => <option key={ratio}>{ratio}</option>)}</select></Field>
+                    <div>
+                        <span className="studio-label">封面构图参考</span>
+                        <div className="grid gap-2 sm:grid-cols-3">
+                            <button type="button" aria-pressed={coverReferenceMode === "none"} disabled={!!busy} className={`rounded-xl border p-3 text-left ${coverReferenceMode === "none" ? "border-cyan-300/45 bg-cyan-300/8" : "border-white/10 bg-black/20 hover:border-white/20"}`} onClick={() => setCoverReferenceMode("none")}><strong className="block text-xs text-white/80">不参考</strong><span className="mt-1 block text-[11px] leading-4 text-white/35">全新构图</span></button>
+                            <button type="button" aria-pressed={coverReferenceMode === "uploaded"} disabled={!!busy} className={`rounded-xl border p-3 text-left ${coverReferenceMode === "uploaded" ? "border-cyan-300/45 bg-cyan-300/8" : "border-white/10 bg-black/20 hover:border-white/20"}`} onClick={() => setCoverReferenceMode("uploaded")}><strong className="block text-xs text-white/80">用户上传</strong><span className="mt-1 block text-[11px] leading-4 text-white/35">借鉴参考图</span></button>
+                            <button type="button" aria-pressed={coverReferenceMode === "previous"} disabled={!!busy || !previousGeneratedCover} className={`rounded-xl border p-3 text-left ${coverReferenceMode === "previous" ? "border-cyan-300/45 bg-cyan-300/8" : "border-white/10 bg-black/20 hover:border-white/20"} disabled:cursor-not-allowed disabled:opacity-35`} onClick={() => setCoverReferenceMode("previous")}><strong className="block text-xs text-white/80">上一版生成图</strong><span className="mt-1 block text-[11px] leading-4 text-white/35">{previousGeneratedCover ? "保留未修改部分" : "暂无上一版"}</span></button>
+                        </div>
+                        <p className="mt-1.5 text-[11px] leading-5 text-white/30">这里只控制封面的构图参考；项目人设、画风、道具和分镜图仍会自动用于保持一致。</p>
+                    </div>
+                    {coverReferenceMode === "uploaded" && <div className="rounded-xl border border-white/8 bg-black/15 p-3">
+                        <div className="flex items-center gap-3">
+                            {selectedCoverReference ? <button type="button" className="h-16 w-24 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black/30" title="预览封面参考图" onClick={() => setCoverPreview({ name: selectedCoverReference.name, url: projectInlineUrl(bundle.project.id, "asset", selectedCoverReference.id), description: selectedCoverReference.description })}><img className="h-full w-full object-cover" src={projectInlineUrl(bundle.project.id, "asset", selectedCoverReference.id)} alt={selectedCoverReference.name} /></button> : <div className="flex h-16 w-24 shrink-0 items-center justify-center rounded-lg border border-dashed border-white/12 text-white/25"><ImageIcon size={22} /></div>}
+                            <div className="min-w-0 flex-1">
+                                {coverReferenceAssets.length > 0 ? <select aria-label="选择已上传的封面参考图" value={effectiveCoverReferenceAssetId} disabled={!!busy} onChange={(event) => setCoverReferenceAssetId(event.target.value)}>{coverReferenceAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}</select> : <p className="text-xs leading-5 text-amber-100/65">请先上传一张封面参考图。</p>}
+                                <label className="studio-secondary mt-2 w-fit cursor-pointer px-3 py-1.5 text-xs"><input className="hidden" type="file" accept="image/*" disabled={!!busy} onChange={(event) => { const file = event.target.files?.[0]; if (file) void uploadCoverReference(file); event.target.value = ""; }} />{busy === "cover-reference-upload" ? <Loader2 className="animate-spin" size={14} /> : <Upload size={14} />}{coverReferenceAssets.length ? "再上传一张" : "上传参考图"}</label>
+                            </div>
+                        </div>
+                    </div>}
                     <label><span className="studio-label">本次生成建议（可选）</span><textarea className="studio-input min-h-36 resize-y" maxLength={4000} disabled={!!busy} value={coverSuggestions} onChange={(event) => setCoverSuggestions(event.target.value)} placeholder="例如：主标题改成“地府鬼满为患，阴差上门劝人别死”；突出张小差震惊表情和过载排插；老奶奶拿扫帚站在右侧；整体更有喜剧冲突……" /><span className="mt-1.5 flex justify-between text-[11px] text-white/30"><span>建议只写本次想强化或改变的内容，其余由项目设定自动补齐。</span><span>{coverSuggestions.length}/4000</span></span></label>
                     <div className="rounded-lg border border-white/8 bg-black/15 p-3 text-xs leading-5 text-white/40">默认版式会参考你给的示例：顶部大标题、中心主角强情绪、关键配角对照、危险物件前景、冷暖光影分层。除非建议中明确要求，否则不会生成额外小字和乱码标签。</div>
-                    <button type="button" className="studio-primary w-full" disabled={!!busy} onClick={() => void createCover()}>{busy === "cover" ? <Loader2 className="animate-spin" size={16} /> : <Sparkles size={16} />}{busy === "cover" ? "封面生成中…" : currentCover ? "按以上建议重新生成" : "按以上设置生成封面"}</button>
+                    <button type="button" className="studio-primary w-full" disabled={!!busy || coverReferenceMissing} onClick={() => void createCover()}>{busy === "cover" ? <Loader2 className="animate-spin" size={16} /> : <Sparkles size={16} />}{busy === "cover" ? "封面生成中…" : currentCover ? "按以上建议重新生成" : "按以上设置生成封面"}</button>
                 </div>
             </div>
         </section>
@@ -1614,7 +1683,7 @@ function DeliveryCard({ delivery, projectId }: { delivery: Delivery; projectId: 
 
 function Field({ label, hint, wide, children }: { label: string; hint?: string; wide?: boolean; children: React.ReactNode }) { return <label className={wide ? "md:col-span-2" : ""}><span className="studio-label">{label}</span><div className="studio-field">{children}</div>{hint && <span className="mt-1.5 block text-[11px] leading-5 text-white/32">{hint}</span>}</label>; }
 function assetRoleLabel(role: AssetRole) {
-    return ({ character: "人物形象", prop: "固定物品", style: "画风参考", scene: "场景参考", cover: "项目封面", keyframe: "首帧", last_frame: "尾帧", motion: "动作/运镜", voice: "声音参考", music: "背景音乐", sound_effect: "音效", output: "输出", other: "其他" } as Record<AssetRole, string>)[role] || role;
+    return ({ character: "人物形象", prop: "固定物品", style: "画风参考", scene: "场景参考", cover_reference: "封面参考图", cover: "项目封面", keyframe: "首帧", last_frame: "尾帧", motion: "动作/运镜", voice: "声音参考", music: "背景音乐", sound_effect: "音效", output: "输出", other: "其他" } as Record<AssetRole, string>)[role] || role;
 }
 function toggle(values: string[], value: string) { return values.includes(value) ? values.filter((item) => item !== value) : [...values, value]; }
 type BusyState = ReadonlySet<string>;

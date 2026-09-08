@@ -34,6 +34,7 @@ from src.video_workflow.domain import (
     SceneProfile,
     SeedanceReferenceMode,
     SeriesAsset,
+    ScriptDurationAssessment,
     ScriptRewriteDraft,
     Shot,
     ShotContinuityMode,
@@ -2329,6 +2330,94 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             self.store.save_asset(asset)
         self.store.save_project(latest_project)
         return latest_character
+
+    async def assess_story_duration(self, project_id: str) -> ScriptDurationAssessment:
+        """Estimate a script's natural edited runtime without padding to its target."""
+        project = self.require_project(project_id)
+        story = project.brief.story.strip()
+        if not story:
+            raise ValueError("请先填写或上传剧情故事脚本")
+
+        provider = settings.BRIEF_ANALYSIS_PROVIDER
+        if provider == "auto":
+            provider = settings.LLM_PROVIDER
+        duration_llm = create_llm_generator(provider)
+        target = project.brief.target_duration_seconds
+        prompt = f"""请独立评估下面剧本在正常、紧凑但不仓促的成片剪辑中，能够自然支撑多少秒。
+
+【目标时长仅用于比较，不得反向拉伸评估】
+- 客户目标成片：{target:g} 秒
+- 画幅：{project.brief.aspect_ratio}
+- 叙事节奏要求：{project.brief.pacing or '未填写，按常规剧情短片节奏'}
+
+【自然时长计时口径｜必须严格执行】
+1. 先区分真正说出口的对白/旁白与只在画面中发生的动作，不得把所有叙述文字都当作配音朗读。
+2. 中文对白和旁白按正常可懂语速约每秒 3.4 个有效字符估算，正常标点呼吸已包含在估值中。
+3. 只计算推动剧情、表达情绪转折或传递信息所必需的可见动作、建立镜头和转场；对白期间可同步完成的动作不得重复累计。
+4. 普通反应停顿通常只取 0.3–1 秒。只有剧本明确需要悬念、喜剧卡点或重大情绪转折时才增加必要停顿。
+5. 严禁为了接近 {target:g} 秒而加入静止等待、重复表情、无新信息的环境展示、机械留白或把一个简单动作拖成数秒。
+6. natural_duration_seconds 必须是依据现有内容得到的独立结论，可以明显短于或长于目标。min/max 表示紧凑剪辑到舒展剪辑的合理范围，而不是凑目标的范围。
+7. dialogue_and_narration_seconds、visual_only_seconds、transition_seconds 是互不重叠的时间分类，三项之和应接近 natural_duration_seconds。
+8. density_issues 只写会造成内容偏空、重复或过密的具体位置；没有则返回空数组。
+
+【待评估剧本】
+{story}
+
+严格返回以下 JSON 对象，不要 Markdown：
+{{
+  "natural_duration_seconds": 120,
+  "natural_duration_min_seconds": 110,
+  "natural_duration_max_seconds": 132,
+  "dialogue_and_narration_seconds": 75,
+  "visual_only_seconds": 40,
+  "transition_seconds": 5,
+  "content_density": "sparse、balanced 或 dense",
+  "summary": "自然时长结论及与客户目标的差距",
+  "assessment_basis": ["关键计时依据"],
+  "density_issues": ["可能导致空镜或信息过密的具体段落"]
+}}"""
+        payload = await duration_llm.generate_json(
+            "你是资深影视编剧、剪辑师和制片统筹。你只按现有有效内容评估自然成片时长，不为满足客户目标虚构停顿或留白。",
+            prompt,
+        )
+
+        def seconds(name: str, default: float) -> float:
+            try:
+                return max(0.0, float(payload.get(name, default)))
+            except (TypeError, ValueError):
+                return default
+
+        natural = max(1.0, seconds("natural_duration_seconds", target))
+        lower = max(1.0, min(natural, seconds("natural_duration_min_seconds", natural * 0.92)))
+        upper = max(natural, seconds("natural_duration_max_seconds", natural * 1.08))
+        difference = natural - target
+        tolerance = max(8.0, target * 0.05)
+        recommendation = "expand" if difference < -tolerance else "shorten" if difference > tolerance else "fit"
+        density = str(payload.get("content_density") or "balanced").lower()
+        if density not in {"sparse", "balanced", "dense"}:
+            density = "balanced"
+
+        def string_list(name: str) -> list[str]:
+            value = payload.get(name)
+            if not isinstance(value, list):
+                return []
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        return ScriptDurationAssessment(
+            natural_duration_seconds=round(natural, 1),
+            natural_duration_min_seconds=round(lower, 1),
+            natural_duration_max_seconds=round(upper, 1),
+            target_duration_seconds=round(target, 1),
+            difference_seconds=round(difference, 1),
+            recommendation=recommendation,
+            content_density=density,
+            dialogue_and_narration_seconds=round(seconds("dialogue_and_narration_seconds", 0), 1),
+            visual_only_seconds=round(seconds("visual_only_seconds", natural), 1),
+            transition_seconds=round(seconds("transition_seconds", 0), 1),
+            summary=str(payload.get("summary") or "").strip(),
+            assessment_basis=string_list("assessment_basis"),
+            density_issues=string_list("density_issues"),
+        )
 
     async def rewrite_story(
         self,
@@ -5425,7 +5514,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         prompt_targets: list[str] | None = None,
         h3_skill_id: str = "h3-prompt-writing",
     ) -> Shot:
-        """Redo one shot while locking only its ordinal, id and duration."""
+        """Redo one shot while locking its identity and ordinal, not its duration."""
         project = self.require_project(project_id)
         shot = self.require_shot(shot_id)
         suggestions = user_suggestions.strip()
@@ -5437,8 +5526,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         ]
         generator = create_llm_generator(settings.LLM_PROVIDER)
         payload = await generator.generate_json(
-            "你是影视分镜导演。只重做指定单镜；镜号和时长是硬约束，人物、对白、场景、动作与构图可按建议改变。",
-            f"""重做下面一个分镜。保持 shot_id、ordinal、duration_seconds 原值；其他内容按用户建议重新设计。
+            "你是影视分镜导演。只重做指定单镜；镜头身份和镜号是硬约束，时长必须按重做后的有效内容重新判断。",
+            f"""重做下面一个分镜。保持 shot_id、ordinal 原值；人物、对白、场景、动作、构图和 duration_seconds 都可按用户建议重新设计。
 
 项目剧情：{project.brief.story}
 统一风格：{self.project_style_text(project)}
@@ -5446,11 +5535,28 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
 原镜头：{json.dumps(shot.model_dump(mode='json'), ensure_ascii=False)}
 用户建议（最高优先级）：{suggestions}
 
-为固定时长编写从 0 秒连续覆盖到结尾的 visual_beats，每 2–4 秒有新的可见变化；每段只含一个主动作和一种主要运镜。系统播报、旁白、画外音须作为非 character 的 voice_event 且 lip_sync=false。voice_events 是唯一声音时序来源，dialogue 留空；整镜所有可朗读文字合计最多 {speech_budget_for_duration(shot.duration_seconds)} 个中文字符，按正常语速编排且声音事件不重叠，前后保留画面反应和环境声。默认 text_policy=post_overlay。
+先根据重做后的信息量选择 2–15 秒的自然镜头时长，不得为了沿用原来的 {shot.duration_seconds:g} 秒而加入静止等待、重复表情或无新信息留白；也不得用过短时长挤掉必要台词。visual_beats 从 0 秒连续覆盖所选 duration_seconds，每 2–4 秒有新的可见变化；每段只含一个主动作和一种主要运镜。系统播报、旁白、画外音须作为非 character 的 voice_event 且 lip_sync=false。voice_events 是唯一声音时序来源，dialogue 留空；整镜所有可朗读文字按正常语速每秒约 3.4 个有效字符编排，声音事件不重叠，只保留剧情确实需要的短反应和环境声。默认 text_policy=post_overlay。
 
 严格返回紧凑 JSON（不要输出 visual_prompt、keyframe_prompt、motion_prompt 等系统本地编译字段）：
-{{"event":"本镜完整事件","opening_state":"0 秒静态起始状态","dialogue":"","dialogue_speaker":"","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","visual_beats":[{{"start_seconds":0,"end_seconds":3,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[{{"kind":"character/system_vo/narration/offscreen","speaker_name":"","text":"","start_seconds":0.5,"end_seconds":3.5,"lip_sync":false}}],"text_policy":"post_overlay"}}""",
+{{"duration_seconds":8,"event":"本镜完整事件","opening_state":"0 秒静态起始状态","dialogue":"","dialogue_speaker":"","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","visual_beats":[{{"start_seconds":0,"end_seconds":3,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[{{"kind":"character/system_vo/narration/offscreen","speaker_name":"","text":"","start_seconds":0.5,"end_seconds":3.5,"lip_sync":false}}],"text_policy":"post_overlay"}}""",
         )
+        original_duration = shot.duration_seconds
+        try:
+            proposed_duration = float(payload.get("duration_seconds", original_duration))
+        except (TypeError, ValueError):
+            proposed_duration = original_duration
+        proposed_duration = max(0.25, min(15.0, proposed_duration))
+        authored_duration = proposed_duration
+        raw_voice_payloads = payload.get("voice_events")
+        if isinstance(raw_voice_payloads, list):
+            spoken_size = sum(
+                spoken_character_count(str(item.get("text") or ""))
+                for item in raw_voice_payloads
+                if isinstance(item, dict)
+            )
+            if spoken_size:
+                proposed_duration = min(15.0, max(proposed_duration, spoken_size / 3.4 + 0.01))
+        shot.duration_seconds = round(proposed_duration, 2)
         names = [str(value) for value in payload.get("character_names", [])]
         event_text = str(payload.get("event") or payload.get("narrative") or "").strip()
         opening_state = str(
@@ -5522,12 +5628,20 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     continue
         shot.visual_beats = self._scale_visual_beats(
             parsed_beats,
-            shot.duration_seconds,
+            authored_duration,
             shot.duration_seconds,
             shot_size=shot.shot_size,
             camera_angle=shot.camera_angle,
             camera_motion=shot.camera_motion or "固定镜头",
             fallback_action=shot.subject_motion,
+        )
+        if not str(payload.get("subject_motion") or "").strip() and parsed_beats:
+            shot.subject_motion = "；".join(
+                beat.subject_action for beat in shot.visual_beats if beat.subject_action
+            )
+        shot.subject_motion = self._normalize_motion_duration(
+            shot.subject_motion or shot.narrative,
+            shot.duration_seconds,
         )
         raw_voice_events = payload.get("voice_events")
         parsed_voice_events: list[VoiceEvent] = []
@@ -6666,7 +6780,7 @@ Do not copy the full project bible or every character into the result. The autho
             if (
                 asset
                 and asset.type == AssetType.IMAGE
-                and asset.role != AssetRole.COVER
+                and asset.role not in {AssetRole.COVER, AssetRole.COVER_REFERENCE}
                 and resolve_media_path(asset.path).is_file()
             ):
                 selected.append(asset)
@@ -6682,6 +6796,7 @@ Do not copy the full project bible or every character into the result. The autho
         references: list[Asset],
         user_suggestions: str = "",
         aspect_ratio: str = "16:9",
+        reference_mode: str = "none",
     ) -> str:
         title = project.brief.title.strip()
         story = project.brief.story.strip()[:2400]
@@ -6705,11 +6820,18 @@ Do not copy the full project bible or every character into the result. The autho
             AssetRole.SCENE: "场景",
             AssetRole.KEYFRAME: "分镜首帧",
             AssetRole.PROP: "关键道具",
+            AssetRole.COVER_REFERENCE: "用户上传的封面参考",
+            AssetRole.COVER: "上一版生成封面",
         }
         reference_lines = "\n".join(
             f"- 参考图 {index}：{asset.name}（{role_labels.get(asset.role, '项目视觉参考')}）"
             for index, asset in enumerate(references, start=1)
         ) or "- 当前没有可用参考图，严格依据项目设定绘制"
+        cover_reference_instruction = {
+            "none": "不提交封面构图参考，根据项目设定全新构图。后续项目人设、画风、道具和分镜参考仍用于保持一致性。",
+            "uploaded": "参考图 1 是用户上传的封面参考；借鉴它的构图、信息层级和氛围，但人物身份、故事内容和准确文字以本项目设定及用户建议为准。",
+            "previous": "参考图 1 是上一版生成封面；保留用户建议未要求改动的人物、构图、色彩和视觉层级，重点执行本次建议。",
+        }.get(reference_mode, "根据项目设定全新构图。")
         suggestion_block = user_suggestions.strip() or "无额外建议，由系统选择故事冲突最强的瞬间"
         return f"""【任务】为本视频项目生成一张可直接发布的高点击率中文主封面，不是普通分镜截图。
 【封面比例】{aspect_ratio}，横竖构图必须严格适配该比例，重要人物、标题和危险物件都留在安全区。
@@ -6722,34 +6844,77 @@ Do not copy the full project bible or every character into the result. The autho
 【统一视觉风格】{style}
 【参考图顺序】
 {reference_lines}
+【封面参考方式】{cover_reference_instruction}
 【本次用户建议｜最高优先级】{suggestion_block}
 【封面设计语言】参考成熟中文科普短片/剧情短视频海报：顶部大标题占约 20%，中心用主角的大幅强情绪反应形成第一视觉焦点，关键配角在侧后方形成态度对照；把最能说明主题的风险物件或事件放在前景并适度夸张，背景用环境细节补足故事世界。采用前景暖色风险光与背景冷色空间光的层次对比，轮廓清楚、构图饱满、信息一眼可读，兼具戏剧性、科普感和点击吸引力。
-【硬性限制】角色身份、年龄、发型、服装和画风必须服从参考图及项目设定；只允许出现上述准确主标题，除非用户建议明确要求，否则不要生成小字、标签、榜单、乱码、Logo、水印、边框或界面元素；不要把封面做成角色设定板、九宫格、拼贴或电影截图。""".strip()
+【硬性限制】角色身份、年龄、发型和服装必须服从本项目人物参考图与设定；用户上传的封面参考只用于构图、信息层级和氛围，不得用它覆盖本项目的人物身份或故事。只允许出现上述准确主标题，除非用户建议明确要求，否则不要生成小字、标签、榜单、乱码、Logo、水印、边框或界面元素；不要把封面做成角色设定板、九宫格、拼贴或电影截图。""".strip()
 
     async def generate_project_cover(
         self,
         project_id: str,
         user_suggestions: str = "",
         aspect_ratio: str = "16:9",
+        reference_mode: str = "none",
+        reference_asset_id: str | None = None,
         image_provider: str | None = None,
         image_model: str | None = None,
     ) -> Asset:
         supported_ratios = {"16:9", "9:16", "1:1", "4:3", "3:4"}
+        supported_reference_modes = {"none", "uploaded", "previous"}
         if aspect_ratio not in supported_ratios:
             raise ValueError(f"不支持的封面比例: {aspect_ratio}")
+        if reference_mode not in supported_reference_modes:
+            raise ValueError(f"不支持的封面参考方式: {reference_mode}")
         if project_id in self._active_project_covers:
             raise ProjectCoverBusyError("本项目封面正在生成，请等待完成后再提交下一版")
 
         project = self.require_project(project_id)
         shots = self.store.list_shots(project_id)
         assets = self.store.list_assets(project_id)
-        references = self._cover_reference_assets(project, shots, assets)
+        cover_reference: Asset | None = None
+        if reference_mode == "uploaded":
+            if not reference_asset_id:
+                raise ValueError("请先上传并选择一张封面参考图")
+            cover_reference = next(
+                (
+                    asset
+                    for asset in assets
+                    if asset.id == reference_asset_id
+                    and asset.role == AssetRole.COVER_REFERENCE
+                    and asset.type == AssetType.IMAGE
+                ),
+                None,
+            )
+            if cover_reference is None or not resolve_media_path(cover_reference.path).is_file():
+                raise ValueError("选中的封面参考图不存在或不是可用图片")
+        elif reference_mode == "previous":
+            cover_reference = next(
+                (
+                    asset
+                    for asset in reversed(assets)
+                    if asset.role == AssetRole.COVER
+                    and asset.type == AssetType.IMAGE
+                    and "generated-cover" in asset.tags
+                    and resolve_media_path(asset.path).is_file()
+                ),
+                None,
+            )
+            if cover_reference is None:
+                raise ValueError("当前还没有可作为参考的上一版生成封面")
+
+        project_references = self._cover_reference_assets(project, shots, assets)
+        references = list(dict.fromkeys(
+            asset.id for asset in ([cover_reference] if cover_reference else []) + project_references
+        ))
+        assets_by_id = {asset.id: asset for asset in assets}
+        references = [assets_by_id[asset_id] for asset_id in references if asset_id in assets_by_id][:10]
         prompt = self.compile_project_cover_prompt(
             project,
             shots,
             references,
             user_suggestions,
             aspect_ratio,
+            reference_mode,
         )
         output_dir = self.project_dir(project_id) / "covers" / uuid4().hex
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -6780,7 +6945,14 @@ Do not copy the full project bible or every character into the result. The autho
                 name=f"{project.brief.title} · 项目封面 {aspect_ratio}",
                 description=prompt,
             )
-            asset.tags = ["generated-cover", f"cover-ratio:{aspect_ratio}", f"seed:{seed}"]
+            asset.tags = [
+                "generated-cover",
+                f"cover-ratio:{aspect_ratio}",
+                f"seed:{seed}",
+                f"cover-reference-mode:{reference_mode}",
+            ]
+            if cover_reference:
+                asset.tags.append(f"cover-reference-asset:{cover_reference.id}")
             return self.store.save_asset(asset)
         finally:
             self._active_project_covers.discard(project_id)

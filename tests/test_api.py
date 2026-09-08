@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
-from src.video_workflow.domain import Asset, AssetRole, AssetType, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, Shot, ShotContinuityMode, StyleProfile
+from src.video_workflow.domain import Asset, AssetRole, AssetType, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, ScriptDurationAssessment, Shot, ShotContinuityMode, StyleProfile
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
@@ -66,6 +66,29 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(episode.json()["episode_number"], 2)
         self.assertTrue(episode.json()["brief"]["visual_style"].startswith("统一二维插画"))
         self.assertIn("禁止真人照片", episode.json()["brief"]["visual_style"])
+
+    def test_script_duration_assessment_route(self) -> None:
+        project = self.client.post(
+            "/api/projects",
+            json={"title": "自然时长接口", "story": "人物发现危险并处理。", "target_duration_seconds": 60},
+        ).json()
+        result = ScriptDurationAssessment(
+            natural_duration_seconds=42,
+            natural_duration_min_seconds=38,
+            natural_duration_max_seconds=46,
+            target_duration_seconds=60,
+            difference_seconds=-18,
+            recommendation="expand",
+            dialogue_and_narration_seconds=22,
+            visual_only_seconds=18,
+            transition_seconds=2,
+            summary="内容不足",
+        )
+        with patch.object(router.project_service, "assess_story_duration", new=AsyncMock(return_value=result)):
+            response = self.client.post(f"/api/projects/{project['id']}/brief/duration-assess", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["natural_duration_seconds"], 42)
+        self.assertEqual(response.json()["recommendation"], "expand")
 
     def test_scene_editor_preview_patch_and_conflict(self) -> None:
         project = router.project_service.create_project(ProjectBrief(title="场景编辑", story="奶奶在客厅"))
@@ -142,6 +165,14 @@ class ProjectApiTests(unittest.TestCase):
             "/api/projects",
             json={"title": "排插安全科普", "story": "阴差上门排查老化排插"},
         ).json()
+        uploaded = self.client.post(
+            f"/api/projects/{project['id']}/assets",
+            files={"file": ("layout.png", io.BytesIO(b"cover-reference"), "image/png")},
+            data={"role": "cover_reference", "name": "客户封面参考"},
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        self.assertEqual(uploaded.json()["role"], "cover_reference")
+        reference_asset_id = uploaded.json()["id"]
         cover = Asset(
             project_id=project["id"],
             type=AssetType.IMAGE,
@@ -157,6 +188,8 @@ class ProjectApiTests(unittest.TestCase):
                 json={
                     "user_suggestions": "让危险排插占前景三分之一",
                     "aspect_ratio": "9:16",
+                    "reference_mode": "uploaded",
+                    "reference_asset_id": reference_asset_id,
                 },
             )
 
@@ -164,17 +197,24 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(response.json()["role"], "cover")
         self.assertIn("cover-ratio:9:16", response.json()["tags"])
         generator.assert_awaited_once_with(
-            project["id"],
-            "让危险排插占前景三分之一",
-            "9:16",
-            None,
-            None,
+            project_id=project["id"],
+            user_suggestions="让危险排插占前景三分之一",
+            aspect_ratio="9:16",
+            reference_mode="uploaded",
+            reference_asset_id=reference_asset_id,
+            image_provider=None,
+            image_model=None,
         )
         invalid = self.client.post(
             f"/api/projects/{project['id']}/cover/generate",
             json={"aspect_ratio": "2:1"},
         )
         self.assertEqual(invalid.status_code, 422)
+        invalid_mode = self.client.post(
+            f"/api/projects/{project['id']}/cover/generate",
+            json={"reference_mode": "random"},
+        )
+        self.assertEqual(invalid_mode.status_code, 422)
 
     def test_shot_split_preview_and_confirm_routes(self) -> None:
         project = self.client.post("/api/projects", json={"title": "拆分接口", "story": "人物起身、开门并走出房间"}).json()

@@ -22,6 +22,7 @@ export type AssetRole =
     | 'prop'
     | 'style'
     | 'scene'
+    | 'cover_reference'
     | 'cover'
     | 'keyframe'
     | 'last_frame'
@@ -186,6 +187,22 @@ export interface ScriptRewriteDraft {
     estimated_duration_seconds: number;
     change_summary: string;
     feasibility_notes: string[];
+}
+
+export interface ScriptDurationAssessment {
+    natural_duration_seconds: number;
+    natural_duration_min_seconds: number;
+    natural_duration_max_seconds: number;
+    target_duration_seconds: number;
+    difference_seconds: number;
+    recommendation: "expand" | "shorten" | "fit";
+    content_density: "sparse" | "balanced" | "dense";
+    dialogue_and_narration_seconds: number;
+    visual_only_seconds: number;
+    transition_seconds: number;
+    summary: string;
+    assessment_basis: string[];
+    density_issues: string[];
 }
 
 export interface RuntimeSettingField {
