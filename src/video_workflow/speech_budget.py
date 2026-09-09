@@ -11,6 +11,14 @@ from typing import Any
 SPEECH_CHARACTERS_PER_SECOND = 3.4
 SPEECH_WINDOW_CHARACTERS_PER_SECOND = 3.9
 SPEECH_EVENT_GAP_SECONDS = 0.15
+H3_BASE_SPEECH_CHARACTERS_PER_SECOND = 4.0
+H3_MAX_SPEECH_CHARACTERS_PER_SECOND = 8.0
+
+SPEECH_PACING_CHARACTERS_PER_SECOND = {
+    "natural": SPEECH_CHARACTERS_PER_SECOND,
+    "brisk": 4.8,
+    "short_ad": 6.2,
+}
 
 
 def spoken_character_count(value: str) -> int:
@@ -19,10 +27,47 @@ def spoken_character_count(value: str) -> int:
     return len(text)
 
 
-def speech_budget_for_duration(duration_seconds: float) -> int:
+def speech_pacing_characters_per_second(preset: object) -> float:
+    """Resolve a project-level delivery preset to an effective Chinese rate."""
+    value = getattr(preset, "value", preset)
+    return SPEECH_PACING_CHARACTERS_PER_SECOND.get(str(value or "natural"), SPEECH_CHARACTERS_PER_SECOND)
+
+
+def dialogue_rate_percent_for_cps(characters_per_second: float) -> int:
+    """Translate an effective H3 speech rate into the existing per-shot control."""
+    percent = round((float(characters_per_second) / H3_BASE_SPEECH_CHARACTERS_PER_SECOND - 1.0) * 100)
+    return max(-50, min(100, percent))
+
+
+def h3_speech_characters_per_second(dialogue_rate_percent: float) -> float:
+    """Return the rate represented by a shot's H3/TTS percentage control."""
+    return max(
+        2.0,
+        min(
+            H3_MAX_SPEECH_CHARACTERS_PER_SECOND,
+            H3_BASE_SPEECH_CHARACTERS_PER_SECOND * (1.0 + float(dialogue_rate_percent) / 100.0),
+        ),
+    )
+
+
+def spoken_duration_seconds(
+    value: str,
+    characters_per_second: float,
+    *,
+    tail_seconds: float = 0.35,
+) -> float:
+    """Estimate a complete utterance using the same effective-character count everywhere."""
+    rate = max(0.1, float(characters_per_second))
+    return spoken_character_count(value) / rate + max(0.0, float(tail_seconds))
+
+
+def speech_budget_for_duration(
+    duration_seconds: float,
+    characters_per_second: float = SPEECH_CHARACTERS_PER_SECOND,
+) -> int:
     """Return the total comfortable spoken-character budget for one shot."""
     duration = max(0.25, float(duration_seconds))
-    return max(4, int(math.floor(duration * SPEECH_CHARACTERS_PER_SECOND)))
+    return max(4, int(math.floor(duration * max(0.1, float(characters_per_second)))))
 
 
 def _clean_spoken_text(value: str) -> str:
@@ -143,6 +188,9 @@ def _allocate_event_budgets(lengths: list[int], total_budget: int) -> list[int]:
 def fit_voice_event_payloads(
     events: list[dict[str, Any]],
     duration_seconds: float,
+    *,
+    characters_per_second: float = SPEECH_CHARACTERS_PER_SECOND,
+    preserve_spoken_text: bool = False,
 ) -> list[dict[str, Any]]:
     """Fit timed voice events to a comfortable shot-level speech budget."""
     duration = max(0.25, float(duration_seconds))
@@ -188,42 +236,44 @@ def fit_voice_event_payloads(
             "end_seconds": merged_end,
         }]
 
-    total_budget = speech_budget_for_duration(duration)
+    total_budget = speech_budget_for_duration(duration, characters_per_second)
     source_texts = [str(event["text"]) for event in cleaned]
     lengths = [spoken_character_count(text) for text in source_texts]
-    allocations = _allocate_event_budgets(lengths, total_budget)
-    for event, allocation in zip(cleaned, allocations, strict=False):
-        event["text"] = compact_spoken_text(str(event["text"]), allocation)
+    if not preserve_spoken_text:
+        allocations = _allocate_event_budgets(lengths, total_budget)
+        for event, allocation in zip(cleaned, allocations, strict=False):
+            event["text"] = compact_spoken_text(str(event["text"]), allocation)
 
     # Clause-safe compaction can leave a few characters unused. Reassign that
     # space to still-truncated events so important second clauses survive.
-    for _ in range(3):
-        used = [spoken_character_count(str(event["text"])) for event in cleaned]
-        spare = total_budget - sum(used)
-        candidates = [index for index, length in enumerate(lengths) if used[index] < length]
-        candidates.sort(
-            key=lambda index: bool(
-                re.search(r"违规|失败|抹杀|死亡|禁止|警告|危险|通关", source_texts[index])
-            ),
-            reverse=True,
-        )
-        if spare <= 0 or not candidates:
-            break
-        progressed = False
-        for index in candidates:
-            expanded = compact_spoken_text(
-                source_texts[index],
-                min(lengths[index], used[index] + spare),
+    if not preserve_spoken_text:
+        for _ in range(3):
+            used = [spoken_character_count(str(event["text"])) for event in cleaned]
+            spare = total_budget - sum(used)
+            candidates = [index for index, length in enumerate(lengths) if used[index] < length]
+            candidates.sort(
+                key=lambda index: bool(
+                    re.search(r"违规|失败|抹杀|死亡|禁止|警告|危险|通关", source_texts[index])
+                ),
+                reverse=True,
             )
-            expanded_size = spoken_character_count(expanded)
-            if expanded_size > used[index] and expanded_size - used[index] <= spare:
-                cleaned[index]["text"] = expanded
-                spare -= expanded_size - used[index]
-                progressed = True
-            if spare <= 0:
+            if spare <= 0 or not candidates:
                 break
-        if not progressed:
-            break
+            progressed = False
+            for index in candidates:
+                expanded = compact_spoken_text(
+                    source_texts[index],
+                    min(lengths[index], used[index] + spare),
+                )
+                expanded_size = spoken_character_count(expanded)
+                if expanded_size > used[index] and expanded_size - used[index] <= spare:
+                    cleaned[index]["text"] = expanded
+                    spare -= expanded_size - used[index]
+                    progressed = True
+                if spare <= 0:
+                    break
+            if not progressed:
+                break
 
     # Keep voice events sequential and make every declared window large enough
     # for normal-speed delivery.  Existing later cues remain preferred when
@@ -231,7 +281,9 @@ def fit_voice_event_payloads(
     needed_windows = [
         max(
             0.7,
-            spoken_character_count(str(event["text"])) / SPEECH_WINDOW_CHARACTERS_PER_SECOND + 0.1,
+            spoken_character_count(str(event["text"]))
+            / max(SPEECH_WINDOW_CHARACTERS_PER_SECOND, float(characters_per_second) + 0.5)
+            + 0.1,
         )
         for event in cleaned
     ]

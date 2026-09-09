@@ -7,7 +7,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.video_workflow.config import settings
-from src.video_workflow.domain import CharacterProfile, ProjectBrief, Shot, VoiceEvent
+from src.video_workflow.domain import (
+    AssetRole,
+    CharacterProfile,
+    GenerationMode,
+    ProjectBrief,
+    SeedanceReferenceMode,
+    Shot,
+    VoiceEvent,
+)
 from src.video_workflow.h3_prompt_skills import (
     OFFICIAL_H3_SKILLS_COMMIT,
     get_h3_prompt_skill,
@@ -30,12 +38,14 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
         settings.PROJECTS_DIR = self.previous_projects_dir
         self.temp.cleanup()
 
-    def test_catalog_exposes_general_and_eight_official_styles(self) -> None:
+    def test_catalog_exposes_general_official_styles_and_short_ad_workflow(self) -> None:
         skills = list_h3_prompt_skills()
-        self.assertEqual(len(skills), 9)
+        self.assertEqual(len(skills), 10)
         self.assertEqual(skills[0]["id"], "h3-prompt-writing")
         self.assertEqual(skills[0]["source_commit"], OFFICIAL_H3_SKILLS_COMMIT)
         self.assertEqual(get_h3_prompt_skill("paper-collage-explainer-generator").version, "0.3.9")
+        self.assertEqual(get_h3_prompt_skill("short-video-talking-ad-generator").name, "舞台互动型抓眼广告")
+        self.assertEqual(skills[3]["source_url"], "")
         with self.assertRaisesRegex(ValueError, "未知的 H3 Prompt Skill"):
             get_h3_prompt_skill("missing-style")
 
@@ -104,23 +114,216 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("integrated_multimodal_description:", saved.h3_prompt_skill_output)
         self.assertEqual(saved.video_prompt, saved.h3_prompt_skill_output)
         self.assertEqual(self.service.compile_h3_prompt(project, saved, []), saved.h3_prompt_skill_output)
-        self.assertIn("handcrafted papercraft stop motion", captured["system"])
-        self.assertIn("every 2–4 seconds", captured["system"])
-        self.assertIn("system_vo, narration and offscreen", captured["system"])
-        self.assertIn("hard speech budget", captured["system"])
-        self.assertIn("exactly one <d>[Chinese]", captured["system"])
-        self.assertIn("Translate each approved Chinese voice anchor", captured["system"])
-        self.assertIn("Only the exact contents of <d> tags may be vocalized", captured["system"])
-        self.assertNotIn("inside the exact approved voice anchors", captured["system"])
-        self.assertIn("H3 is allowed to render authored", captured["system"])
-        self.assertIn("text_policy=post_overlay does not prohibit H3", captured["system"])
-        self.assertIn("hard speech budget: at most", captured["user"])
-        self.assertIn("approved voice anchors", captured["user"])
-        self.assertIn("timed visual beats", captured["user"])
-        self.assertIn("text policy: post_overlay", captured["user"])
-        self.assertIn("H3 may render exact on-screen copy explicitly authored", captured["user"])
-        self.assertIn("no-text post_overlay rule applies to still-frame and Seedance", captured["user"])
+        self.assertIn("用手工纸艺定格动画解释概念", captured["system"])
+        self.assertIn("普通内容每2至4秒", captured["system"])
+        self.assertIn("system_vo、narration和offscreen", captured["system"])
+        self.assertIn("口播硬预算", captured["system"])
+        self.assertIn("只在其指定时间出现一次 <d>[Chinese]", captured["system"])
+        self.assertIn("声音锚点压缩成中文", captured["system"])
+        self.assertIn("只有 <d> 标签内部文字可以发声", captured["system"])
+        self.assertIn("H3可以渲染分镜明确要求", captured["system"])
+        self.assertIn("text_policy=post_overlay不禁止H3", captured["system"])
+        self.assertIn("口播硬预算：全部声音事件合计最多", captured["user"])
+        self.assertIn("已确认声音锚点", captured["user"])
+        self.assertIn("分段视觉时间轴", captured["user"])
+        self.assertIn("文字策略：post_overlay", captured["user"])
+        self.assertIn("H3可以在指定时间渲染", captured["user"])
+        self.assertIn("最终提示词正文必须使用中文", captured["user"])
         self.assertIn("保持白纸颜色", captured["user"])
+
+    async def test_explicit_h3_prompt_input_mode_selects_exclusive_template_and_submission_mode(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="输入模式", story="主持人口播"))
+        first_path = Path(self.temp.name) / "first.png"
+        last_path = Path(self.temp.name) / "last.png"
+        character_path = Path(self.temp.name) / "host.png"
+        for path in (first_path, last_path, character_path):
+            path.write_bytes(b"image")
+        first = self.service.register_existing_asset(project.id, first_path, AssetRole.KEYFRAME, "舞台首帧")
+        last = self.service.register_existing_asset(project.id, last_path, AssetRole.LAST_FRAME, "人物收束尾帧")
+        character = self.service.register_existing_asset(project.id, character_path, AssetRole.CHARACTER, "主持人角色图")
+        shot = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                generation_mode=GenerationMode.R2V,
+                narrative="主持人从舞台中央走向观众并完成口播",
+                keyframe_asset_id=first.id,
+                last_frame_asset_id=last.id,
+                reference_asset_ids=[character.id],
+            )
+        )
+        calls: list[tuple[str, str]] = []
+
+        class FakeLLM:
+            async def generate_json(self, system_prompt: str, user_prompt: str, reference_images=None):
+                calls.append((system_prompt, user_prompt))
+                if "严格使用以下字段顺序" in system_prompt:
+                    return {
+                        "video_prompt": (
+                            "subject_definitions: Host from <Picture 1>.\n"
+                            "summary: Stage pitch.\nretention_analysis: Strong hook.\n"
+                            "detailed_description: The host crosses the stage.\n"
+                            "overall_soundscape: Clear room tone.\nnon_diegetic_music: None."
+                        )
+                    }
+                return {
+                    "video_prompt": (
+                        "For the target video, at 0.00 seconds, <Picture 1> is fully referenced.\n"
+                        "integrated_multimodal_description: The host crosses the stage and lands on the supplied last frame.\n"
+                        "overall_soundscape: Clear room tone.\nnon_diegetic_music: None."
+                    )
+                }
+
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()):
+            frame_result = await self.service.generate_h3_prompts(
+                project.id, [shot.id], "h3-prompt-writing", input_mode="frame"
+            )
+            reference_result = await self.service.generate_h3_prompts(
+                project.id, [shot.id], "h3-prompt-writing", input_mode="reference"
+            )
+
+        self.assertEqual(frame_result[0].generation_mode, GenerationMode.I2V)
+        self.assertIn("API另行提供已确认的last_frame", calls[0][0])
+        self.assertIn("仅使用帧：已确认的first_frame和last_frame", calls[0][1])
+        self.assertIn("按API实际顺序排列的可用参考：[]", calls[0][1])
+        self.assertNotIn("主持人角色图", calls[0][1])
+        self.assertEqual(reference_result[0].generation_mode, GenerationMode.R2V)
+        self.assertIn("严格使用以下字段顺序", calls[1][0])
+        self.assertIn("仅使用参考：", calls[1][1])
+        self.assertIn("主持人角色图", calls[1][1])
+        saved = self.service.require_shot(shot.id)
+        self.assertEqual(saved.generation_mode, GenerationMode.R2V)
+        self.assertEqual(saved.resolved_generation_mode, GenerationMode.R2V)
+
+    def test_explicit_seedance_prompt_input_mode_compiles_distinct_grammars(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="Seedance 输入模式", story="主持人口播"))
+        first_path = Path(self.temp.name) / "seedance-first.png"
+        style_path = Path(self.temp.name) / "seedance-style.png"
+        first_path.write_bytes(b"image")
+        style_path.write_bytes(b"image")
+        first = self.service.register_existing_asset(project.id, first_path, AssetRole.KEYFRAME, "严格首帧")
+        style = self.service.register_existing_asset(project.id, style_path, AssetRole.STYLE, "广告风格参考")
+        shot = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                narrative="主持人走向观众",
+                keyframe_asset_id=first.id,
+                reference_asset_ids=[style.id],
+            )
+        )
+
+        frame = self.service.generate_seedance_prompts(project.id, [shot.id], "frame")[0]
+        self.assertEqual(frame.seedance_reference_mode, SeedanceReferenceMode.STRICT_FIRST_FRAME)
+        self.assertIn("@图片1是严格首帧", frame.seedance_prompt)
+        self.assertNotIn("广告风格参考", frame.seedance_prompt)
+
+        reference = self.service.generate_seedance_prompts(project.id, [shot.id], "reference")[0]
+        self.assertEqual(reference.seedance_reference_mode, SeedanceReferenceMode.MULTIMODAL_REFERENCE)
+        self.assertNotIn("@图片1是严格首帧", reference.seedance_prompt)
+        self.assertIn("广告风格参考", reference.seedance_prompt)
+
+    async def test_short_ad_prompt_replaces_paraphrased_dialogue_with_exact_copy(self) -> None:
+        advertising_copy = "最高保障三百万元，立即点击咨询。"
+        project = self.service.create_project(
+            ProjectBrief(
+                title="快口播原文校验",
+                story=advertising_copy,
+                speech_pacing="short_ad",
+            )
+        )
+        shot = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                generation_mode="r2v",
+                duration_seconds=5,
+                dialogue_rate_percent=55,
+                voice_events=[
+                    VoiceEvent(
+                        kind="narration",
+                        speaker_name="口播主持人",
+                        text=advertising_copy,
+                        start_seconds=0.2,
+                        end_seconds=4.8,
+                        lip_sync=False,
+                    )
+                ],
+            )
+        )
+
+        class ParaphrasingLLM:
+            async def generate_json(self, *_args, **_kwargs):
+                return {
+                    "video_prompt": (
+                        "subject_definitions: One presenter.\n"
+                        "detailed_description: The presenter says <d>[Chinese] 最高保障很多，快来咨询。</d>"
+                    )
+                }
+
+        with patch(
+            "src.video_workflow.services.projects.create_llm_generator",
+            return_value=ParaphrasingLLM(),
+        ):
+            generated = await self.service.generate_h3_prompts(
+                project.id,
+                [shot.id],
+                "short-video-talking-ad-generator",
+            )
+
+        prompt = generated[0].h3_prompt_skill_output
+        self.assertNotIn("最高保障很多", prompt)
+        self.assertEqual(prompt.count(advertising_copy), 1)
+        self.assertIn(f"<d>[Chinese] {advertising_copy}</d>", prompt)
+        self.assertIn("舞台广告多机位控制", prompt)
+        self.assertIn("本段不要求一镜到底", prompt)
+        self.assertIn("主持人不在画面内", prompt)
+
+    def test_stage_ad_sequence_roles_balance_energy_and_continuity(self) -> None:
+        roles = [self.service.short_ad_stage_role(ordinal, 7) for ordinal in range(1, 8)]
+
+        self.assertEqual(
+            [role["name"] for role in roles],
+            [
+                "开场空间钩子",
+                "主持人中景跟拍",
+                "主持人情绪近景",
+                "观众肩后视角",
+                "主持人与观众同框互动",
+                "大屏证据点",
+                "情绪高点与 CTA",
+            ],
+        )
+        self.assertTrue(all("runtime" in role for role in roles))
+        contract = self.service.short_ad_stage_storyboard_contract(7)
+        self.assertIn("不等于一镜到底", contract)
+        self.assertIn("纯观众中近景或近景", contract)
+        self.assertIn("避免无动机跨越180度", contract)
+        self.assertIn("首帧与尾帧", contract)
+
+    def test_stage_ad_runtime_contract_refreshes_after_last_frame_is_added(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(title="舞台广告", story="主持人介绍保险", speech_pacing="short_ad")
+        )
+        first = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                scene_description="蓝色保险发布会舞台，主持人在中央，LED 大屏在身后",
+            )
+        )
+        self.store.save_shot(Shot(project_id=project.id, ordinal=2))
+        self.store.save_shot(Shot(project_id=project.id, ordinal=3))
+
+        initial = self.service.apply_h3_stage_ad_contract(project, first, "base prompt")
+        self.assertIn("从已提供首帧准确起步", initial)
+        self.assertNotIn("本段为首尾帧I2V", initial)
+
+        first.last_frame_asset_id = "last-frame-asset"
+        refreshed = self.service.apply_h3_stage_ad_contract(project, first, initial)
+        self.assertEqual(refreshed.count("舞台广告多机位控制"), 1)
+        self.assertIn("本段为首尾帧I2V", refreshed)
+        self.assertIn("准确落到已提供尾帧构图", refreshed)
 
     def test_h3_allows_authored_copy_while_seedance_remains_text_free(self) -> None:
         project = self.service.create_project(ProjectBrief(title="分引擎文字策略", story="电脑发布任务"))
@@ -162,7 +365,7 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
 
         class PartiallyFailingLLM:
             async def generate_json(self, _system_prompt: str, user_prompt: str, reference_images=None):
-                if "ordinal/title: 2 /" in user_prompt:
+                if "生成段序号/标题：2 /" in user_prompt:
                     await asyncio.sleep(0.02)
                     raise RuntimeError("second prompt failed")
                 return {
@@ -258,14 +461,14 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("approved_voice_identity", saved.h3_prompt_skill_output)
         self.assertNotIn("voice anchor:", saved.h3_prompt_skill_output)
         self.assertNotIn(speaker.voice_description, saved.h3_prompt_skill_output)
-        self.assertIn("speech_control (NON-SPOKEN PRODUCTION INSTRUCTION)", saved.h3_prompt_skill_output)
-        self.assertIn("Only the exact text inside existing <d>...</d> tags may become speech", saved.h3_prompt_skill_output)
-        self.assertIn("silent_voice_direction_1", saved.h3_prompt_skill_output)
-        self.assertIn("young adult male voice", saved.h3_prompt_skill_output)
-        self.assertIn("a restless, impatient edge", saved.h3_prompt_skill_output)
+        self.assertIn("声音控制（非口播制作指令）", saved.h3_prompt_skill_output)
+        self.assertIn("只有现有<d>...</d>标签内部的逐字内容可以发声", saved.h3_prompt_skill_output)
+        self.assertIn("声音表演说明1", saved.h3_prompt_skill_output)
+        self.assertIn("青年男性声线", saved.h3_prompt_skill_output)
+        self.assertIn("带一点毛躁和不耐烦", saved.h3_prompt_skill_output)
         self.assertEqual(saved.h3_prompt_skill_output.count("<d>[Chinese] 真是麻烦。</d>"), 1)
 
-    def test_energetic_heroine_voice_direction_is_compact_english_metadata(self) -> None:
+    def test_energetic_heroine_voice_direction_is_compact_chinese_metadata(self) -> None:
         project = self.service.create_project(ProjectBrief(title="活力女主", story="张小差接到任务"))
         speaker = CharacterProfile(
             name="张小差",
@@ -288,11 +491,10 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
 
         contract = self.service.h3_silent_voice_contract(project, [event])
 
-        self.assertIn("lively, energetic delivery", contract)
-        self.assertIn("quicker, brighter delivery", contract)
-        self.assertIn("sparkling, excited lift", contract)
-        self.assertIn("informal, approachable girl-next-door", contract)
-        self.assertIn("lip-sync only during the tagged words", contract)
+        self.assertIn("表达活泼有能量", contract)
+        self.assertIn("立刻提高语速、音高和明亮度", contract)
+        self.assertIn("自然亲近的邻家口吻", contract)
+        self.assertIn("只在标签台词期间同步口型", contract)
         self.assertNotIn(speaker.voice_description, contract)
 
 

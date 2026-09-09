@@ -122,7 +122,7 @@ class Settings(BaseSettings):
     H3_AUDIO_MODE: str = "native"
     # comfyui_h3 renders on the self-hosted ComfyUI instance; atlas_h3 and
     # metaso_h3 are independent hosted MiniMax H3 API routes.
-    H3_PROVIDER: str = "comfyui_h3"
+    H3_PROVIDER: str = "metaso_h3"
     ATLASCLOUD_API_KEY: str | None = None
     ATLASCLOUD_BASE_URL: str = "https://api.atlascloud.ai"
     ATLASCLOUD_POLL_INTERVAL_SECONDS: float = 2.0

@@ -29,6 +29,8 @@ from src.video_workflow.domain import (
     ShotSplitPreview,
     ShotSplitSegment,
     StyleProfile,
+    SpeechPacingPreset,
+    VisualBeat,
     VoiceEvent,
 )
 from src.video_workflow.integrations.comfyui import (
@@ -74,6 +76,10 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         source = self.service.create_project(ProjectBrief(
             title="张小差安全科普",
             story="第一集",
+            speech_pacing="short_ad",
+            aspect_ratio="9:16",
+            width=768,
+            height=1344,
             visual_style="中式奇幻轻喜剧插画",
             negative_prompt="禁止写实摄影",
         ))
@@ -110,6 +116,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
 
         series, source = self.service.save_project_as_series(source.id, "张小差科普宇宙")
         self.assertEqual(source.episode_number, 1)
+        self.assertEqual(series.speech_pacing.value, "short_ad")
+        self.assertEqual((series.aspect_ratio, series.width, series.height), ("9:16", 768, 1344))
         self.assertTrue(all(Path(asset.path).is_file() for asset in series.assets))
         self.assertNotIn(style_asset.id, series.style_profile.reference_asset_ids)
 
@@ -121,6 +129,11 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         )
         episode_assets = self.store.list_assets(episode.id)
         self.assertEqual(episode.episode_number, 2)
+        self.assertEqual(episode.brief.speech_pacing.value, "short_ad")
+        self.assertEqual(
+            (episode.brief.aspect_ratio, episode.brief.width, episode.brief.height),
+            ("9:16", 768, 1344),
+        )
         self.assertIn("数字手绘", episode.brief.visual_style)
         self.assertIn("固定线稿", source.style_bible)
         self.assertIn("逐集场景规则", episode.style_bible)
@@ -324,6 +337,229 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         prompt_text = _build_user_suggestions_text(suggestion)
         self.assertIn("用户本次分镜建议｜高优先级", prompt_text)
         self.assertIn(suggestion, prompt_text)
+
+    def test_short_ad_storyboard_preserves_copy_and_applies_reusable_pacing(self) -> None:
+        advertising_copy = (
+            "现在投保太平洋百万医疗险，最高保障三百万元，"
+            "覆盖住院医疗和特定药品费用，立即点击咨询。"
+        )
+        project = self.service.create_project(
+            ProjectBrief(
+                title="抓眼口播模板",
+                story=advertising_copy,
+                target_duration_seconds=10,
+                speech_pacing="short_ad",
+                pacing="0–2秒开场钩子，其余时间连续快口播",
+                delivery_notes="数字和行动号召不得改写",
+            )
+        )
+        captured: dict[str, object] = {}
+
+        class FakeLLM:
+            async def generate_storyboard(self, **kwargs: object) -> Storyboard:
+                captured.update(kwargs)
+                return Storyboard(
+                    topic="抓眼口播模板",
+                    scenes=[
+                        Scene(
+                            id=1,
+                            event="主持人快速介绍保障并指向咨询按钮",
+                            opening_state="主持人面对镜头，保险卡片在身侧",
+                            motion_prompt="主持人打出投保手势，卡片逐项亮起",
+                            duration=10,
+                            voice_events=[
+                                VoiceEvent(
+                                    kind="narration",
+                                    speaker_name="口播主持人",
+                                    text=advertising_copy,
+                                    start_seconds=0.2,
+                                    end_seconds=9.7,
+                                    lip_sync=False,
+                                )
+                            ],
+                        )
+                    ],
+                )
+
+        class FakeOrchestrator:
+            def __init__(self, *_: object, **__: object) -> None:
+                self.llm = FakeLLM()
+
+        with patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator):
+            shots = asyncio.run(
+                self.service.generate_storyboard(
+                    project.id,
+                    1,
+                    "manual",
+                    prompt_targets=[],
+                )
+            )
+
+        contract = str(captured["user_suggestions"])
+        self.assertIn("抓眼快口播广告", contract)
+        self.assertIn("舞台互动型抓眼广告多机位语法", contract)
+        self.assertIn("不等于一镜到底", contract)
+        self.assertIn("每秒约 6.2 个有效中文字符", contract)
+        self.assertIn(project.brief.pacing, contract)
+        self.assertIn(project.brief.delivery_notes, contract)
+        self.assertEqual(shots[0].voice_events[0].text, advertising_copy)
+        self.assertEqual(shots[0].dialogue_rate_percent, 55)
+        self.assertEqual(shots[0].h3_prompt_skill_id, "short-video-talking-ad-generator")
+        self.assertIn("向前一步", shots[0].subject_motion)
+        self.assertEqual(shots[0].shot_size, "斜前方稍宽中景")
+        self.assertIn("多机位硬切", shots[0].camera_motion)
+        self.assertEqual(len(shots[0].visual_beats), 7)
+        self.assertEqual(
+            sum("主持人不在画面内" in beat.subject_action for beat in shots[0].visual_beats),
+            1,
+        )
+
+    def test_short_ad_multicam_beats_match_reference_lengths_and_offset_segment_boundary(self) -> None:
+        following = Shot(
+            project_id="project",
+            ordinal=2,
+            duration_seconds=9.5,
+            shot_size="中景",
+            camera_angle="正面平视",
+            subject_motion="主持人继续讲解免健康告知",
+            visual_beats=[
+                VisualBeat(
+                    start_seconds=0,
+                    end_seconds=9.5,
+                    purpose="反常识信息逐层揭晓",
+                    subject_action="主持人强调没有任何健康告知",
+                    shot_size="中景",
+                    camera_angle="正面平视",
+                )
+            ],
+        )
+        current = Shot(
+            project_id="project",
+            ordinal=1,
+            duration_seconds=7.2,
+            shot_size="中景",
+            camera_angle="正面平视",
+            subject_motion="主持人讲解全国医院范围",
+            visual_beats=[
+                VisualBeat(
+                    start_seconds=0,
+                    end_seconds=7.2,
+                    purpose="全国医院范围",
+                    subject_action="主持人强调全国二甲、二乙、三甲、三乙医院都支持就医",
+                    shot_size="中景",
+                    camera_angle="正面平视",
+                )
+            ],
+        )
+
+        current_beats = self.service.short_ad_multicam_beats(current, 2, following)
+        following_beats = self.service.short_ad_multicam_beats(following, 2)
+
+        self.assertEqual(len(current_beats), 5)
+        self.assertEqual(len(following_beats), 7)
+        for beats in (current_beats, following_beats):
+            self.assertEqual(sum("主持人不在画面内" in beat.subject_action for beat in beats), 1)
+            self.assertEqual(sum("主持人口播不断" in beat.sound_cue for beat in beats), 1)
+            self.assertGreaterEqual(
+                len({self.service._short_ad_shot_size_family(beat.shot_size) for beat in beats}),
+                4,
+            )
+        self.assertNotEqual(
+            self.service._short_ad_shot_size_family(current_beats[-1].shot_size),
+            self.service._short_ad_shot_size_family(following_beats[0].shot_size),
+        )
+        self.assertIn("明确避开下一生成段首帧", current_beats[-1].subject_action)
+
+        continuous_following = following.model_copy(update={"continuity_mode": ShotContinuityMode.CONTINUOUS})
+        continuous_beats = self.service.short_ad_multicam_beats(current, 2, continuous_following)
+        self.assertNotIn("明确避开下一生成段首帧", continuous_beats[-1].subject_action)
+        self.assertIn("下一段0.00秒严格接本段真实尾帧", continuous_beats[-1].subject_action)
+
+    def test_short_ad_storyboard_overrides_static_llm_framing_with_stage_sequence(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(
+                title="七镜舞台广告",
+                story="主持人连续介绍保险卖点并完成行动号召",
+                target_duration_seconds=35,
+                speech_pacing="short_ad",
+            )
+        )
+
+        class StaticStoryboardLLM:
+            async def generate_storyboard(self, **_: object) -> Storyboard:
+                return Storyboard(
+                    topic="七镜舞台广告",
+                    scenes=[
+                        Scene(
+                            id=ordinal,
+                            event=f"主持人讲解第 {ordinal} 个信息点",
+                            opening_state="主持人站在舞台中央",
+                            motion_prompt="主持人站立讲解",
+                            shot_size="中景",
+                            camera_motion="固定镜头",
+                            duration=5,
+                        )
+                        for ordinal in range(1, 8)
+                    ],
+                )
+
+        class FakeOrchestrator:
+            def __init__(self, *_: object, **__: object) -> None:
+                self.llm = StaticStoryboardLLM()
+
+        with patch("src.video_workflow.services.projects.WorkflowOrchestrator", FakeOrchestrator):
+            shots = asyncio.run(
+                self.service.generate_storyboard(project.id, 7, "manual", prompt_targets=[])
+            )
+
+        self.assertEqual(
+            [shot.shot_size for shot in shots],
+            [
+                "观众与舞台同框的稍宽斜侧景别",
+                "中景",
+                "近景",
+                "观众前景肩后中全景",
+                "主持人与前排观众同框中全景",
+                "主持人与大屏同框中景",
+                "斜前方中景",
+            ],
+        )
+        self.assertEqual(shots[0].continuity_mode, ShotContinuityMode.INDEPENDENT)
+        self.assertTrue(
+            all(shot.continuity_mode == ShotContinuityMode.SAME_SCENE for shot in shots[1:])
+        )
+        self.assertIn("前景观众简短点头或举手回应", shots[3].subject_motion)
+        self.assertIn("主持人走到舞台边缘", shots[4].subject_motion)
+        self.assertNotEqual(shots[3].camera_motion, "固定镜头")
+
+    def test_switching_project_to_short_ad_updates_shots_without_rewriting_copy(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="切换口播档", story="保险口播"))
+        advertising_copy = "客户已确认的广告文案和产品数字要完整保留，立即点击咨询。"
+        shot = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                duration_seconds=6,
+                voice_events=[
+                    VoiceEvent(
+                        kind="narration",
+                        speaker_name="旁白",
+                        text=advertising_copy,
+                        start_seconds=0.2,
+                        end_seconds=5.8,
+                        lip_sync=False,
+                    )
+                ],
+            )
+        )
+        project.brief.speech_pacing = SpeechPacingPreset.SHORT_AD
+
+        self.service.update_project(project)
+
+        updated = self.service.require_shot(shot.id)
+        self.assertEqual(updated.voice_events[0].text, advertising_copy)
+        self.assertEqual(updated.dialogue_rate_percent, 55)
+        self.assertEqual(updated.h3_prompt_skill_id, "short-video-talking-ad-generator")
 
     def test_storyboard_generation_preserves_parallel_project_updates(self) -> None:
         project = self.service.create_project(
@@ -1274,6 +1510,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         prompt = self.service.compile_seedance_prompt(project, second, assets)
         self.assertIn("图片1是上一镜真实尾帧", prompt)
         self.assertIn("图片2", prompt)
+        h3_prompt = self.service.compile_h3_prompt(project, second, assets)
+        self.assertIn("连续续接", h3_prompt)
+        self.assertIn("本镜0.00秒优先采用镜头 1的真实成片尾帧作为首帧", h3_prompt)
 
     def test_single_shot_ai_redo_keeps_identity_and_ordinal_but_can_change_duration(self) -> None:
         project = self.service.create_project(ProjectBrief(title="redo", story="原剧情"))
@@ -1689,12 +1928,12 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE, settings.TTS_PROVIDER = previous_audio
         self.assertIn("<Picture 1>", prompt)
         self.assertIn("<Subject 2> (S1)", prompt)
-        self.assertIn("<Audio 1> is the directly reused clean Chinese dialogue track", prompt)
+        self.assertIn("<Audio 1>是直接复用给", prompt)
         self.assertIn("<d>[Chinese] 同志你好，这是秦绍辉。</d>", prompt)
         self.assertEqual(prompt.count("<d>"), 1)
         self.assertEqual(prompt.count("</d>"), 1)
         self.assertIn("禁止重复台词", prompt)
-        self.assertIn("Do not change to a single-person close-up", prompt)
+        self.assertIn("不得擅自全部改为单人近景", prompt)
         previous_audio = (settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE, settings.TTS_PROVIDER)
         settings.H3_POSTPROCESS_AUDIO = True
         settings.H3_AUDIO_MODE = "clean_tts"
@@ -1705,7 +1944,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             settings.H3_POSTPROCESS_AUDIO, settings.H3_AUDIO_MODE, settings.TTS_PROVIDER = previous_audio
         self.assertEqual(len(segments), 1)
         self.assertAlmostEqual(float(segments[0]["generation_duration"]), 6.82, places=2)
-        self.assertIn("Do not change to a single-person close-up", str(segments[0]["prompt"]))
+        self.assertIn("不得擅自全部改为单人近景", str(segments[0]["prompt"]))
         required = RenderQueue._required_assets(shot, [keyframe, qin, d_ref, c_ref], GenerationMode.R2V)
         self.assertEqual([asset.id for asset in required], [keyframe.id, qin.id, d_ref.id, c_ref.id])
 
@@ -1760,9 +1999,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertIn(speaker.voice_description, seedance)
         self.assertIn("保持同一音色、年龄感、性别感、音高和口音", seedance)
         self.assertNotIn(speaker.voice_description, h3)
-        self.assertIn("young adult male voice", h3)
-        self.assertIn("a restless, impatient edge", h3)
-        self.assertIn("Only the exact text inside existing <d>...</d> tags may become speech", h3)
+        self.assertIn("青年男性声线", h3)
+        self.assertIn("带一点毛躁和不耐烦", h3)
+        self.assertIn("只有现有<d>...</d>标签内部的逐字内容可以发声", h3)
         self.assertEqual(profile.voice, "zh-CN-YunjianNeural")
         self.assertEqual(profile.selection_reason, "young_forceful_male")
         self.assertGreater(profile.rate_percent, 0)
@@ -1798,8 +2037,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(resolved[0].speaker_id, female.id)
         self.assertIn(female.voice_description, seedance)
         self.assertNotIn(female.voice_description, h3)
-        self.assertIn("young adult female voice", h3)
-        self.assertIn("urgent emotional intent", h3)
+        self.assertIn("青年女性声线", h3)
+        self.assertIn("带有急切意图", h3)
         self.assertNotIn(f"声音锚点：{male.voice_description}", seedance)
 
     def test_native_h3_audio_mode_leaves_generated_file_untouched(self) -> None:
@@ -1817,6 +2056,38 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(delivery["mode"], "native")
         self.assertEqual(video.read_bytes(), b"native-h3-audio-fixture")
         self.assertFalse((self.root / "native.native-audio.mp4").exists())
+
+    @unittest.skipUnless(shutil.which(settings.FFMPEG_BIN) and shutil.which(settings.FFPROBE_BIN), "ffmpeg required")
+    def test_native_h3_segment_concat_preserves_provider_audio(self) -> None:
+        sources = [self.root / f"native-segment-{index}.mp4" for index in (1, 2)]
+        destination = self.root / "native-concat.mp4"
+        for index, source in enumerate(sources, start=1):
+            subprocess.run(
+                [
+                    settings.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", f"color=c={'blue' if index == 1 else 'red'}:s=320x180:r=24",
+                    "-f", "lavfi", "-i", f"sine=frequency={440 + index * 40}:sample_rate=32000:duration=1",
+                    "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", "-shortest",
+                    str(source),
+                ],
+                check=True,
+            )
+
+        RenderQueue._concat_video_segments(sources, [0.9, 0.9], destination, preserve_audio=True)
+        probe = subprocess.run(
+            [
+                settings.FFPROBE_BIN, "-v", "error", "-show_entries",
+                "stream=codec_type,codec_name,sample_rate,channels", "-of", "json", str(destination),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(probe.stdout)["streams"]
+        audio = next(stream for stream in streams if stream["codec_type"] == "audio")
+        self.assertEqual(audio["codec_name"], "aac")
+        self.assertEqual(audio["sample_rate"], "32000")
+        self.assertEqual(audio["channels"], 2)
 
     @unittest.skipUnless(shutil.which(settings.FFMPEG_BIN) and shutil.which(settings.FFPROBE_BIN), "ffmpeg required")
     def test_clean_audio_delivery_discards_native_h3_track(self) -> None:
@@ -1867,6 +2138,17 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(stream["channels"], 2)
         qc = RenderQueue._validate_rendered_media(video, 320, 180, 2.0, True)
         self.assertTrue(qc["passed"], qc["issues"])
+        drift_qc = RenderQueue._validate_rendered_media(
+            video,
+            320,
+            180,
+            1.2,
+            True,
+            duration_warning_tolerance=1.0,
+        )
+        self.assertTrue(drift_qc["passed"], drift_qc["issues"])
+        self.assertEqual(drift_qc["issues"], [])
+        self.assertTrue(any("时长异常" in warning for warning in drift_qc["warnings"]))
         bad_qc = RenderQueue._validate_rendered_media(video, 640, 360, 2.0, True)
         self.assertFalse(bad_qc["passed"])
         self.assertTrue(any("分辨率异常" in issue for issue in bad_qc["issues"]))
@@ -2320,6 +2602,26 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.store.save_shot(shot)
 
         with self.assertRaisesRegex(ValueError, "多人镜头.*完整首帧"):
+            RenderQueue(self.store, self.service).enqueue(project.id, [shot.id])
+
+        self.assertEqual(self.store.list_jobs(project.id), [])
+
+    def test_render_queue_blocks_speech_above_intelligible_fast_ad_ceiling(self) -> None:
+        project = self.service.create_project(
+            ProjectBrief(title="超过快口播上限", story="口播", speech_pacing="short_ad")
+        )
+        shot = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                generation_mode=GenerationMode.R2V,
+                duration_seconds=5,
+                dialogue="保" * 50,
+                dialogue_rate_percent=100,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "50 个口播字符.*上限 8 字/秒"):
             RenderQueue(self.store, self.service).enqueue(project.id, [shot.id])
 
         self.assertEqual(self.store.list_jobs(project.id), [])

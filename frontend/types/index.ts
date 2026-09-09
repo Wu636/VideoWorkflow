@@ -36,6 +36,8 @@ export type JobStatus = 'queued' | 'submitting' | 'running' | 'completed' | 'fai
 
 export interface ProjectBrief {
     title: string;
+    project_quote: number | null;
+    /** Legacy field retained when loading older projects. */
     client_name: string;
     story: string;
     target_duration_seconds: number;
@@ -44,6 +46,7 @@ export interface ProjectBrief {
     height: number;
     fps: number;
     language: string;
+    speech_pacing: "natural" | "brisk" | "short_ad";
     visual_style: string;
     pacing: string;
     audience: string;
@@ -111,6 +114,10 @@ export interface ProductionSeries {
     id: string;
     name: string;
     description: string;
+    speech_pacing: "natural" | "brisk" | "short_ad";
+    aspect_ratio: string;
+    width: number;
+    height: number;
     visual_style: string;
     style_bible: string;
     style_profile: StyleProfile | null;
@@ -386,6 +393,9 @@ export interface Shot {
     h3_shift_video: number;
     h3_shift_audio: number;
     h3_seed: number | null;
+    h3_resolution: "default" | "768P" | "2K";
+    h3_ratio: "project" | "adaptive" | "21:9" | "16:9" | "4:3" | "1:1" | "3:4" | "9:16";
+    h3_context_ir_enabled: boolean | null;
     version: number;
     created_at: string;
     updated_at: string;

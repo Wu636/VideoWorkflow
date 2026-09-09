@@ -29,7 +29,7 @@ COMPACT_STORYBOARD_SYSTEM_PROMPT = """
 {"topic":"", "scenes":[{"duration":6,"event":"本镜完整可见事件","opening_state":"0 秒静态起始状态","dialogue":"纯台词或空字符串","dialogue_speaker":"发言角色名/旁白/空字符串","character_names":["本镜可辨认角色完整名"],"shot_size":"中景","camera_angle":"平视","lens":"50mm","camera_motion":"固定或一种主要运镜","visual_beats":[{"start_seconds":0,"end_seconds":3,"purpose":"开场钩子/推进/结果","subject_action":"一个主动作","environment_action":"环境反馈","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}],"voice_events":[{"kind":"character/system_vo/narration/offscreen","speaker_name":"","text":"","start_seconds":0.5,"end_seconds":2.5,"lip_sync":false}]}]}
 每个镜头只保留一个 event 和一个 opening_state；visual_beats 从 0 秒连续覆盖到 duration，每 2–4 秒出现新的可见变化，形成触发、执行、反馈、结果的动作弧线。镜头时长 4–15 秒，严格按用户要求的镜头数输出。
 只在确有需要时输出 transition、audio_design、text_policy；不要输出 visual_prompt、keyframe_prompt、motion_prompt、story_beat、narrative、id 等冗余字段，这些字段由系统本地编译。不要在 beats 重复整镜的景别、角度和运镜，留空表示继承镜头级设置。
-所有声音统一以 voice_events 为唯一时序来源；dialogue 仅为兼容字段，已有 voice_events 时保持空字符串，避免重复输出同一句话。角色声音写 character 并绑定唯一 speaker_name，旁白/系统播报/画外音使用对应 kind 且 lip_sync=false。整镜所有可朗读文字合计按每秒 3.4 个中文字符控制：5 秒最多 17 字、10 秒最多 34 字、15 秒最多 51 字；声音最多占镜头约 85%，开头和结尾必须留出画面反应与环境声，不安排重叠人声。长规则、旁白和系统播报只保留推动本镜的关键信息，不逐条朗读设定。character_names 只列出当前镜头真正可辨认的人物，并逐字沿用角色档案中的名称。首帧 opening_state 只写静态状态，不写未来动作、声音或字幕；画面文字留给后期叠加。保持角色身份、服装、场景和统一风格连续。
+所有声音统一以 voice_events 为唯一时序来源；dialogue 仅为兼容字段，已有 voice_events 时保持空字符串，避免重复输出同一句话。角色声音写 character 并绑定唯一 speaker_name，旁白/系统播报/画外音使用对应 kind 且 lip_sync=false。默认按每秒 3.4 个有效中文字符控制整镜可朗读文字，并为画面反应和环境声留出空间；如果用户的高优先级项目约束另行指定口播档与每秒字符数，必须以该约束为准。“抓眼快口播广告”档须逐字保留客户广告口播、产品名、数字、责任范围和行动号召，不做二次精简。各声音事件不重叠。character_names 只列出当前镜头真正可辨认的人物，并逐字沿用角色档案中的名称。首帧 opening_state 只写静态状态，不写未来动作、声音或字幕；画面文字留给后期叠加。保持角色身份、服装、场景和统一风格连续。
 """.strip()
 
 
@@ -202,7 +202,14 @@ def _normalize_visual_beats(scene: dict, duration: int) -> list[dict]:
     ]
 
 
-def _normalize_voice_events(scene: dict, duration: int, include_dialogue: bool) -> list[dict]:
+def _normalize_voice_events(
+    scene: dict,
+    duration: int,
+    include_dialogue: bool,
+    *,
+    characters_per_second: float = 3.4,
+    preserve_spoken_text: bool = False,
+) -> list[dict]:
     if not include_dialogue:
         return []
     raw_events = scene.get("voice_events")
@@ -229,23 +236,36 @@ def _normalize_voice_events(scene: dict, duration: int, include_dialogue: bool) 
                 }
             )
     if events:
-        return fit_voice_event_payloads(events, duration)
+        return fit_voice_event_payloads(
+            events,
+            duration,
+            characters_per_second=characters_per_second,
+            preserve_spoken_text=preserve_spoken_text,
+        )
 
     dialogue = str(scene.get("dialogue") or "").strip()
     if not dialogue:
         return []
     speaker_name = str(scene.get("dialogue_speaker") or "旁白").strip()
     kind = _voice_kind_for_label(speaker_name)
-    return fit_voice_event_payloads([
-        {
-            "kind": kind,
-            "speaker_name": speaker_name,
-            "text": dialogue,
-            "start_seconds": 0.35,
-            "end_seconds": min(float(duration), max(1.5, len(dialogue) / 3.7 + 0.2)),
-            "lip_sync": kind == "character",
-        }
-    ], duration)
+    return fit_voice_event_payloads(
+        [
+            {
+                "kind": kind,
+                "speaker_name": speaker_name,
+                "text": dialogue,
+                "start_seconds": 0.35,
+                "end_seconds": min(
+                    float(duration),
+                    max(1.5, len(dialogue) / max(0.1, characters_per_second) + 0.2),
+                ),
+                "lip_sync": kind == "character",
+            }
+        ],
+        duration,
+        characters_per_second=characters_per_second,
+        preserve_spoken_text=preserve_spoken_text,
+    )
 
 
 def _build_rich_motion_prompt(base_prompt: str, duration: int) -> str:
@@ -268,7 +288,13 @@ def _build_rich_motion_prompt(base_prompt: str, duration: int) -> str:
     return f"总时长约{duration}秒。{normalized_base}。"
 
 
-def _normalize_storyboard_payload(payload: dict, include_dialogue: bool) -> dict:
+def _normalize_storyboard_payload(
+    payload: dict,
+    include_dialogue: bool,
+    *,
+    characters_per_second: float = 3.4,
+    preserve_spoken_text: bool = False,
+) -> dict:
     scenes = payload.get("scenes")
     if not isinstance(scenes, list):
         return payload
@@ -309,7 +335,13 @@ def _normalize_storyboard_payload(payload: dict, include_dialogue: bool) -> dict
             motion_prompt = "；".join(beat_actions) if beat_actions else _fallback_motion_prompt()
         scene["motion_prompt"] = _build_rich_motion_prompt(motion_prompt, scene["duration"])
         scene["visual_beats"] = _normalize_visual_beats(scene, scene["duration"])
-        scene["voice_events"] = _normalize_voice_events(scene, scene["duration"], include_dialogue)
+        scene["voice_events"] = _normalize_voice_events(
+            scene,
+            scene["duration"],
+            include_dialogue,
+            characters_per_second=characters_per_second,
+            preserve_spoken_text=preserve_spoken_text,
+        )
         text_policy = str(scene.get("text_policy") or "post_overlay").strip()
         scene["text_policy"] = text_policy if text_policy in {"none", "post_overlay", "reference_locked"} else "post_overlay"
 
@@ -388,7 +420,7 @@ def _build_prompt_context_text(
         "6. character_names 必须列出本镜所有可辨认角色，并逐字使用角色设定中的完整名称；不得以泛称替代或凭空新增可辨认人物。\n"
         "7. opening_state 只描述 0 秒静态画面，不写未来动作、运镜、声音或时长；默认 text_policy=post_overlay，画面中的字幕、标题、UI 文案均留给后期叠加。\n"
         "8. 具体时序、景别变化、环境反馈、单段运镜和声音卡点写入 visual_beats；镜头级景别、角度和运镜只写一次，beat 中相同值留空。\n"
-        "9. 声音密度使用硬预算：整镜所有 voice_events 的可朗读文字合计不超过 duration×3.4 个中文字符（5秒17字、10秒34字、15秒51字）；按正常语速编排，声音占用不超过约85%，前后留出反应和环境声。\n"
+        "9. 默认声音密度为 duration×3.4 个有效中文字符，前后留出反应和环境声；如用户的高优先级项目约束指定其他口播档及每秒字符数，按该预算编排。抓眼快口播广告的客户原始口播不做精简或改写。\n"
         "10. voice_events 是唯一声音时序来源；已有 voice_events 时 dialogue 留空，同一句话只出现一次。系统规则或长旁白压缩成推动本镜的1–3条关键信息，15秒镜头最多4个声音事件，事件不得重叠。"
     )
     return prompt_suffix
@@ -404,6 +436,17 @@ def _build_user_suggestions_text(user_suggestions: str | None = None) -> str:
         "请把这些建议落实到镜头拆分、叙事顺序、景别、运镜、角色动作、对白和节奏中。"
         "若建议与基础剧情存在细节冲突，以用户本次建议为准，但不要遗漏故事的关键因果。"
     )
+
+
+def _storyboard_speech_options(user_suggestions: str | None) -> dict[str, float | bool]:
+    """Read the service-authored pacing contract passed to every LLM provider."""
+    suggestions = user_suggestions or ""
+    match = re.search(r"每秒约\s*(\d+(?:\.\d+)?)\s*个有效中文字符", suggestions)
+    characters_per_second = float(match.group(1)) if match else 3.4
+    return {
+        "characters_per_second": characters_per_second,
+        "preserve_spoken_text": "抓眼快口播广告" in suggestions,
+    }
 
 
 def _resolve_reference_image_url(reference_image: str | None) -> str | None:
@@ -470,7 +513,7 @@ class DeepSeekGenerator(LLMGenerator):
 
 【创作铁律】
 1. narrative 只写画面事件；dialogue 只写纯台词；dialogue_speaker 精确绑定唯一发言者。
-2. 台词长度按时长控制：5-10秒镜头建议 10-30 字，绝对不能超过35个字！
+2. 台词长度默认按自然语速控制：5–10 秒镜头建议 10–30 个有效字符；若用户上下文明确给出“抓眼快口播广告”口播档，则改按其中指定的每秒字符数规划，完整保留客户广告台词、产品名、数字、责任范围和行动号召，不套用 35 字上限。
 3. 情绪状态要具体："眼眶微红/嘴角微扬/眉头紧锁" 比 "伤心/开心/生气" 效果好10倍
 4. 动作描述要细化："向前迈步 + 挥出右爪" 比 "打架" 效果好
 5. 每镜具备完整动作弧线；每个 visual beat 只完成一个主动作并使用一种主要运镜，整镜每 2–4 秒产生新的可见变化
@@ -545,7 +588,11 @@ class DeepSeekGenerator(LLMGenerator):
             raise ValueError("DeepSeek returned empty content")
             
         try:
-            data = _normalize_storyboard_payload(json.loads(content), include_dialogue=include_dialogue)
+            data = _normalize_storyboard_payload(
+                json.loads(content),
+                include_dialogue=include_dialogue,
+                **_storyboard_speech_options(user_suggestions),
+            )
             return Storyboard(**data)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse DeepSeek response as JSON: {e}\nContent: {content}")
@@ -806,7 +853,11 @@ class OpenLuxGenerator(LLMGenerator):
             payload = _parse_json_object(content, "OpenLux")
         except ValueError as exc:
             raise ValueError(f"{exc}{self._raw_result_hint()}") from exc
-        payload = _normalize_storyboard_payload(payload, include_dialogue=include_dialogue)
+        payload = _normalize_storyboard_payload(
+            payload,
+            include_dialogue=include_dialogue,
+            **_storyboard_speech_options(user_suggestions),
+        )
         try:
             return Storyboard(**payload)
         except Exception as exc:
@@ -1044,7 +1095,11 @@ class GLMGenerator(LLMGenerator):
         content = content.strip()
         
         try:
-            data = _normalize_storyboard_payload(json.loads(content), include_dialogue=include_dialogue)
+            data = _normalize_storyboard_payload(
+                json.loads(content),
+                include_dialogue=include_dialogue,
+                **_storyboard_speech_options(user_suggestions),
+            )
             return Storyboard(**data)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse GLM response as JSON: {e}\nContent: {content}")
@@ -1339,7 +1394,11 @@ class ArkLLMGenerator(LLMGenerator):
         content = content.strip()
         
         try:
-            data = _normalize_storyboard_payload(json.loads(content), include_dialogue=include_dialogue)
+            data = _normalize_storyboard_payload(
+                json.loads(content),
+                include_dialogue=include_dialogue,
+                **_storyboard_speech_options(user_suggestions),
+            )
             return Storyboard(**data)
         except json.JSONDecodeError as e:
             raise ValueError(f"Failed to parse Ark LLM response as JSON: {e}\nContent: {content}")

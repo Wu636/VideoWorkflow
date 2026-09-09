@@ -78,6 +78,7 @@ function normalizeProjectBrief(brief: Partial<ProjectBrief> & Pick<ProjectBrief,
     const square = brief.aspect_ratio === "1:1";
     return {
         title: brief.title,
+        project_quote: brief.project_quote ?? null,
         client_name: brief.client_name || "",
         story: brief.story,
         target_duration_seconds: brief.target_duration_seconds || 30,
@@ -86,6 +87,7 @@ function normalizeProjectBrief(brief: Partial<ProjectBrief> & Pick<ProjectBrief,
         height: brief.height || (portrait ? 1344 : square ? 1024 : 768),
         fps: brief.fps || 24,
         language: brief.language || "zh-CN",
+        speech_pacing: brief.speech_pacing || "natural",
         visual_style: brief.visual_style || "",
         pacing: brief.pacing || "",
         audience: brief.audience || "",
@@ -522,6 +524,7 @@ export async function generateH3Prompts(
     projectId: string,
     shotIds: string[],
     skillId: string,
+    inputMode: "frame" | "reference",
     userSuggestions = "",
 ): Promise<Shot[]> {
     return api(`/projects/${projectId}/h3-prompts/generate`, {
@@ -530,14 +533,19 @@ export async function generateH3Prompts(
             shot_ids: shotIds,
             skill_id: skillId,
             user_suggestions: userSuggestions,
+            input_mode: inputMode,
         }),
     });
 }
 
-export async function generateSeedancePrompts(projectId: string, shotIds: string[]): Promise<Shot[]> {
+export async function generateSeedancePrompts(
+    projectId: string,
+    shotIds: string[],
+    inputMode: "frame" | "reference",
+): Promise<Shot[]> {
     return api(`/projects/${projectId}/seedance-prompts/generate`, {
         method: "POST",
-        body: JSON.stringify({ shot_ids: shotIds }),
+        body: JSON.stringify({ shot_ids: shotIds, input_mode: inputMode }),
     });
 }
 
@@ -581,6 +589,30 @@ export async function exportKeyframes(projectId: string, shotIds: string[]): Pro
     return { blob: await response.blob(), filename };
 }
 
+export async function exportRenderJobs(projectId: string, jobIds: string[]): Promise<{ blob: Blob; filename: string }> {
+    const response = await fetch(`${API_BASE}/projects/${projectId}/videos/export`, {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_ids: jobIds }),
+    });
+    if (!response.ok) {
+        let message = await response.text();
+        try {
+            const parsed = JSON.parse(message) as { detail?: string };
+            message = parsed.detail || message;
+        } catch {
+            // Keep the backend response body.
+        }
+        throw new Error(message || `Export failed (${response.status})`);
+    }
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const encoded = disposition.match(/filename\*=utf-8''([^;]+)/i)?.[1];
+    const quoted = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+    const filename = encoded ? decodeURIComponent(encoded) : quoted || `videos-${projectId}.zip`;
+    return { blob: await response.blob(), filename };
+}
+
 export async function planRender(projectId: string): Promise<Shot[]> {
     return api(`/projects/${projectId}/render/plan`, { method: "POST", body: "{}" });
 }
@@ -595,7 +627,7 @@ export async function enqueueRender(projectId: string, shotIds?: string[], optio
         method: "POST",
         body: JSON.stringify({
             shot_ids: shotIds || null,
-            provider: options.provider || "comfyui_h3",
+            provider: options.provider || "metaso_h3",
             model_id: options.modelId || null,
             resolution: options.resolution || null,
             generate_audio: options.generateAudio ?? true,
@@ -619,8 +651,11 @@ export async function deleteRenderJob(projectId: string, jobId: string): Promise
     return api(`/projects/${projectId}/jobs/${jobId}`, { method: "DELETE" });
 }
 
-export async function comfyPreflight(projectId: string): Promise<Record<string, unknown> & { online: boolean; ok: boolean; error?: string }> {
-    return api(`/projects/${projectId}/comfyui/preflight`);
+export async function comfyPreflight(
+    projectId: string,
+    provider: "metaso_h3" | "comfyui_h3" | "atlas_h3" = "metaso_h3",
+): Promise<Record<string, unknown> & { online: boolean; ok: boolean; error?: string }> {
+    return api(`/projects/${projectId}/comfyui/preflight?provider=${provider}`);
 }
 
 export async function seedancePreflight(projectId: string, modelId: string, resolution: string): Promise<Record<string, unknown> & { online: boolean; ok: boolean; message?: string }> {

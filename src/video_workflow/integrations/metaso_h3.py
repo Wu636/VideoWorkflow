@@ -27,11 +27,50 @@ METASO_H3_MAX_VIDEOS = 3
 METASO_H3_MAX_AUDIOS = 3
 METASO_H3_MAX_MEDIA = 12
 
-_RATIOS = {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+METASO_H3_RESOLUTIONS = {"768P", "2K"}
+METASO_H3_RATIOS = {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 
 
 def metaso_duration(seconds: float) -> int:
     return int(max(4, min(15, round(float(seconds)))))
+
+
+def metaso_ratio(project_ratio: str, configured_ratio: str = "adaptive") -> str:
+    """Use the project's authored canvas ratio for the MetaSo request.
+
+    ``adaptive`` used to be copied from the global model setting even when a
+    project had an explicit 9:16 canvas.  That leaves the hosted model free to
+    return a landscape clip.  A supported project ratio is the more specific
+    instruction; the global setting remains a fallback for legacy/custom
+    canvases whose ratio is not part of MiniMax's accepted enum.
+    """
+    authored = str(project_ratio or "").strip()
+    if authored in METASO_H3_RATIOS - {"adaptive"}:
+        return authored
+    configured = str(configured_ratio or "").strip()
+    return configured if configured in METASO_H3_RATIOS else "adaptive"
+
+
+def metaso_request_ratio(
+    project_ratio: str,
+    shot_ratio: str = "project",
+    configured_ratio: str = "adaptive",
+) -> str:
+    """Resolve a per-shot API ratio without losing the project default."""
+    requested = str(shot_ratio or "project").strip()
+    if requested == "project":
+        return metaso_ratio(project_ratio, configured_ratio)
+    if requested in METASO_H3_RATIOS:
+        return requested
+    return metaso_ratio(project_ratio, configured_ratio)
+
+
+def metaso_resolution(shot_resolution: str = "default", configured_resolution: str = "768P") -> str:
+    requested = str(shot_resolution or "default").strip()
+    if requested in METASO_H3_RESOLUTIONS:
+        return requested
+    configured = str(configured_resolution or "").strip()
+    return configured if configured in METASO_H3_RESOLUTIONS else "768P"
 
 
 def media_data_url(path: Path) -> str:
@@ -79,15 +118,14 @@ class MetaSoH3Client:
         resolution: str,
         duration: int,
         ratio: str,
+        context_ir_enabled: bool | None = None,
     ) -> str:
         image_urls = list(dict.fromkeys(image_urls or []))
         video_urls = list(dict.fromkeys(video_urls or []))
         audio_urls = list(dict.fromkeys(audio_urls or []))
         frame_urls = [url for url in (first_frame_url, last_frame_url) if url]
-        if frame_urls and (image_urls or video_urls):
-            raise ValueError("MetaSo H3 首尾帧模式与多参考图/视频模式需要分开提交")
-        if last_frame_url and not first_frame_url:
-            raise ValueError("MetaSo H3 尾帧模式同时需要首帧")
+        if frame_urls and (image_urls or video_urls or audio_urls):
+            raise ValueError("MetaSo H3 帧模式与全能参考模式需要分开提交")
         image_count = len(image_urls) + len(frame_urls)
         media_count = image_count + len(video_urls) + len(audio_urls)
         if image_count > METASO_H3_MAX_IMAGES:
@@ -98,11 +136,11 @@ class MetaSoH3Client:
             raise ValueError(f"MetaSo H3 单次最多 {METASO_H3_MAX_AUDIOS} 个音频，当前 {len(audio_urls)} 个")
         if media_count > METASO_H3_MAX_MEDIA:
             raise ValueError(f"MetaSo H3 单次最多 {METASO_H3_MAX_MEDIA} 项素材，当前 {media_count} 项")
-        if not first_frame_url and not image_urls and not video_urls:
-            raise ValueError("MetaSo H3 至少需要一项首帧、参考图片或参考视频")
-        if resolution not in {"768P", "2K"}:
+        if not frame_urls and not image_urls and not video_urls and not audio_urls:
+            raise ValueError("MetaSo H3 至少需要一项首帧、尾帧或全能参考素材")
+        if resolution not in METASO_H3_RESOLUTIONS:
             raise ValueError(f"MetaSo H3 分辨率仅支持 768P 或 2K，收到 {resolution}")
-        if ratio not in _RATIOS:
+        if ratio not in METASO_H3_RATIOS:
             raise ValueError(f"MetaSo H3 不支持画面比例 {ratio}")
         if int(duration) < 4 or int(duration) > 15:
             raise ValueError("MetaSo H3 单段时长范围为 4–15 秒")
@@ -121,7 +159,11 @@ class MetaSoH3Client:
             "resolution": resolution,
             "duration": int(duration),
             "ratio": ratio,
-            "context_ir_enabled": bool(settings.METASO_H3_CONTEXT_IR_ENABLED),
+            "context_ir_enabled": (
+                bool(settings.METASO_H3_CONTEXT_IR_ENABLED)
+                if context_ir_enabled is None
+                else bool(context_ir_enabled)
+            ),
         }
         payload_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         if payload_size > METASO_H3_MAX_REQUEST_BYTES:

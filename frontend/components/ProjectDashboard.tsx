@@ -36,11 +36,12 @@ export default function ProjectDashboard() {
     const [selectedCharacterIds, setSelectedCharacterIds] = useState<string[]>([]);
     const [form, setForm] = useState({
         title: "",
-        client_name: "",
+        project_quote: null as number | null,
         story: "",
         visual_style: "",
         target_duration_seconds: 30,
         aspect_ratio: "16:9",
+        speech_pacing: "natural" as "natural" | "brisk" | "short_ad",
     });
 
     const reload = async () => {
@@ -70,11 +71,12 @@ export default function ProjectDashboard() {
         setSelectedCharacterIds(source?.characters.map((character) => character.id) || []);
         setForm({
             title: "",
-            client_name: "",
+            project_quote: null,
             story: "",
             visual_style: source?.visual_style || "",
             target_duration_seconds: 30,
-            aspect_ratio: "16:9",
+            aspect_ratio: source?.aspect_ratio || "16:9",
+            speech_pacing: source?.speech_pacing || "natural",
         });
         setShowCreate(true);
     };
@@ -83,7 +85,12 @@ export default function ProjectDashboard() {
         const source = seriesById.get(seriesId);
         setSelectedSeriesId(seriesId);
         setSelectedCharacterIds(source?.characters.map((character) => character.id) || []);
-        setForm((current) => ({ ...current, visual_style: source?.visual_style || "" }));
+        setForm((current) => ({
+            ...current,
+            visual_style: source?.visual_style || "",
+            aspect_ratio: source?.aspect_ratio || "16:9",
+            speech_pacing: source?.speech_pacing || "natural",
+        }));
     };
 
     const submit = async () => {
@@ -180,7 +187,7 @@ export default function ProjectDashboard() {
                                     </div>
                                     <h3 className="mb-1 truncate text-xl font-semibold group-hover:text-cyan-200">{project.brief.title}</h3>
                                     {project.series_id && <p className="mb-1 text-xs text-cyan-200/65">{seriesById.get(project.series_id)?.name || "系列作品"} · 第 {project.episode_number || "?"} 集</p>}
-                                    <p className="mb-5 text-sm text-white/45">{project.brief.client_name || "未填写客户"}</p>
+                                    <p className="mb-5 text-sm text-white/45">{project.brief.project_quote == null ? "未填写项目报价" : `项目报价 ¥${project.brief.project_quote.toFixed(2)}`}</p>
                                     <p className="line-clamp-3 min-h-[63px] text-sm leading-5 text-white/65">{project.brief.story}</p>
                                     <div className="mt-6 flex gap-4 border-t border-white/8 pt-4 text-xs text-white/45">
                                         <span>{project.brief.target_duration_seconds}s</span>
@@ -206,9 +213,10 @@ export default function ProjectDashboard() {
                             <Field label="所属系列（可选）" wide><select value={selectedSeriesId} onChange={(event) => selectSeries(event.target.value)}><option value="">独立项目</option>{series.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></Field>
                             {selectedSeries && <div className="rounded-xl border border-cyan-300/12 bg-cyan-300/[.025] p-4 md:col-span-2"><div className="flex items-center gap-2"><BookCopy size={16} className="text-cyan-300" /><strong>自动沿用系列资料</strong></div><p className="mt-2 text-sm leading-6 text-white/50">画风、统一风格圣经、负面约束和下方勾选角色的人物参考图会复制到新一集。新角色可在进入项目后添加，或由剧本分析识别。</p><div className="mt-3 flex flex-wrap gap-2">{selectedSeries.characters.map((character) => <label key={character.id} className="flex cursor-pointer items-center gap-2 rounded-lg border border-white/8 bg-black/15 px-3 py-2 text-sm text-white/65"><input type="checkbox" checked={selectedCharacterIds.includes(character.id)} onChange={(event) => setSelectedCharacterIds(event.target.checked ? [...selectedCharacterIds, character.id] : selectedCharacterIds.filter((id) => id !== character.id))} /><Users size={14} />{character.name}</label>)}</div></div>}
                             <Field label="项目名称"><input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} placeholder="例如：品牌微电影《回家》" /></Field>
-                            <Field label="客户名称"><input value={form.client_name} onChange={(event) => setForm({ ...form, client_name: event.target.value })} placeholder="选填" /></Field>
+                            <Field label="项目报价（元）"><input type="number" min={0} step="0.01" value={form.project_quote ?? ""} onChange={(event) => setForm({ ...form, project_quote: event.target.value === "" ? null : Math.max(0, Number(event.target.value)) })} placeholder="选填，例如：6800" /></Field>
                             <Field label="目标时长（秒）"><input type="number" min={1} value={form.target_duration_seconds} onChange={(event) => setForm({ ...form, target_duration_seconds: Number(event.target.value) })} /></Field>
                             <Field label="画幅"><select value={form.aspect_ratio} onChange={(event) => setForm({ ...form, aspect_ratio: event.target.value })}><option>16:9</option><option>9:16</option><option>1:1</option></select></Field>
+                            <Field label="口播节奏"><select value={form.speech_pacing} onChange={(event) => setForm({ ...form, speech_pacing: event.target.value as typeof form.speech_pacing })}><option value="natural">自然口播 · 3.4 字/秒</option><option value="brisk">紧凑讲解 · 4.8 字/秒</option><option value="short_ad">抓眼快口播广告 · 6.2 字/秒</option></select></Field>
                             <Field label="客户故事/剧情脚本" wide><textarea rows={7} value={form.story} onChange={(event) => setForm({ ...form, story: event.target.value })} placeholder="粘贴客户的初步剧情、人物关系、重要台词和必须出现的内容…" /></Field>
                             {selectedSeries ? <div className="rounded-lg border border-white/8 bg-black/15 p-4 text-sm text-white/50 md:col-span-2"><span className="text-white/70">系列画风：</span>{selectedSeries.visual_style || selectedSeries.style_profile?.name || "已保存的统一风格"}</div> : <Field label="期望画风" wide><textarea rows={3} value={form.visual_style} onChange={(event) => setForm({ ...form, visual_style: event.target.value })} placeholder="例如：东方奇幻、电影级光影、写实人物、冷青橙调…" /></Field>}
                         </div>

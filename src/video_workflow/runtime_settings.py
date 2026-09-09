@@ -16,7 +16,7 @@ from src.video_workflow.integrations.metaso_h3 import METASO_H3_MODEL_ID
 @dataclass(frozen=True)
 class RuntimeField:
     key: str
-    group: Literal["llm", "image", "video", "comfyui", "audio"]
+    group: Literal["llm", "image", "video", "h3_api", "comfyui", "audio"]
     label: str
     description: str = ""
     secret: bool = False
@@ -66,36 +66,38 @@ RUNTIME_FIELDS = (
     RuntimeField("SEEDANCE_JOB_TIMEOUT_SECONDS", "video", "Seedance 单任务超时（秒）"),
     RuntimeField("ARK_VIDEO_MODEL", "video", "旧版方舟视频模型"),
     RuntimeField("GRSAI_VIDEO_MODEL", "video", "GRSAI 视频模型"),
-    RuntimeField("COMFYUI_BASE_URL", "comfyui", "ComfyUI 地址", "MiniMax H3 服务器的外网或内网地址。"),
     RuntimeField(
-        "H3_PROVIDER", "comfyui", "H3 生成通道",
-        "comfyui_h3 走自部署 ComfyUI；atlas_h3 与 metaso_h3 分别走两条线上 MiniMax H3 API。",
-        options=("comfyui_h3", "metaso_h3", "atlas_h3"),
+        "H3_PROVIDER", "h3_api", "H3 生成通道",
+        "默认使用 metaso_h3 线上 MiniMax H3 API；comfyui_h3 仅用于自部署兼容，atlas_h3 为另一条线上通道。",
+        options=("metaso_h3", "atlas_h3", "comfyui_h3"),
     ),
-    RuntimeField("ATLASCLOUD_API_KEY", "comfyui", "Atlas Cloud API Key", "https://console.atlascloud.ai 获取；仅 atlas_h3 通道需要。", secret=True),
-    RuntimeField("ATLASCLOUD_BASE_URL", "comfyui", "Atlas Cloud Base URL"),
+    RuntimeField("METASO_H3_API_KEY", "h3_api", "MetaSo H3 API Key", "MetaSo 控制台 H3 API 密钥；仅 metaso_h3 通道使用。", secret=True),
+    RuntimeField("METASO_H3_BASE_URL", "h3_api", "MetaSo H3 Base URL", "默认 https://metaso.cn/api/minimax。"),
+    RuntimeField("METASO_H3_RESOLUTION", "h3_api", "MetaSo H3 默认清晰度", "逐镜未指定时使用；支持 768P 和 2K。", options=("768P", "2K")),
     RuntimeField(
-        "H3_ATLAS_RESOLUTION", "comfyui", "Atlas H3 分辨率",
+        "METASO_H3_RATIO", "h3_api", "MetaSo H3 默认画面比例",
+        "逐镜选择“沿用模型设置”时使用；adaptive 表示由模型结合参考素材决定。",
+        options=("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+    ),
+    RuntimeField("METASO_H3_CONTEXT_IR_ENABLED", "h3_api", "MetaSo Context IR 默认值", "逐镜未指定时使用；开启后网关会按次收取额外的素材理解费用。"),
+    RuntimeField("METASO_H3_POLL_INTERVAL_SECONDS", "h3_api", "MetaSo 轮询间隔（秒）"),
+    RuntimeField("METASO_H3_JOB_TIMEOUT_SECONDS", "h3_api", "MetaSo 单任务超时（秒）"),
+    RuntimeField("ATLASCLOUD_API_KEY", "h3_api", "Atlas Cloud API Key", "https://console.atlascloud.ai 获取；仅 atlas_h3 通道需要。", secret=True),
+    RuntimeField("ATLASCLOUD_BASE_URL", "h3_api", "Atlas Cloud Base URL"),
+    RuntimeField(
+        "H3_ATLAS_RESOLUTION", "h3_api", "Atlas H3 分辨率",
         "Atlas 通道提交时使用的分辨率，手动选择，不随项目尺寸自动映射。",
         options=("768P", "1080P"),
     ),
     RuntimeField(
-        "H3_ATLAS_RATIO", "comfyui", "Atlas H3 画面比例",
+        "H3_ATLAS_RATIO", "h3_api", "Atlas H3 画面比例",
         "adaptive 表示让模型自行决定；成片会缩放回项目分辨率。",
         options=("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
     ),
-    RuntimeField("ATLASCLOUD_JOB_TIMEOUT_SECONDS", "comfyui", "Atlas 单任务超时（秒）"),
-    RuntimeField("METASO_H3_API_KEY", "comfyui", "MetaSo H3 API Key", "MetaSo 控制台 H3 API 密钥；仅 metaso_h3 通道使用。", secret=True),
-    RuntimeField("METASO_H3_BASE_URL", "comfyui", "MetaSo H3 Base URL", "默认 https://metaso.cn/api/minimax。"),
-    RuntimeField("METASO_H3_RESOLUTION", "comfyui", "MetaSo H3 分辨率", "768P 是默认基础生成档；需要更高细节时可选择 2K。", options=("768P", "2K")),
-    RuntimeField(
-        "METASO_H3_RATIO", "comfyui", "MetaSo H3 画面比例",
-        "adaptive 表示由模型结合参考素材决定；成片会缩放回项目分辨率。",
-        options=("adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
-    ),
-    RuntimeField("METASO_H3_CONTEXT_IR_ENABLED", "comfyui", "MetaSo Context IR", "默认关闭；开启后网关会按次收取额外的素材理解费用。"),
-    RuntimeField("METASO_H3_POLL_INTERVAL_SECONDS", "comfyui", "MetaSo 轮询间隔（秒）"),
-    RuntimeField("METASO_H3_JOB_TIMEOUT_SECONDS", "comfyui", "MetaSo 单任务超时（秒）"),
+    RuntimeField("ATLASCLOUD_JOB_TIMEOUT_SECONDS", "h3_api", "Atlas 单任务超时（秒）"),
+    RuntimeField("H3_AUTO_SEGMENT_COMPLEX_SHOTS", "h3_api", "复杂长镜头自动续帧拆段", "开启后，超过稳定时长或包含多动作的镜头会拆成短段连续生成，再自动拼回一条视频。"),
+    RuntimeField("H3_MAX_SEGMENT_SECONDS", "h3_api", "单段高稳定时长（秒）", "建议 6–8 秒；MetaSo 单次请求硬范围为 4–15 秒。"),
+    RuntimeField("COMFYUI_BASE_URL", "comfyui", "ComfyUI 地址", "仅自部署兼容通道使用。"),
     RuntimeField("COMFYUI_API_TOKEN", "comfyui", "ComfyUI API Token", secret=True),
     RuntimeField("COMFYUI_REQUEST_TIMEOUT_SECONDS", "comfyui", "请求超时（秒）"),
     RuntimeField("COMFYUI_POLL_INTERVAL_SECONDS", "comfyui", "轮询间隔（秒）"),
@@ -113,8 +115,6 @@ RUNTIME_FIELDS = (
         "NVFP4 最省显存；INT8/BF16 可能改善复杂指令和多人关系理解，但显存/内存开销更高。",
         options=("nvfp4", "int8", "bf16"),
     ),
-    RuntimeField("H3_AUTO_SEGMENT_COMPLEX_SHOTS", "comfyui", "复杂长镜头自动续帧拆段", "开启后，超过稳定时长或包含多动作的镜头会拆成短段连续生成，再自动拼回一条视频。"),
-    RuntimeField("H3_MAX_SEGMENT_SECONDS", "comfyui", "单段高稳定时长（秒）", "建议 6–8 秒；越短越稳，但会增加生成次数。"),
     RuntimeField("H3_AUDIO_MODE", "audio", "成片音频策略", "native 默认保留 H3 原声；需要独立配音版时再主动选择 clean_tts；mute 输出静音版。", options=("native", "clean_tts", "mute")),
     RuntimeField("TTS_PROVIDER", "audio", "对白语音服务", "edge 为免密钥的在线普通话语音；disabled 仅输出静音。", options=("edge", "disabled")),
     RuntimeField("TTS_DEFAULT_FEMALE_VOICE", "audio", "默认女声 Voice ID"),
@@ -125,7 +125,14 @@ RUNTIME_FIELDS = (
 )
 
 FIELD_MAP = {field.key: field for field in RUNTIME_FIELDS}
-GROUP_LABELS = {"llm": "剧本与分镜大模型", "image": "分镜图生成", "video": "外部视频模型", "comfyui": "MiniMax H3 / ComfyUI", "audio": "对白与音频净化"}
+GROUP_LABELS = {
+    "llm": "剧本与分镜大模型",
+    "image": "分镜图生成",
+    "video": "外部视频模型",
+    "h3_api": "MiniMax H3 接口",
+    "comfyui": "ComfyUI 自部署兼容",
+    "audio": "对白与音频净化",
+}
 
 
 class RuntimeSettingsManager:
@@ -190,7 +197,7 @@ class RuntimeSettingsManager:
 
     def public_payload(self) -> dict[str, Any]:
         groups: list[dict[str, Any]] = []
-        for group in ("llm", "image", "video", "comfyui", "audio"):
+        for group in ("llm", "image", "video", "h3_api", "comfyui", "audio"):
             fields = []
             for definition in (item for item in RUNTIME_FIELDS if item.group == group):
                 value = getattr(settings, definition.key)
@@ -283,7 +290,7 @@ class RuntimeSettingsManager:
         else:
             video_label, video_model, video_ready = "GRSAI", settings.GRSAI_VIDEO_MODEL, bool(settings.GRSAI_API_KEY)
 
-        h3_selected = settings.H3_PROVIDER if settings.H3_PROVIDER in {"comfyui_h3", "metaso_h3", "atlas_h3"} else "comfyui_h3"
+        h3_selected = settings.H3_PROVIDER if settings.H3_PROVIDER in {"comfyui_h3", "metaso_h3", "atlas_h3"} else "metaso_h3"
         if h3_selected == "metaso_h3":
             h3_label = "MetaSo MiniMax H3 API"
             h3_model = f"{METASO_H3_MODEL_ID} · {settings.METASO_H3_RESOLUTION} · {settings.METASO_H3_RATIO}"

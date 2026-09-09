@@ -10,8 +10,15 @@ from unittest.mock import patch
 import httpx
 
 from src.video_workflow.config import settings
-from src.video_workflow.domain import AssetRole, ProjectBrief, Shot
-from src.video_workflow.integrations.metaso_h3 import METASO_H3_MODEL_ID, MetaSoH3Client, metaso_duration
+from src.video_workflow.domain import AssetRole, ProjectBrief, Shot, ShotContinuityMode
+from src.video_workflow.integrations.metaso_h3 import (
+    METASO_H3_MODEL_ID,
+    MetaSoH3Client,
+    metaso_duration,
+    metaso_request_ratio,
+    metaso_resolution,
+    metaso_ratio,
+)
 from src.video_workflow.services.projects import ProjectService
 from src.video_workflow.services.render_queue import RenderQueue
 from src.video_workflow.storage import ProjectStore
@@ -99,6 +106,36 @@ class MetaSoH3Tests(unittest.TestCase):
         self.assertEqual(metaso_duration(7.6), 8)
         self.assertEqual(metaso_duration(20.0), 15)
 
+    def test_project_ratio_overrides_global_adaptive_setting(self) -> None:
+        self.assertEqual(metaso_ratio("9:16", "adaptive"), "9:16")
+        self.assertEqual(metaso_ratio("16:9", "9:16"), "16:9")
+        self.assertEqual(metaso_ratio("custom", "3:4"), "3:4")
+        self.assertEqual(metaso_ratio("custom", "invalid"), "adaptive")
+
+    def test_per_shot_api_settings_override_model_defaults(self) -> None:
+        self.assertEqual(metaso_request_ratio("9:16", "3:4", "adaptive"), "3:4")
+        self.assertEqual(metaso_request_ratio("9:16", "project", "adaptive"), "9:16")
+        self.assertEqual(metaso_resolution("2K", "768P"), "2K")
+        self.assertEqual(metaso_resolution("default", "2K"), "2K")
+
+    def test_hosted_h3_keeps_fast_authored_commercial_read_in_one_call(self) -> None:
+        store = ProjectStore(self.root / "state.sqlite3")
+        service = ProjectService(store)
+        project = service.create_project(ProjectBrief(title="快口播", story="商业口播测试"))
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            duration_seconds=11,
+            dialogue="这是一段需要快速清晰表达的商业口播内容，主持人情绪急切而有感染力，整段不应因为默认慢速预算被拆开。",
+            dialogue_rate_percent=40,
+            h3_prompt_skill_output="VERTICAL 9:16 authored commercial prompt",
+        )
+        plan = service.h3_segment_plan(project, shot, [], max_segment_seconds=15)
+        self.assertEqual(len(plan), 1)
+        self.assertTrue(plan[0]["prompt"].startswith(shot.h3_prompt_skill_output))
+        self.assertIn("把全部49个有效中文口播字符完整放入11秒内", plan[0]["prompt"])
+        self.assertIn("每个标签只说一次，不漏字、不加字、不重复", plan[0]["prompt"])
+
     def test_submit_uses_v2_multimodal_schema_and_context_ir_is_opt_in(self) -> None:
         with patch("src.video_workflow.integrations.metaso_h3.httpx.AsyncClient", FakeAsyncClient):
             task_id = asyncio.run(
@@ -148,6 +185,28 @@ class MetaSoH3Tests(unittest.TestCase):
                 )
             )
 
+        with patch("src.video_workflow.integrations.metaso_h3.httpx.AsyncClient", FakeAsyncClient):
+            asyncio.run(
+                MetaSoH3Client().submit(
+                    prompt="只给尾帧",
+                    last_frame_url="data:image/png;base64,BBBB",
+                    resolution="768P",
+                    duration=5,
+                    ratio="9:16",
+                )
+            )
+            asyncio.run(
+                MetaSoH3Client().submit(
+                    prompt="只给声音参考",
+                    audio_urls=["https://cdn.example/voice.wav"],
+                    resolution="768P",
+                    duration=5,
+                    ratio="9:16",
+                )
+            )
+        self.assertEqual(FakeAsyncClient.requests[-2]["json"]["content"][1]["role"], "last_frame")
+        self.assertEqual(FakeAsyncClient.requests[-1]["json"]["content"][1]["role"], "reference_audio")
+
     def test_poll_extracts_official_task_content_url(self) -> None:
         FakeAsyncClient.poll_responses = [
             {"task": {"status": "processing"}},
@@ -187,22 +246,34 @@ class MetaSoH3Tests(unittest.TestCase):
     def test_queue_maps_i2v_keyframe_to_first_frame_and_saves_resume_snapshot(self) -> None:
         store = ProjectStore(self.root / "state.sqlite3")
         service = ProjectService(store)
-        project = service.create_project(ProjectBrief(title="MetaSo I2V", story="首帧映射测试"))
+        project = service.create_project(
+            ProjectBrief(title="MetaSo I2V", story="首帧映射测试", aspect_ratio="9:16", width=768, height=1344)
+        )
         image = self.root / "first.png"
         image.write_bytes(b"image")
         asset = service.register_existing_asset(project.id, image, AssetRole.KEYFRAME, "首帧")
+        last_image = self.root / "last.png"
+        last_image.write_bytes(b"last-image")
+        last_asset = service.register_existing_asset(project.id, last_image, AssetRole.LAST_FRAME, "尾帧")
         shot = Shot(
             project_id=project.id,
             ordinal=1,
             narrative="人物转身",
             duration_seconds=6,
             keyframe_asset_id=asset.id,
+            last_frame_asset_id=last_asset.id,
             image_path=str(image),
             video_prompt="人物自然转身，镜头稳定",
+            h3_resolution="2K",
+            h3_ratio="3:4",
+            h3_context_ir_enabled=True,
         )
         store.save_shot(shot)
         settings.H3_PROVIDER = "metaso_h3"
         job = RenderQueue(store, service).enqueue(project.id, [shot.id])[0]
+        settings.METASO_H3_RESOLUTION = "768P"
+        settings.METASO_H3_RATIO = "16:9"
+        settings.METASO_H3_CONTEXT_IR_ENABLED = False
         captured: dict[str, object] = {}
 
         class FakeMetaSoClient:
@@ -219,12 +290,72 @@ class MetaSoH3Tests(unittest.TestCase):
             asyncio.run(queue._process_metaso_h3(store.get_job(job.id)))
 
         self.assertTrue(str(captured["first_frame_url"]).startswith("data:image/"))
+        self.assertTrue(str(captured["last_frame_url"]).startswith("data:image/"))
         self.assertEqual(captured["image_urls"], [])
         self.assertEqual(captured["video_urls"], [])
-        self.assertEqual(captured["resolution"], "768P")
+        self.assertEqual(captured["resolution"], "2K")
+        self.assertEqual(captured["ratio"], "3:4")
+        self.assertTrue(captured["context_ir_enabled"])
         persisted = store.get_job(job.id)
         self.assertEqual(persisted.input_snapshot["metaso"]["model"], "MiniMax-H3")
+        self.assertTrue(persisted.input_snapshot["metaso"]["frame_mode"])
+        self.assertEqual(persisted.input_snapshot["metaso"]["input_mode"], "first_last_frame")
+        self.assertEqual(persisted.input_snapshot["metaso"]["resolution"], "2K")
+        self.assertEqual(persisted.input_snapshot["metaso"]["ratio"], "3:4")
+        self.assertTrue(persisted.input_snapshot["metaso"]["context_ir_enabled"])
+        self.assertEqual(persisted.input_snapshot["metaso"]["first_frame_asset_id"], asset.id)
+        self.assertEqual(persisted.input_snapshot["metaso"]["last_frame_asset_id"], last_asset.id)
         self.assertEqual(persisted.input_snapshot["metaso_resume"]["parts"][0]["task_id"], "task-queue")
+
+    def test_continuous_h3_uses_previous_shot_tail_as_first_frame(self) -> None:
+        store = ProjectStore(self.root / "state.sqlite3")
+        service = ProjectService(store)
+        project = service.create_project(ProjectBrief(title="H3 连续续接", story="连续口播"))
+        tail_path = self.root / "previous-tail.png"
+        stale_keyframe_path = self.root / "stale-keyframe.png"
+        tail_path.write_bytes(b"tail")
+        stale_keyframe_path.write_bytes(b"stale")
+        tail = service.register_existing_asset(project.id, tail_path, AssetRole.LAST_FRAME, "上一镜 H3 尾帧")
+        stale_keyframe = service.register_existing_asset(project.id, stale_keyframe_path, AssetRole.KEYFRAME, "本镜旧首帧")
+        first = store.save_shot(
+            Shot(project_id=project.id, ordinal=1, title="第一镜", last_frame_asset_id=tail.id, video_status="completed")
+        )
+        second = store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=2,
+                title="第二镜",
+                duration_seconds=6,
+                keyframe_asset_id=stale_keyframe.id,
+                continuity_mode=ShotContinuityMode.CONTINUOUS,
+            )
+        )
+        settings.H3_PROVIDER = "metaso_h3"
+        job = RenderQueue(store, service).enqueue(project.id, [second.id])[0]
+        self.assertEqual(job.input_snapshot["h3_parameters"]["continuity_mode"], "continuous")
+        self.assertEqual(job.input_snapshot["h3_parameters"]["continuity_source_shot_id"], first.id)
+
+        captured: dict[str, object] = {}
+
+        class FakeMetaSoClient:
+            async def submit(self, **kwargs: object) -> str:
+                captured.update(kwargs)
+                return "task-continuity"
+
+            async def wait_for_result(self, task_id: str, progress: object) -> str:
+                raise RuntimeError("stop-after-submit")
+
+        queue = RenderQueue(store, service)
+        queue.metaso_client = FakeMetaSoClient()  # type: ignore[assignment]
+        with self.assertRaisesRegex(RuntimeError, "stop-after-submit"):
+            asyncio.run(queue._process_metaso_h3(store.get_job(job.id)))
+
+        self.assertTrue(str(captured["first_frame_url"]).startswith("data:image/"))
+        self.assertIsNone(captured["last_frame_url"])
+        self.assertEqual(captured["image_urls"], [])
+        persisted = store.get_job(job.id)
+        self.assertEqual(persisted.input_snapshot["metaso"]["first_frame_asset_id"], tail.id)
+        self.assertEqual(persisted.input_snapshot["metaso"]["continuity_input_asset_id"], tail.id)
 
 
 if __name__ == "__main__":

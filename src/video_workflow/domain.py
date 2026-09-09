@@ -112,9 +112,20 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class SpeechPacingPreset(str, Enum):
+    """Reusable speech-density contracts for storyboard and render planning."""
+
+    NATURAL = "natural"
+    BRISK = "brisk"
+    SHORT_AD = "short_ad"
+
+
 class ProjectBrief(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+    # Retained for backwards compatibility with older project records. New
+    # projects use project_quote instead and do not ask for a client name.
     client_name: str = ""
+    project_quote: float | None = Field(default=None, ge=0)
     story: str = Field(min_length=1)
     target_duration_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
     aspect_ratio: str = "16:9"
@@ -122,6 +133,7 @@ class ProjectBrief(BaseModel):
     height: int = Field(default=768, ge=32, le=4096)
     fps: float = Field(default=24.0, ge=1.0, le=120.0)
     language: str = "zh-CN"
+    speech_pacing: SpeechPacingPreset = SpeechPacingPreset.NATURAL
     visual_style: str = ""
     pacing: str = ""
     audience: str = ""
@@ -216,6 +228,10 @@ class ProductionSeries(BaseModel):
     id: str = Field(default_factory=lambda: new_id("series"))
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
+    speech_pacing: SpeechPacingPreset = SpeechPacingPreset.NATURAL
+    aspect_ratio: str = "16:9"
+    width: int = Field(default=1344, ge=32, le=4096)
+    height: int = Field(default=768, ge=32, le=4096)
     visual_style: str = ""
     style_bible: str = ""
     style_profile: StyleProfile | None = None
@@ -487,6 +503,13 @@ class Shot(BaseModel):
     h3_shift_video: float = Field(default=12.0, ge=0.01, le=100.0)
     h3_shift_audio: float = Field(default=3.0, ge=0.01, le=100.0)
     h3_seed: int | None = Field(default=None, ge=1, le=2**31 - 1)
+    # Hosted MiniMax H3 API controls. ``default`` keeps the runtime MetaSo
+    # setting, while ``project`` follows the authored project canvas ratio.
+    # Legacy ComfyUI tuning fields stay loadable for old projects but are not
+    # exposed by the MetaSo-oriented production UI.
+    h3_resolution: Literal["default", "768P", "2K"] = "default"
+    h3_ratio: Literal["project", "adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] = "project"
+    h3_context_ir_enabled: bool | None = None
     version: int = 1
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)

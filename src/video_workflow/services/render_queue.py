@@ -49,6 +49,8 @@ from src.video_workflow.integrations.metaso_h3 import (
     MetaSoH3Client,
     media_data_url,
     metaso_duration,
+    metaso_request_ratio,
+    metaso_resolution,
 )
 from src.video_workflow.integrations.seedance import (
     SeedanceClient,
@@ -60,6 +62,10 @@ from src.video_workflow.integrations.seedance import (
 from src.video_workflow.media_paths import resolve_media_path
 from src.video_workflow.services.projects import ProjectService, SEEDANCE_PROMPT_VERSION
 from src.video_workflow.services.audio import DialogueAudioService
+from src.video_workflow.speech_budget import (
+    H3_MAX_SPEECH_CHARACTERS_PER_SECOND,
+    h3_speech_characters_per_second,
+)
 from src.video_workflow.storage import ProjectStore
 
 logger = logging.getLogger(__name__)
@@ -152,6 +158,55 @@ class RenderQueue:
         job.input_snapshot["output_artifacts"] = artifacts
         return asset.id
 
+    async def _resolve_h3_continuity_asset(
+        self,
+        project,
+        shot: Shot,
+        assets: list[Asset],
+    ) -> Asset | None:
+        """Resolve the previous shot's real tail for any H3 provider.
+
+        H3 jobs are queued independently, so this lookup intentionally happens
+        at render time. A previous H3 output from an older version may not have
+        a saved tail yet; extract it lazily from that shot's current video.
+        """
+        if shot.continuity_mode != ShotContinuityMode.CONTINUOUS:
+            return None
+        source = self.projects.continuity_source_shot(project, shot)
+        if source is None:
+            raise ValueError(f"镜头 {shot.ordinal} 已选择连续续接，但没有可用的上一镜")
+        asset_map = {asset.id: asset for asset in assets}
+        tail = asset_map.get(source.last_frame_asset_id or "")
+        if tail and tail.type == AssetType.IMAGE:
+            return tail
+
+        if not source.video_path:
+            raise ValueError(
+                f"镜头 {shot.ordinal} 等待镜头 {source.ordinal} 的尾帧；请先完成上一镜再提交本镜"
+            )
+        source_path = resolve_media_path(source.video_path)
+        if not source_path.is_file():
+            raise ValueError(
+                f"镜头 {shot.ordinal} 等待镜头 {source.ordinal} 的尾帧；上一镜成片文件不存在"
+            )
+        destination = (
+            self.projects.project_dir(project.id)
+            / "images"
+            / "last_frames"
+            / f"{source.id}-h3-continuity.png"
+        )
+        await asyncio.to_thread(self._extract_last_frame, source_path, destination)
+        tail = self.projects.register_existing_asset(
+            project.id,
+            destination,
+            role=AssetRole.LAST_FRAME,
+            name=f"镜头 {source.ordinal} · H3 连续尾帧",
+            description="从上一镜 H3 成片提取，作为本镜连续续接的严格首帧",
+        )
+        source.last_frame_asset_id = tail.id
+        self.store.save_shot(source)
+        return tail
+
     def select_output(self, project_id: str, job_id: str) -> Shot:
         """Pin one completed render card as the shot's authoritative version."""
         self.projects.require_project(project_id)
@@ -232,8 +287,21 @@ class RenderQueue:
                     pass
             self._task = None
 
-    def enqueue(self, project_id: str, shot_ids: list[str] | None = None) -> list[RenderJob]:
+    def enqueue(
+        self,
+        project_id: str,
+        shot_ids: list[str] | None = None,
+        provider: str | None = None,
+    ) -> list[RenderJob]:
         project = self.projects.require_project(project_id)
+        valid_providers = {"comfyui_h3", "metaso_h3", "atlas_h3"}
+        selected_provider = (
+            provider
+            if provider in valid_providers
+            else settings.H3_PROVIDER
+            if settings.H3_PROVIDER in valid_providers
+            else "metaso_h3"
+        )
         shots = self.store.list_shots(project_id)
         if shot_ids:
             selected = set(shot_ids)
@@ -251,27 +319,68 @@ class RenderQueue:
         ]
         blockers: list[str] = []
         for shot in planned_shots:
-            has_keyframe = bool(shot.keyframe_asset_id or shot.image_path)
-            if shot.resolved_generation_mode == GenerationMode.I2V and not has_keyframe:
-                blockers.append(f"镜头 {shot.ordinal} 缺少完整首帧")
+            has_first_frame = bool(shot.keyframe_asset_id or shot.image_path)
+            has_last_frame = bool(shot.last_frame_asset_id)
+            continuity_source = self.projects.continuity_source_shot(project, shot)
+            continuity_requested = shot.continuity_mode == ShotContinuityMode.CONTINUOUS and continuity_source is not None
+            if (
+                shot.resolved_generation_mode == GenerationMode.I2V
+                and not has_first_frame
+                and not (selected_provider == "metaso_h3" and has_last_frame)
+                and not continuity_requested
+            ):
+                blockers.append(f"镜头 {shot.ordinal} 缺少帧模式所需的首帧或尾帧")
             elif (
                 shot.generation_mode == GenerationMode.AUTO
                 and shot.resolved_generation_mode == GenerationMode.R2V
                 and len(shot.character_ids) > 1
-                and not has_keyframe
+                and not has_first_frame
             ):
                 blockers.append(f"镜头 {shot.ordinal} 是多人镜头，但只有独立人物参考图")
+            spoken_characters = self.projects.shot_spoken_character_count(shot)
+            required_cps = spoken_characters / max(0.25, shot.duration_seconds)
+            if required_cps > H3_MAX_SPEECH_CHARACTERS_PER_SECOND + 0.01:
+                blockers.append(
+                    f"镜头 {shot.ordinal} 的 {spoken_characters} 个口播字符需要约 {required_cps:.1f} 字/秒，"
+                    f"超过可懂快口播上限 {H3_MAX_SPEECH_CHARACTERS_PER_SECOND:g} 字/秒"
+                )
         if blockers:
             summary = "；".join(blockers[:8])
             suffix = f"；另有 {len(blockers) - 8} 镜" if len(blockers) > 8 else ""
             raise ValueError(
-                f"高质量门禁已阻止提交：{summary}{suffix}。请先在“分镜图 / I2V 首帧”区域生成这些镜头的完整首帧；"
-                "若确实要从多素材自由重组，请在单镜参数中明确选择 R2V。"
+                f"高质量门禁已阻止提交：{summary}{suffix}。"
+                "请按上述单镜提示补齐完整首帧，或调整台词、时长与口播节奏后再提交；"
+                "需要多素材自由重组时，在单镜参数中明确选择 R2V。"
             )
         for shot in planned_shots:
             model_profile = resolve_h3_model_profile(shot.h3_model_profile)
             text_encoder_profile = resolve_h3_text_encoder_profile(shot.h3_text_encoder_profile)
-            provider = settings.H3_PROVIDER if settings.H3_PROVIDER in {"comfyui_h3", "metaso_h3", "atlas_h3"} else "comfyui_h3"
+            api_resolution = metaso_resolution(shot.h3_resolution, settings.METASO_H3_RESOLUTION)
+            api_ratio = metaso_request_ratio(
+                project.brief.aspect_ratio,
+                shot.h3_ratio,
+                settings.METASO_H3_RATIO,
+            )
+            api_context_ir = (
+                bool(settings.METASO_H3_CONTEXT_IR_ENABLED)
+                if shot.h3_context_ir_enabled is None
+                else bool(shot.h3_context_ir_enabled)
+            )
+            has_first_frame = bool(shot.keyframe_asset_id or shot.image_path)
+            has_last_frame = bool(shot.last_frame_asset_id)
+            continuity_source = self.projects.continuity_source_shot(project, shot)
+            continuity_requested = shot.continuity_mode == ShotContinuityMode.CONTINUOUS and continuity_source is not None
+            api_input_mode = (
+                "references"
+                if shot.resolved_generation_mode == GenerationMode.R2V
+                else "first_last_frame"
+                if (has_first_frame or continuity_requested) and has_last_frame
+                else "first_frame"
+                if has_first_frame or continuity_requested
+                else "last_frame"
+                if has_last_frame
+                else "frame"
+            )
             h3_parameters = {
                 "width": shot.h3_width or project.brief.width,
                 "height": shot.h3_height or project.brief.height,
@@ -294,21 +403,48 @@ class RenderQueue:
                     GenerationMode.R2V.value: h3_diffusion_model(model_profile, GenerationMode.R2V),
                 },
                 "text_encoder_model": h3_text_encoder(text_encoder_profile),
+                # Freeze hosted API controls at enqueue time just like the
+                # legacy local-model parameters above.
+                "api_input_mode": api_input_mode,
+                "api_resolution": api_resolution,
+                "api_ratio": api_ratio,
+                "api_context_ir_enabled": api_context_ir,
+                "continuity_mode": shot.continuity_mode.value,
+                "continuity_source_shot_id": shot.continuity_source_shot_id or (
+                    continuity_source.id if continuity_source else None
+                ),
             }
+            spoken_characters = self.projects.shot_spoken_character_count(shot)
+            configured_cps = h3_speech_characters_per_second(shot.dialogue_rate_percent)
+            required_cps = spoken_characters / max(0.25, shot.duration_seconds)
             quality_guard = {
                 "uses_composed_first_frame": shot.resolved_generation_mode == GenerationMode.I2V,
                 "keyframe_asset_id": shot.keyframe_asset_id,
+                "continuity_mode": shot.continuity_mode.value,
+                "continuity_source_shot_id": shot.continuity_source_shot_id or (
+                    continuity_source.id if continuity_source else None
+                ),
+                "continuity_input_asset_id": self.projects.continuity_input_asset_id(project, shot),
                 "reference_count": len(shot.reference_asset_ids),
                 "prompt_characters": len(shot.video_prompt),
                 "audio_postprocess": settings.H3_POSTPROCESS_AUDIO,
                 "audio_mode": settings.H3_AUDIO_MODE,
+                "speech": {
+                    "characters": spoken_characters,
+                    "configured_characters_per_second": round(configured_cps, 2),
+                    "required_characters_per_second": round(required_cps, 2),
+                    "runtime_target_characters_per_second": round(
+                        min(H3_MAX_SPEECH_CHARACTERS_PER_SECOND, max(configured_cps, required_cps)),
+                        2,
+                    ),
+                },
                 "issues": self.projects.shot_quality_issues(shot),
             }
             job = RenderJob(
                 project_id=project_id,
                 shot_id=shot.id,
                 type=JobType.VIDEO,
-                provider=provider,
+                provider=selected_provider,
                 mode=shot.resolved_generation_mode,
                 seed=shot.h3_seed or random.randint(1, 2**31 - 1),
                 input_snapshot={
@@ -511,6 +647,10 @@ class RenderQueue:
         shot = self.projects.require_shot(job.shot_id)
         h3_parameters = job.input_snapshot.get("h3_parameters", {})
         assets = self.store.list_assets(job.project_id)
+        continuity_asset = await self._resolve_h3_continuity_asset(project, shot, assets)
+        if continuity_asset:
+            assets = self.store.list_assets(job.project_id)
+            h3_parameters["continuity_input_asset_id"] = continuity_asset.id
         segment_plan = self.projects.h3_segment_plan(project, shot, assets)
         job.input_snapshot["segment_plan"] = segment_plan
         job.input_snapshot.setdefault("quality_guard", {})["segment_count"] = len(segment_plan)
@@ -566,7 +706,12 @@ class RenderQueue:
         }
         self.store.save_job(job)
 
-        required = self._required_assets(shot, assets, job.mode or GenerationMode.I2V)
+        required = self._required_assets(
+            shot,
+            assets,
+            job.mode or GenerationMode.I2V,
+            opening_asset_id=continuity_asset.id if continuity_asset else None,
+        )
         uploaded = await self.client.upload_assets(required, f"{job.project_id}/{job.id}")
         image_files = [uploaded[a.id] for a in required if a.type == AssetType.IMAGE]
         video_files = [uploaded[a.id] for a in required if a.type == AssetType.VIDEO]
@@ -583,9 +728,10 @@ class RenderQueue:
 
         first_frame = None
         last_frame = None
+        opening_asset_id = continuity_asset.id if continuity_asset else shot.keyframe_asset_id
         if job.mode == GenerationMode.I2V:
-            if shot.keyframe_asset_id:
-                first_frame = uploaded.get(shot.keyframe_asset_id)
+            if opening_asset_id:
+                first_frame = uploaded.get(opening_asset_id)
             if not first_frame and shot.image_path:
                 image_path = resolve_media_path(shot.image_path)
                 first_frame = await self.client.upload_input(
@@ -790,13 +936,28 @@ class RenderQueue:
         *,
         scale_to_expected: bool = False,
         hourly_rate: float | None = None,
+        duration_warning_tolerance: float | None = None,
     ) -> None:
         """Concat segments, overlay clean dialogue, QC and mark the shot done."""
         project = self.projects.require_project(job.project_id)
-        if len(segment_paths) == 1 and abs(
-            float(segment_plan[0].get("generation_duration", segment_plan[0]["duration"]))
-            - float(segment_plan[0]["duration"])
-        ) <= 0.05:
+        # H3 providers may return a codec-timestamp duration that differs
+        # slightly from the requested duration (for example 6.583s for a
+        # 5.806s request).  The finalizer trims every shot to its authored
+        # duration, so a small, decodable drift is a warning rather than a
+        # reason to discard an otherwise valid generated clip.
+        if duration_warning_tolerance is None and job.provider in {"comfyui_h3", "atlas_h3", "metaso_h3"}:
+            duration_warning_tolerance = max(1.0, float(shot.duration_seconds) * 0.15)
+        preserve_native_audio = settings.H3_AUDIO_MODE == "native"
+        if len(segment_paths) == 1 and (
+            preserve_native_audio
+            or abs(
+                float(segment_plan[0].get("generation_duration", segment_plan[0]["duration"]))
+                - float(segment_plan[0]["duration"])
+            ) <= 0.05
+        ):
+            # In native mode the provider's MP4 is the source of truth.  A
+            # hosted API often rounds 4.839s to a 5s request; trimming that
+            # one segment here would needlessly remux (or drop) its audio.
             segment_paths[0].replace(destination)
         else:
             await asyncio.to_thread(
@@ -804,6 +965,7 @@ class RenderQueue:
                 segment_paths,
                 [float(segment["duration"]) for segment in segment_plan],
                 destination,
+                preserve_native_audio,
             )
             for segment_path in segment_paths:
                 segment_path.unlink(missing_ok=True)
@@ -863,11 +1025,34 @@ class RenderQueue:
             float(shot.duration_seconds),
             bool(audio_delivery.get("applied")),
             (job.provider in {"atlas_h3", "metaso_h3"} and settings.H3_AUDIO_MODE != "mute") or bool(speech_tracks),
+            duration_warning_tolerance=duration_warning_tolerance,
         )
         job.input_snapshot["media_qc"] = media_qc
         if not media_qc["passed"]:
-            self.store.save_job(job)
-            raise RuntimeError(f"成片媒体质量门禁未通过：{'；'.join(media_qc['issues'])}")
+            # A provider can return a usable video even when its optional
+            # audio stream or metadata differs from the authored plan. Keep
+            # the diagnostics on the job, but never discard a downloaded
+            # result after generation has completed.
+            logger.warning(
+                "Generated media advisory for job %s (delivery continues): %s",
+                job.id,
+                ";".join(str(issue) for issue in media_qc.get("issues", [])),
+            )
+            job.input_snapshot["media_qc"]["delivery_advisory"] = True
+        tail_path = (
+            self.projects.project_dir(job.project_id)
+            / "images"
+            / "last_frames"
+            / f"{shot.id}-{job.id}-h3.png"
+        )
+        await asyncio.to_thread(self._extract_last_frame, destination, tail_path)
+        tail_asset = self.projects.register_existing_asset(
+            job.project_id,
+            tail_path,
+            role=AssetRole.LAST_FRAME,
+            name=f"镜头 {shot.ordinal} · H3 尾帧",
+            description="从 MiniMax H3 成片提取，可作为下一镜连续续接的严格首帧",
+        )
         elapsed = time.monotonic() - started
         job.status = JobStatus.COMPLETED
         job.progress = 1.0
@@ -879,12 +1064,20 @@ class RenderQueue:
         job.error = None
         job.input_snapshot["dialogue_tts"] = speech_metadata
         job.input_snapshot["audio_delivery"] = audio_delivery
+        job.input_snapshot["output_artifacts"] = {
+            "last_frame_asset_id": tail_asset.id,
+        }
         self.store.save_job(job)
 
         # The user may adopt an older card while this candidate is rendering.
         # Reload before binding so that late completion cannot overwrite it.
         shot = self.store.get_shot(shot.id) or shot
-        self._bind_completed_output(shot, job)
+        self._bind_completed_output(
+            shot,
+            job,
+            last_frame_asset_id=tail_asset.id,
+            replace_tail=True,
+        )
         self.store.save_shot(shot)
         all_shots = self.store.list_shots(job.project_id)
         if all(item.video_status == "completed" for item in all_shots):
@@ -902,6 +1095,10 @@ class RenderQueue:
         width = int(h3_parameters.get("width", shot.h3_width or project.brief.width))
         height = int(h3_parameters.get("height", shot.h3_height or project.brief.height))
         assets = self.store.list_assets(job.project_id)
+        continuity_asset = await self._resolve_h3_continuity_asset(project, shot, assets)
+        if continuity_asset:
+            assets = self.store.list_assets(job.project_id)
+            h3_parameters["continuity_input_asset_id"] = continuity_asset.id
         # The hosted model renders up to 15s per call, so shots within that cap
         # stay a single continuous generation instead of stitched 5s segments.
         segment_plan = self.projects.h3_segment_plan(project, shot, assets, max_segment_seconds=ATLAS_MAX_DURATION_SECONDS)
@@ -918,11 +1115,17 @@ class RenderQueue:
         }
         self.store.save_job(job)
 
-        required = self._required_assets(shot, assets, job.mode or GenerationMode.I2V)
+        required = self._required_assets(
+            shot,
+            assets,
+            job.mode or GenerationMode.I2V,
+            opening_asset_id=continuity_asset.id if continuity_asset else None,
+        )
         upload_cache: dict[str, str] = {}
         # The approved keyframe is always Picture 1. Exclude it from the regular
         # image list so it is not submitted a second time as Picture 2.
-        reference_assets = [asset for asset in required if asset.id != shot.keyframe_asset_id]
+        opening_asset_id = continuity_asset.id if continuity_asset else shot.keyframe_asset_id
+        reference_assets = [asset for asset in required if asset.id != opening_asset_id]
         image_refs = [
             await self._atlas_ref(asset, upload_cache)
             for asset in reference_assets
@@ -939,8 +1142,8 @@ class RenderQueue:
             if asset.type == AssetType.AUDIO
         ]
         first_frame_ref: str | None = None
-        if shot.keyframe_asset_id:
-            keyframe_asset = next((asset for asset in assets if asset.id == shot.keyframe_asset_id), None)
+        if opening_asset_id:
+            keyframe_asset = next((asset for asset in assets if asset.id == opening_asset_id), None)
             if keyframe_asset:
                 first_frame_ref = await self._atlas_ref(keyframe_asset, upload_cache)
         if not first_frame_ref and shot.image_path:
@@ -1126,6 +1329,10 @@ class RenderQueue:
         width = int(h3_parameters.get("width", shot.h3_width or project.brief.width))
         height = int(h3_parameters.get("height", shot.h3_height or project.brief.height))
         assets = self.store.list_assets(job.project_id)
+        continuity_asset = await self._resolve_h3_continuity_asset(project, shot, assets)
+        if continuity_asset:
+            assets = self.store.list_assets(job.project_id)
+            h3_parameters["continuity_input_asset_id"] = continuity_asset.id
         segment_plan = self.projects.h3_segment_plan(
             project,
             shot,
@@ -1134,23 +1341,46 @@ class RenderQueue:
         )
         job.input_snapshot["segment_plan"] = segment_plan
         job.input_snapshot.setdefault("quality_guard", {})["segment_count"] = len(segment_plan)
-        resolution = settings.METASO_H3_RESOLUTION if settings.METASO_H3_RESOLUTION in {"768P", "2K"} else "768P"
-        ratio = (
-            settings.METASO_H3_RATIO
-            if settings.METASO_H3_RATIO in {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
-            else "adaptive"
+        resolution = metaso_resolution(
+            str(h3_parameters.get("api_resolution") or shot.h3_resolution),
+            settings.METASO_H3_RESOLUTION,
         )
+        ratio = metaso_request_ratio(
+            project.brief.aspect_ratio,
+            str(h3_parameters.get("api_ratio") or shot.h3_ratio),
+            settings.METASO_H3_RATIO,
+        )
+        context_ir_enabled = bool(
+            h3_parameters.get(
+                "api_context_ir_enabled",
+                settings.METASO_H3_CONTEXT_IR_ENABLED
+                if shot.h3_context_ir_enabled is None
+                else shot.h3_context_ir_enabled,
+            )
+        )
+        input_mode = str(h3_parameters.get("api_input_mode") or "")
         job.input_snapshot["metaso"] = {
             "model": METASO_H3_MODEL_ID,
             "resolution": resolution,
             "ratio": ratio,
-            "context_ir_enabled": bool(settings.METASO_H3_CONTEXT_IR_ENABLED),
+            "context_ir_enabled": context_ir_enabled,
+            "input_mode": input_mode,
+            "frame_mode": job.mode == GenerationMode.I2V,
+            "first_frame_asset_id": continuity_asset.id if continuity_asset else shot.keyframe_asset_id,
+            "continuity_input_asset_id": continuity_asset.id if continuity_asset else None,
+            "last_frame_asset_id": shot.last_frame_asset_id if job.mode == GenerationMode.I2V else None,
         }
         self.store.save_job(job)
 
-        required = self._required_assets(shot, assets, job.mode or GenerationMode.I2V)
+        required = self._required_assets(
+            shot,
+            assets,
+            job.mode or GenerationMode.I2V,
+            opening_asset_id=continuity_asset.id if continuity_asset else None,
+        )
         reference_cache: dict[str, str] = {}
-        excluded_ids = {shot.keyframe_asset_id}
+        opening_asset_id = continuity_asset.id if continuity_asset else shot.keyframe_asset_id
+        excluded_ids = {opening_asset_id}
         if job.mode == GenerationMode.I2V:
             excluded_ids.add(shot.last_frame_asset_id)
         reference_assets = [asset for asset in required if asset.id not in excluded_ids]
@@ -1171,8 +1401,8 @@ class RenderQueue:
         ]
 
         first_frame_ref: str | None = None
-        if shot.keyframe_asset_id:
-            keyframe_asset = next((asset for asset in assets if asset.id == shot.keyframe_asset_id), None)
+        if opening_asset_id:
+            keyframe_asset = next((asset for asset in assets if asset.id == opening_asset_id), None)
             if keyframe_asset:
                 first_frame_ref = await self._metaso_ref(keyframe_asset, reference_cache)
         if not first_frame_ref and shot.image_path:
@@ -1182,6 +1412,8 @@ class RenderQueue:
             last_frame_asset = next((asset for asset in assets if asset.id == shot.last_frame_asset_id), None)
             if last_frame_asset:
                 last_frame_ref = await self._metaso_ref(last_frame_asset, reference_cache)
+        if not first_frame_ref and last_frame_ref and len(segment_plan) > 1:
+            raise ValueError("MetaSo H3 仅尾帧模式只支持单个 4–15 秒片段，请缩短本镜或同时提供首帧")
 
         output_dir = self.projects.project_dir(job.project_id) / "videos" / shot.id
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1267,12 +1499,13 @@ class RenderQueue:
                     continue
 
                 dialogue_guide = dialogue_guides.get(segment_index)
-                segment_audio_refs = []
-                if dialogue_guide:
-                    segment_audio_refs.append(str(dialogue_guide["remote"]))
-                segment_audio_refs.extend(audio_refs)
-                segment_audio_refs = list(dict.fromkeys(segment_audio_refs))
                 frame_mode = job.mode == GenerationMode.I2V
+                segment_audio_refs: list[str] = []
+                if not frame_mode:
+                    if dialogue_guide:
+                        segment_audio_refs.append(str(dialogue_guide["remote"]))
+                    segment_audio_refs.extend(audio_refs)
+                    segment_audio_refs = list(dict.fromkeys(segment_audio_refs))
                 segment_images = [] if frame_mode else list(dict.fromkeys([url for url in [continuation_ref, *image_refs] if url]))
                 segment_videos = [] if frame_mode else video_refs
                 segment_first_frame = continuation_ref if frame_mode else None
@@ -1281,8 +1514,8 @@ class RenderQueue:
                     if frame_mode and segment_index == len(segment_plan) - 1
                     else None
                 )
-                if not segment_first_frame and not segment_images and not segment_videos:
-                    raise ValueError(f"镜头 {shot.ordinal} 缺少 MetaSo H3 需要的首帧、参考图片或参考视频")
+                if not segment_first_frame and not segment_last_frame and not segment_images and not segment_videos and not segment_audio_refs:
+                    raise ValueError(f"镜头 {shot.ordinal} 缺少 MetaSo H3 需要的首帧、尾帧或全能参考素材")
 
                 pending_task = str(resume_part.get("task_id")) if isinstance(resume_part, dict) and resume_part.get("task_id") else ""
                 if pending_task:
@@ -1303,6 +1536,7 @@ class RenderQueue:
                         resolution=resolution,
                         duration=metaso_duration(float(segment.get("generation_duration", segment["duration"]))),
                         ratio=ratio,
+                        context_ir_enabled=context_ir_enabled,
                     )
                 job.prompt_id = task_id
                 job.status = JobStatus.RUNNING
@@ -1622,18 +1856,34 @@ class RenderQueue:
             self.store.save_project(project)
 
     @staticmethod
-    def _required_assets(shot, assets: list[Asset], mode: GenerationMode) -> list[Asset]:
+    def _required_assets(
+        shot,
+        assets: list[Asset],
+        mode: GenerationMode,
+        opening_asset_id: str | None = None,
+    ) -> list[Asset]:
         asset_map = {asset.id: asset for asset in assets}
         ids: list[str] = []
         if mode == GenerationMode.I2V:
-            ids.extend(asset_id for asset_id in [shot.keyframe_asset_id, shot.last_frame_asset_id] if asset_id)
+            ids.extend(
+                asset_id
+                for asset_id in [opening_asset_id or shot.keyframe_asset_id, shot.last_frame_asset_id]
+                if asset_id
+            )
         else:
             # Picture 1 is always the approved composition anchor. Character,
             # style, video, and audio references follow in authored order.
-            ids.extend(asset_id for asset_id in [shot.keyframe_asset_id, *shot.reference_asset_ids] if asset_id)
+            reference_ids = [opening_asset_id or shot.keyframe_asset_id, *shot.reference_asset_ids]
+            if opening_asset_id and shot.keyframe_asset_id and opening_asset_id != shot.keyframe_asset_id:
+                reference_ids = [asset_id for asset_id in reference_ids if asset_id != shot.keyframe_asset_id]
+            ids.extend(
+                asset_id
+                for asset_id in reference_ids
+                if asset_id
+            )
         result = [asset_map[asset_id] for asset_id in dict.fromkeys(ids) if asset_id in asset_map]
         if mode == GenerationMode.I2V and not result and not shot.image_path:
-            raise ValueError(f"Shot {shot.ordinal} needs an approved first frame before I2V rendering")
+            raise ValueError(f"Shot {shot.ordinal} needs an approved first or last frame before frame-mode rendering")
         if mode == GenerationMode.R2V and not result and not shot.image_path:
             raise ValueError(f"Shot {shot.ordinal} needs reference media before R2V rendering")
         return result
@@ -1662,9 +1912,59 @@ class RenderQueue:
             raise RuntimeError(result.stderr[-1500:] or "Could not extract continuation frame")
 
     @staticmethod
-    def _concat_video_segments(sources: list[Path], durations: list[float], destination: Path) -> None:
+    def _concat_video_segments(
+        sources: list[Path],
+        durations: list[float],
+        destination: Path,
+        preserve_audio: bool = False,
+    ) -> None:
         if len(sources) != len(durations) or not sources:
             raise ValueError("Sequential segment sources/durations do not match")
+
+        if preserve_audio:
+            # Native H3 delivery must carry the provider's audio through
+            # unchanged.  The concat demuxer can join the homogeneous H3 MP4
+            # segments with stream copy; the final project assembler performs
+            # authored-duration trimming later.
+            list_path = destination.with_name(f"{destination.stem}.concat.txt")
+            list_path.write_text(
+                "".join(
+                    f"file '{str(source).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+                    for source in sources
+                ),
+                encoding="utf-8",
+            )
+            try:
+                command = [
+                    settings.FFMPEG_BIN,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(destination),
+                ]
+                result = subprocess.run(command, capture_output=True, text=True)
+            finally:
+                list_path.unlink(missing_ok=True)
+            if result.returncode != 0 or not destination.exists() or destination.stat().st_size == 0:
+                destination.unlink(missing_ok=True)
+                raise RuntimeError(result.stderr[-2000:] or "Could not concatenate native H3 segments")
+            return
+
         command = [settings.FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y"]
         for source in sources:
             command.extend(["-i", str(source)])
@@ -1951,8 +2251,9 @@ class RenderQueue:
         expected_duration: float,
         require_clean_audio: bool,
         require_audible_audio: bool = False,
+        duration_warning_tolerance: float | None = None,
     ) -> dict[str, object]:
-        """Reject broken media before a shot can be marked completed."""
+        """Validate media, retaining small model timing drift as warnings."""
         probe = subprocess.run(
             [
                 settings.FFPROBE_BIN,
@@ -1967,6 +2268,7 @@ class RenderQueue:
             text=True,
         )
         issues: list[str] = []
+        warnings: list[str] = []
         payload: dict[str, object] = {}
         if probe.returncode != 0:
             issues.append(f"ffprobe 读取失败: {probe.stderr[-300:]}")
@@ -1986,8 +2288,14 @@ class RenderQueue:
         format_payload = payload.get("format", {}) if isinstance(payload, dict) else {}
         duration = float(format_payload.get("duration") or 0.0) if isinstance(format_payload, dict) else 0.0
         duration_tolerance = max(0.75, expected_duration * 0.08)
-        if duration <= 0 or abs(duration - expected_duration) > duration_tolerance:
+        if duration <= 0:
             issues.append(f"时长异常 {duration:.3f}s，预期约 {expected_duration:.3f}s")
+        elif abs(duration - expected_duration) > duration_tolerance:
+            duration_issue = f"时长异常 {duration:.3f}s，预期约 {expected_duration:.3f}s"
+            if duration_warning_tolerance is not None and abs(duration - expected_duration) <= duration_warning_tolerance:
+                warnings.append(duration_issue)
+            else:
+                issues.append(duration_issue)
         frame_count = int(video.get("nb_read_frames") or video.get("nb_frames") or 0)
         if frame_count <= 1:
             issues.append("视频帧不足或不可读")
@@ -2037,6 +2345,7 @@ class RenderQueue:
         return {
             "passed": not issues,
             "issues": issues,
+            "warnings": warnings,
             "width": actual_width,
             "height": actual_height,
             "duration_seconds": duration,

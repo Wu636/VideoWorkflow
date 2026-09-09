@@ -26,6 +26,7 @@ from src.video_workflow.domain import (
     CharacterProfile,
     FinalizeRequest,
     GenerationMode,
+    JobType,
     JobStatus,
     Project,
     ProjectBrief,
@@ -179,7 +180,7 @@ class StoryboardApprovalRequest(BaseModel):
 
 class RenderRequest(BaseModel):
     shot_ids: list[str] | None = None
-    provider: Literal["comfyui_h3", "metaso_h3", "atlas_h3", "ark_seedance"] = "comfyui_h3"
+    provider: Literal["comfyui_h3", "metaso_h3", "atlas_h3", "ark_seedance"] = "metaso_h3"
     model_id: str | None = None
     resolution: str | None = None
     generate_audio: bool = True
@@ -206,6 +207,10 @@ class KeyframeExportRequest(BaseModel):
     shot_ids: list[str] | None = None
 
 
+class VideoExportRequest(BaseModel):
+    job_ids: list[str] = Field(min_length=1, max_length=500)
+
+
 class KeyframePromptUpdateRequest(BaseModel):
     keyframe_prompt: str = Field(min_length=1, max_length=12000)
     keyframe_revision_suggestion_draft: str | None = Field(default=None, max_length=4000)
@@ -217,10 +222,12 @@ class H3PromptGenerateRequest(BaseModel):
     shot_ids: list[str] | None = None
     skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
     user_suggestions: str = Field(default="", max_length=4000)
+    input_mode: Literal["frame", "reference"]
 
 
 class SeedancePromptGenerateRequest(BaseModel):
     shot_ids: list[str] | None = None
+    input_mode: Literal["frame", "reference"]
 
 
 class SeedanceEstimateRequest(BaseModel):
@@ -1194,6 +1201,7 @@ async def generate_h3_prompts(project_id: str, request: H3PromptGenerateRequest)
             request.shot_ids,
             request.skill_id,
             request.user_suggestions,
+            request.input_mode,
         )
     except KeyError as exc:
         raise _not_found(str(exc)) from exc
@@ -1207,7 +1215,11 @@ async def generate_h3_prompts(project_id: str, request: H3PromptGenerateRequest)
 @router.post("/{project_id}/seedance-prompts/generate")
 async def generate_seedance_prompts(project_id: str, request: SeedancePromptGenerateRequest):
     try:
-        return project_service.generate_seedance_prompts(project_id, request.shot_ids)
+        return project_service.generate_seedance_prompts(
+            project_id,
+            request.shot_ids,
+            request.input_mode,
+        )
     except KeyError as exc:
         raise _not_found(str(exc)) from exc
     except ValueError as exc:
@@ -1311,6 +1323,41 @@ def _build_keyframe_archive(project_id: str, shot_ids: list[str] | None) -> tupl
     return archive_path, f"{project_title}_分镜图_{len(entries)}张.zip", len(entries)
 
 
+def _build_video_archive(project_id: str, job_ids: list[str]) -> tuple[Path, str, int]:
+    project = project_service.require_project(project_id)
+    selected = set(job_ids)
+    entries: list[tuple[str, Path]] = []
+    for job in store.list_jobs(project_id):
+        if job.id not in selected or job.type != JobType.VIDEO or job.status != JobStatus.COMPLETED or not job.output_path:
+            continue
+        path = resolve_media_path(job.output_path)
+        if not path.is_file():
+            continue
+        shot = store.get_shot(job.shot_id) if job.shot_id else None
+        if shot:
+            title = _safe_archive_component(shot.title, f"镜头_{shot.ordinal:03d}")
+            label = f"镜头_{shot.ordinal:03d}_{title}"
+        else:
+            label = "生成视频"
+        suffix = path.suffix.lower() or ".mp4"
+        entries.append((f"{label}_{job.id[-6:]}{suffix}", path))
+    if not entries:
+        raise ValueError("所选任务中没有可下载的已完成视频")
+
+    handle = tempfile.NamedTemporaryFile(prefix="videoworkflow-videos-", suffix=".zip", delete=False)
+    archive_path = Path(handle.name)
+    handle.close()
+    try:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            for arcname, source in entries:
+                archive.write(source, arcname=arcname)
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    project_title = _safe_archive_component(project.brief.title, project.id)
+    return archive_path, f"{project_title}_已完成视频_{len(entries)}个.zip", len(entries)
+
+
 @router.post("/{project_id}/keyframes/export")
 async def export_keyframes(project_id: str, request: KeyframeExportRequest):
     try:
@@ -1318,6 +1365,24 @@ async def export_keyframes(project_id: str, request: KeyframeExportRequest):
             _build_keyframe_archive,
             project_id,
             request.shot_ids,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return FileResponse(
+        archive_path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(archive_path.unlink, missing_ok=True),
+    )
+
+
+@router.post("/{project_id}/videos/export")
+async def export_videos(project_id: str, request: VideoExportRequest):
+    try:
+        archive_path, filename, _ = await asyncio.to_thread(
+            _build_video_archive,
+            project_id,
+            request.job_ids,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1352,7 +1417,7 @@ async def enqueue_render(project_id: str, request: RenderRequest):
                 resolution=request.resolution,
                 generate_audio=request.generate_audio,
             )
-        return render_queue.enqueue(project_id, request.shot_ids)
+        return render_queue.enqueue(project_id, request.shot_ids, provider=request.provider)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1430,14 +1495,18 @@ async def delete_job(project_id: str, job_id: str):
 
 
 @router.get("/{project_id}/comfyui/preflight")
-async def comfyui_preflight(project_id: str):
+async def comfyui_preflight(
+    project_id: str,
+    provider: Literal["comfyui_h3", "metaso_h3", "atlas_h3"] | None = None,
+):
     project_service.require_project(project_id)
-    if settings.H3_PROVIDER == "metaso_h3":
+    selected_provider = provider or settings.H3_PROVIDER
+    if selected_provider == "metaso_h3":
         try:
             return await MetaSoH3Client().preflight()
         except Exception as exc:
             return {"online": False, "ok": False, "provider": "metaso_h3", "error": str(exc)}
-    if settings.H3_PROVIDER == "atlas_h3":
+    if selected_provider == "atlas_h3":
         return {
             "online": bool(settings.ATLASCLOUD_API_KEY),
             "ok": bool(settings.ATLASCLOUD_API_KEY),

@@ -67,6 +67,20 @@ class ProjectApiTests(unittest.TestCase):
         self.assertTrue(episode.json()["brief"]["visual_style"].startswith("统一二维插画"))
         self.assertIn("禁止真人照片", episode.json()["brief"]["visual_style"])
 
+    def test_project_quote_is_optional_and_persisted(self) -> None:
+        quoted = self.client.post(
+            "/api/projects",
+            json={"title": "报价项目", "story": "故事", "project_quote": 6800.5},
+        )
+        self.assertEqual(quoted.status_code, 200, quoted.text)
+        self.assertEqual(quoted.json()["brief"]["project_quote"], 6800.5)
+        unquoted = self.client.post(
+            "/api/projects",
+            json={"title": "未报价项目", "story": "故事"},
+        )
+        self.assertEqual(unquoted.status_code, 200, unquoted.text)
+        self.assertIsNone(unquoted.json()["brief"]["project_quote"])
+
     def test_script_duration_assessment_route(self) -> None:
         project = self.client.post(
             "/api/projects",
@@ -334,7 +348,10 @@ class ProjectApiTests(unittest.TestCase):
                 return str(path)
 
         with patch("src.video_workflow.services.projects.create_llm_generator", return_value=LLM()):
-            generated = self.client.post(f"/api/projects/{project_id}/h3-prompts/generate", json={"shot_ids": [shot.id]})
+            generated = self.client.post(
+                f"/api/projects/{project_id}/h3-prompts/generate",
+                json={"shot_ids": [shot.id], "input_mode": "frame"},
+            )
         self.assertEqual(generated.status_code, 200, generated.text)
         deleted = self.client.delete(f"/api/projects/{project_id}/assets/{style['id']}")
         self.assertEqual(deleted.status_code, 200, deleted.text)
@@ -413,6 +430,9 @@ class ProjectApiTests(unittest.TestCase):
             h3_scheduler="karras",
             h3_denoise=0.9,
             h3_seed=20260822,
+            h3_resolution="2K",
+            h3_ratio="9:16",
+            h3_context_ir_enabled=True,
         )
         response = self.client.put(f"/api/projects/{project_id}/shots/{shot.id}", json=shot_payload)
         self.assertEqual(response.status_code, 200, response.text)
@@ -421,6 +441,9 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(response.json()["h3_steps"], 6)
         self.assertEqual(response.json()["h3_scheduler"], "karras")
         self.assertEqual(response.json()["h3_seed"], 20260822)
+        self.assertEqual(response.json()["h3_resolution"], "2K")
+        self.assertEqual(response.json()["h3_ratio"], "9:16")
+        self.assertTrue(response.json()["h3_context_ir_enabled"])
 
         response = self.client.post(
             f"/api/projects/{project_id}/assets",
@@ -440,6 +463,9 @@ class ProjectApiTests(unittest.TestCase):
 
         response = self.client.get("/api/settings")
         self.assertEqual(response.status_code, 200, response.text)
+        groups = {group["id"]: group for group in response.json()["groups"]}
+        self.assertIn("h3_api", groups)
+        self.assertTrue(any(field["key"] == "H3_PROVIDER" for field in groups["h3_api"]["fields"]))
         secret_fields = [field for group in response.json()["groups"] for field in group["fields"] if field["secret"]]
         self.assertTrue(secret_fields)
         self.assertTrue(all(field["value"] == "" for field in secret_fields))
@@ -556,6 +582,57 @@ class ProjectApiTests(unittest.TestCase):
         )
         self.assertEqual(empty.status_code, 400, empty.text)
         self.assertIn("没有可导出", empty.json()["detail"])
+
+    def test_video_export_downloads_selected_completed_jobs_as_zip(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="视频批量导出", story="两个已完成视频"))
+        first_shot = router.store.save_shot(Shot(project_id=project.id, ordinal=1, title="开场/入镜"))
+        second_shot = router.store.save_shot(Shot(project_id=project.id, ordinal=2, title="镜头二"))
+        first_path = Path(self.temp.name) / "first.mp4"
+        second_path = Path(self.temp.name) / "second.mp4"
+        first_path.write_bytes(b"first-video")
+        second_path.write_bytes(b"second-video")
+        first_job = router.store.save_job(RenderJob(
+            project_id=project.id,
+            shot_id=first_shot.id,
+            type=JobType.VIDEO,
+            status=JobStatus.COMPLETED,
+            output_path=str(first_path),
+        ))
+        second_job = router.store.save_job(RenderJob(
+            project_id=project.id,
+            shot_id=second_shot.id,
+            type=JobType.VIDEO,
+            status=JobStatus.COMPLETED,
+            output_path=str(second_path),
+        ))
+        ignored = router.store.save_job(RenderJob(
+            project_id=project.id,
+            shot_id=second_shot.id,
+            type=JobType.VIDEO,
+            status=JobStatus.FAILED,
+            output_path=str(second_path),
+        ))
+
+        response = self.client.post(
+            f"/api/projects/{project.id}/videos/export",
+            json={"job_ids": [second_job.id, ignored.id, first_job.id]},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["content-type"], "application/zip")
+        self.assertIn("filename*=utf-8", response.headers["content-disposition"].lower())
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), 2)
+            self.assertEqual({archive.read(name) for name in names}, {b"first-video", b"second-video"})
+            self.assertTrue(any(first_job.id[-6:] in name for name in names))
+            self.assertTrue(any(second_job.id[-6:] in name for name in names))
+
+        empty = self.client.post(
+            f"/api/projects/{project.id}/videos/export",
+            json={"job_ids": [ignored.id]},
+        )
+        self.assertEqual(empty.status_code, 400, empty.text)
+        self.assertIn("已完成视频", empty.json()["detail"])
 
 
     def test_render_job_delete_requires_terminal_status(self) -> None:

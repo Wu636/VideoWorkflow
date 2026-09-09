@@ -211,6 +211,36 @@ class OpenLuxGeneratorTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertTrue(all(not event["lip_sync"] for event in events))
 
+    def test_storyboard_normalization_preserves_short_ad_copy_at_selected_rate(self) -> None:
+        advertising_copy = (
+            "现在投保太平洋百万医疗险，最高保障三百万元，"
+            "覆盖住院医疗和特定药品费用，立即点击咨询。"
+        )
+        payload = _normalize_storyboard_payload(
+            {
+                "scenes": [
+                    {
+                        "duration": 10,
+                        "event": "主持人快速介绍保障",
+                        "voice_events": [
+                            {
+                                "kind": "narration",
+                                "speaker_name": "口播主持人",
+                                "text": advertising_copy,
+                                "start_seconds": 0.2,
+                                "end_seconds": 9.7,
+                            }
+                        ],
+                    }
+                ]
+            },
+            include_dialogue=True,
+            characters_per_second=6.2,
+            preserve_spoken_text=True,
+        )
+
+        self.assertEqual(payload["scenes"][0]["voice_events"][0]["text"], advertising_copy)
+
     def test_factory_and_auto_vision_route_select_openlux(self) -> None:
         self.assertIsInstance(create_llm_generator("openlux"), OpenLuxGenerator)
         with (
