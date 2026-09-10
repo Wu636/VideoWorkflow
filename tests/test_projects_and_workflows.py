@@ -795,6 +795,35 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertIn(asset.id, saved_profile.reference_asset_ids)
         self.assertTrue(saved_profile.approved)
 
+    def test_scene_profile_manual_reference_is_used_by_automatic_material_selection(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="手工场景图", story="人物在客厅"))
+        scene_path = self.root / "manual-scene.png"
+        scene_path.write_bytes(b"manual-scene")
+        asset = self.service.register_existing_asset(project.id, scene_path, AssetRole.SCENE, "本地客厅图")
+        profile = SceneProfile(name="客厅", description="固定木桌", source_shot_ids=[])
+        project.scene_profiles = [profile]
+        self.store.save_project(project)
+        shot = self.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=1,
+            scene_profile_ids=[profile.id],
+            scene_profile_id=profile.id,
+            use_scene_profile=True,
+        ))
+
+        attached = self.service.attach_scene_profile_reference(project.id, profile.id, asset.id)
+        self.assertEqual(attached.reference_asset_ids, [asset.id])
+        self.assertEqual(attached.reference_source, "upload")
+        self.assertEqual(
+            [item.id for item in self.service.keyframe_reference_assets(
+                self.service.require_project(project.id), shot, self.store.list_assets(project.id), []
+            )],
+            [asset.id],
+        )
+        cleared = self.service.clear_scene_profile_reference(project.id, profile.id)
+        self.assertEqual(cleared.reference_asset_ids, [])
+        self.assertFalse(cleared.approved)
+
     def test_character_reference_generation_accepts_selected_image_and_appearance(self) -> None:
         appearance = CharacterAppearanceProfile(
             label="少年期",
@@ -1357,6 +1386,56 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(refreshed.h3_prompt_source_revision, refreshed.content_revision)
         self.assertEqual(refreshed.seedance_prompt_source_revision, refreshed.content_revision)
 
+    def test_seedance_user_constraints_survive_role_refresh_and_global_rules_are_prioritized(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="安全帽约束", story="陈野和林晓进入现场"))
+        project.seedance_global_constraints = (
+            "全系列强制约束：所有出镜人物全程佩戴蓝色安全帽并系好下颌带；"
+            "林晓的所有头发必须收进安全帽内，帽外不得露出任何头发。"
+        )
+        chen = CharacterProfile(
+            id="chen",
+            name="陈野",
+            description="一段很长的角色描述，用于确保高优先级服装规则不会被截断。" * 8,
+            wardrobe="蓝色安全帽、深色工装",
+        )
+        lin = CharacterProfile(
+            id="lin",
+            name="林晓",
+            description="年轻女性，黑色长发",
+            wardrobe="蓝色安全帽、南网工装",
+        )
+        project.characters = [chen, lin]
+        self.store.save_project(project)
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="两人走入作业现场",
+            character_ids=[chen.id, lin.id],
+            seedance_prompt="",
+        )
+        shot.seedance_prompt = self.service.compile_seedance_prompt(project, shot, [])
+        self.store.save_shot(shot)
+
+        authored = self.service.require_shot(shot.id)
+        authored.seedance_prompt = authored.seedance_prompt.replace(
+            "【约束】",
+            "【约束】本镜必须保持所有人物的安全帽不被动作或运镜带走；",
+            1,
+        )
+        saved = self.service.update_shot(project.id, authored)
+        self.assertIn("本镜必须保持所有人物的安全帽不被动作或运镜带走", saved.seedance_prompt_user_constraints)
+
+        project.characters[0].description = "更新后的角色资料"
+        self.service.update_project(project)
+        refreshed = self.service.require_shot(shot.id)
+        self.assertIn("【系列强制约束】", refreshed.seedance_prompt)
+        self.assertLess(refreshed.seedance_prompt.index("【系列强制约束】"), refreshed.seedance_prompt.index("【素材定义】"))
+        self.assertIn("全程佩戴蓝色安全帽并系好下颌带", refreshed.seedance_prompt)
+        self.assertIn("头发全部收进安全帽内，帽外不得露发", refreshed.seedance_prompt)
+        self.assertIn("本镜必须保持所有人物的安全帽不被动作或运镜带走", refreshed.seedance_prompt)
+        self.assertIn("全程佩戴蓝色安全帽并系好下颌带", refreshed.seedance_prompt.split("【素材定义】", 1)[1])
+        self.assertLess(len(refreshed.seedance_prompt), 1800)
+
     def test_asset_prompt_refresh_drops_deleted_style_reference(self) -> None:
         project = self.service.create_project(ProjectBrief(title="删除风格图", story="人物走入房间"))
         style_path = self.root / "style.png"
@@ -1670,7 +1749,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(first, {"project_count": 1, "shot_count": 1})
         self.assertEqual(second, {"project_count": 0, "shot_count": 0})
         self.assertEqual(migrated.seedance_reference_mode, SeedanceReferenceMode.MULTIMODAL_REFERENCE)
-        self.assertEqual(migrated.seedance_prompt_version, "seedance-2.0-director-v6")
+        self.assertEqual(migrated.seedance_prompt_version, "seedance-2.0-director-v7")
 
     def test_comfyui_submit_uses_canonical_uuid_prompt_id(self) -> None:
         captured: dict[str, object] = {}
@@ -2689,6 +2768,46 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(draft.recommended_shot_count, 4)
         self.assertEqual(draft.characters[0].character_id, project.characters[0].id)
         self.assertEqual(captured["reference_images"], [str(reference.resolve())])
+
+    def test_script_character_backfill_only_appends_missing_roles(self) -> None:
+        project = self.service.create_project(ProjectBrief(
+            title="只补角色",
+            story="陆峥带林晓进入作业现场，现场广播提醒他们佩戴安全帽。",
+        ))
+        existing = CharacterProfile(
+            id="character_luzheng",
+            name="陆峥",
+            description="用户已经确认的陆峥设定",
+            wardrobe="用户已经确认的工装",
+            voice_description="用户已经确认的声音",
+            tts_voice="voice-luzheng",
+        )
+        project.characters = [existing]
+        self.store.save_project(project)
+        before = existing.model_dump(mode="json")
+
+        class FakeLLM:
+            async def generate_json(self, _system: str, prompt: str):
+                self_test.assertIn("当前剧本", prompt)
+                self_test.assertIn("陆峥", prompt)
+                return {
+                    "characters": [
+                        {"character_id": existing.id, "name": "陆峥", "description": "AI 不应覆盖", "wardrobe": "AI 不应覆盖"},
+                        {"character_id": None, "name": "林晓", "description": "年轻女性，短发", "wardrobe": "南网工装", "voice_description": "清晰利落"},
+                    ]
+                }
+
+        self_test = self
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()):
+            result = asyncio.run(self.service.analyze_and_backfill_script_characters(project.id))
+
+        saved = self.service.require_project(project.id)
+        saved_existing = next(character for character in saved.characters if character.id == existing.id)
+        self.assertEqual(saved_existing.model_dump(mode="json"), before)
+        self.assertEqual([character.name for character in saved.characters], ["陆峥", "林晓"])
+        self.assertEqual(result["added_count"], 1)
+        self.assertEqual(result["existing_count"], 1)
+        self.assertEqual(result["added_characters"][0].name, "林晓")
 
     def test_brief_analysis_normalizes_common_claude_json_variations(self) -> None:
         payload = _normalize_project_analysis_payload(

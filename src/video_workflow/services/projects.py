@@ -37,6 +37,7 @@ from src.video_workflow.domain import (
     SeriesAsset,
     ScriptDurationAssessment,
     ScriptRewriteDraft,
+    SpokenTextPolicy,
     Shot,
     ShotContinuityMode,
     ShotSplitPreview,
@@ -60,6 +61,7 @@ from src.video_workflow.speech_budget import (
     dialogue_rate_percent_for_cps,
     speech_budget_for_duration,
     speech_pacing_characters_per_second,
+    preserves_spoken_text,
     spoken_duration_seconds,
     spoken_character_count,
 )
@@ -68,7 +70,7 @@ from src.video_workflow.types import Scene
 
 logger = logging.getLogger(__name__)
 
-SEEDANCE_PROMPT_VERSION = "seedance-2.0-director-v6"
+SEEDANCE_PROMPT_VERSION = "seedance-2.0-director-v7"
 H3_DIRECTOR_VERSION = "h3-director-v11"
 
 CHARACTER_REFERENCE_SHEET_LAYOUT = """生成一张横向 16:9 的单一角色四视图设定板，角色可以是人物、动物或拟人角色；画面严格只呈现同一个角色的四个视图，不是四个不同角色：
@@ -417,12 +419,15 @@ class ProjectService:
         ] + preserved_characters
         series.assets = snapshots
         series.speech_pacing = project.brief.speech_pacing
+        series.spoken_text_policy = project.brief.spoken_text_policy
         series.aspect_ratio = project.brief.aspect_ratio
         series.width = project.brief.width
         series.height = project.brief.height
         series.visual_style = self.reusable_series_style_text(project)
         series.style_bible = self.reusable_series_style_bible(project)
         series.negative_prompt = project.brief.negative_prompt
+        if project.seedance_global_constraints.strip() or current is None:
+            series.seedance_global_constraints = project.seedance_global_constraints.strip()
         series.style_profile = (
             project.style_profile.model_copy(
                 deep=True,
@@ -446,6 +451,7 @@ class ProjectService:
         )
         saved_series = self.store.save_series(series)
         project.series_id = saved_series.id
+        project.seedance_global_constraints = saved_series.seedance_global_constraints
         if project.episode_number is None:
             used_numbers = [
                 item.episode_number or 0
@@ -471,6 +477,7 @@ class ProjectService:
         inherited_brief = brief.model_copy(
             update={
                 "speech_pacing": series.speech_pacing,
+                "spoken_text_policy": series.spoken_text_policy,
                 "aspect_ratio": series.aspect_ratio,
                 "width": series.width,
                 "height": series.height,
@@ -487,6 +494,7 @@ class ProjectService:
         project.series_id = series.id
         project.episode_number = max(existing_numbers, default=0) + 1
         project.style_bible = series.style_bible
+        project.seedance_global_constraints = series.seedance_global_constraints
 
         character_map = {
             character.id: new_id("character")
@@ -754,6 +762,11 @@ class ProjectService:
     def update_project(self, project: Project) -> Project:
         existing = self.store.get_project(project.id)
         if existing:
+            # Older clients do not know this field yet.  Preserve the saved
+            # series rule when such a payload comes back with the default
+            # empty value.
+            if not project.seedance_global_constraints.strip() and existing.seedance_global_constraints.strip():
+                project.seedance_global_constraints = existing.seedance_global_constraints
             latest_scenes = {item.id: item for item in existing.scene_profiles}
             project.scene_profiles = [
                 latest_scenes[item.id] if item.id in latest_scenes and latest_scenes[item.id].version > item.version else item
@@ -766,11 +779,16 @@ class ProjectService:
                 or existing.style_bible != project.style_bible
                 or existing.brief.visual_style != project.brief.visual_style
                 or existing.brief.negative_prompt != project.brief.negative_prompt
+                or existing.seedance_global_constraints != project.seedance_global_constraints
             )
         )
         speech_pacing_changed = bool(
             existing
             and existing.brief.speech_pacing != project.brief.speech_pacing
+        )
+        spoken_text_policy_changed = bool(
+            existing
+            and existing.brief.spoken_text_policy != project.brief.spoken_text_policy
         )
         characters_changed = bool(existing and existing.characters != project.characters)
         if existing and existing.brief.story != project.brief.story and project.ai_recommended_shot_count == existing.ai_recommended_shot_count:
@@ -780,6 +798,7 @@ class ProjectService:
                 existing.brief != project.brief
                 or existing.style_bible != project.style_bible
                 or existing.characters != project.characters
+                or existing.seedance_global_constraints != project.seedance_global_constraints
             )
             if content_changed and existing.status not in {ProjectStatus.BRIEF_DRAFT, ProjectStatus.STORYBOARD_DRAFT}:
                 project.storyboard_version = max(project.storyboard_version, existing.storyboard_version + 1)
@@ -798,7 +817,7 @@ class ProjectService:
                     shot.h3_prompt_skill_id = "h3-prompt-writing"
                 shot.version += 1
                 self.store.save_shot(shot)
-        if style_changed or characters_changed or speech_pacing_changed:
+        if style_changed or characters_changed or speech_pacing_changed or spoken_text_policy_changed:
             self.refresh_shot_prompt_caches(project.id)
         return saved_project
 
@@ -826,7 +845,7 @@ class ProjectService:
                 self._effective_voice_events(shot),
                 shot.duration_seconds,
                 shot.duration_seconds,
-                preserve_spoken_text=True,
+                preserve_spoken_text=self.should_preserve_spoken_text(project),
             )
             self.synchronize_shot_cast(project, shot)
             shot.content_revision += 1
@@ -856,6 +875,11 @@ class ProjectService:
                 shot.video_prompt = self.compile_h3_prompt(project, shot, assets)
                 shot.h3_director_version = H3_DIRECTOR_VERSION
                 shot.h3_prompt_source_revision = shot.content_revision
+            if not shot.seedance_prompt_user_constraints.strip():
+                shot.seedance_prompt_user_constraints = self._extract_seedance_user_constraints(
+                    shot.seedance_prompt,
+                    project,
+                )
             shot.seedance_prompt = self.compile_seedance_prompt(project, shot, assets)
             shot.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
             shot.seedance_prompt_source_revision = shot.content_revision
@@ -1209,9 +1233,22 @@ class ProjectService:
         user_suggestions: str = "",
         prompt_targets: list[str] | None = None,
         h3_skill_id: str = "h3-prompt-writing",
+        spoken_text_policy: str | None = None,
     ) -> list[Shot]:
         project = self.require_project(project_id)
         user_suggestions = user_suggestions.strip()
+        policy_value = str(
+            getattr(project.brief.spoken_text_policy, "value", project.brief.spoken_text_policy)
+            or "adaptive"
+        ).strip().lower()
+        if spoken_text_policy is not None:
+            policy_value = str(spoken_text_policy).strip().lower()
+        if policy_value not in {"adaptive", "verbatim"}:
+            raise ValueError("spoken_text_policy 必须是 adaptive 或 verbatim")
+        # Persist the choice before constructing the prompt so every later
+        # stage (split, revise, H3 and clean TTS) sees the same contract.
+        project.brief.spoken_text_policy = SpokenTextPolicy(policy_value)
+        preserve_spoken_text = self.should_preserve_spoken_text(project)
         minimum_count = max(1, math.ceil(project.brief.target_duration_seconds / 15.0))
         if count_mode == "ai":
             count = await self.recommend_shot_count(project_id, user_suggestions) if user_suggestions else (
@@ -1239,13 +1276,13 @@ class ProjectService:
 交付备注：{project.brief.delivery_notes or '未填写'}
 口播节奏档：{'抓眼快口播广告' if short_ad else '紧凑讲解' if project.brief.speech_pacing.value == 'brisk' else '自然口播'}，按每秒约 {speech_cps:g} 个有效中文字符规划。
 项目里明确写出的起止时间、无口播区间、开场钩子时长和总口播时长都是硬约束；不得擅自把 4 秒改成 5 秒或挤占口播时段。
-{'客户原始广告口播、产品名、数字、责任范围和行动号召必须逐字保留并按语义断句分配到各口播镜头；不得为了普通叙事语速删词或改写。' if short_ad else '对白总量必须落在各镜可懂语速预算内；超出时应重新分配镜头时长。'}"""
+{'所有对白、旁白、系统播报、画外音和内心独白等需配音文字必须逐字保留，只允许拆句、跨镜分配和调整时长；不得删词、改写、概括或合并。' if preserve_spoken_text else '对白总量必须落在各镜可懂语速预算内；超出时应重新分配镜头时长。'}"""
         count_constraint = f"""【镜头数量最高优先级硬约束｜每镜为一个生成段】
 本次必须把完整剧情从开端到结局重新规划为严格 {count} 个分镜；scenes 数组长度必须等于 {count}，id 必须连续为 1 到 {count}。
 不允许额外增加 scenes 或返回候选镜头，也不允许省略结尾；但每个 scene 内部允许并且应当用 visual_beats 编排多机位画面段和纯观众反应镜头，这些内部切镜不计入 scenes 数量。
 生成段数量要求高于默认拆镜建议。本项目目标时长为 {project.brief.target_duration_seconds:g} 秒，平均每段约 {average_duration:.2f} 秒；请在每段不超过15秒的范围内调整信息密度和duration。
 每段必须按自身duration编写从0秒连续覆盖到结尾的visual_beats；{'抓眼广告每1.1至1.8秒出现一次与语义一致的景别、角度、主持人动作或观众反馈变化' if short_ad else '普通内容每2至4秒出现一次新的可见变化'}，形成完整动作弧线，禁止用静止等待填满时长。scene级shot_size、camera_angle描述首帧机位；每个visual beat分别写自己的景别、角度、运镜和硬切逻辑。
-第 1 镜必须承担故事开端，第 {count} 镜必须完整呈现原剧情结局；中间 {max(0, count - 2)} 镜覆盖关键因果、转折与必要对白，确保压缩后仍是完整故事。
+第 1 镜必须承担故事开端，第 {count} 镜必须完整呈现原剧情结局；中间 {max(0, count - 2)} 镜覆盖关键因果、转折与必要对白，确保{'完整保留所有需配音文字后' if preserve_spoken_text else '压缩后'}仍是完整故事。
 输出 JSON 前先自行计数校验，只有 scenes 恰好 {count} 项才能提交。"""
         base_suggestions = "\n\n".join(
             item
@@ -1260,15 +1297,18 @@ class ProjectService:
         # One click performs one paid generation. Provider/SKD retries and
         # post-validation re-generations are deliberately disabled: an invalid
         # result remains recoverable and visible instead of charging 2–3 times.
-        storyboard = await orchestrator.llm.generate_storyboard(
-            topic=project.brief.story,
-            count=count,
-            reference_image=reference,
-            include_dialogue=True,
-            character_description=self.character_bible(project),
-            image_style=self.project_style_text(project),
-            user_suggestions=base_suggestions,
-        )
+        storyboard_kwargs = {
+            "topic": project.brief.story,
+            "count": count,
+            "reference_image": reference,
+            "include_dialogue": True,
+            "character_description": self.character_bible(project),
+            "image_style": self.project_style_text(project),
+            "user_suggestions": base_suggestions,
+        }
+        if preserve_spoken_text:
+            storyboard_kwargs["preserve_spoken_text"] = True
+        storyboard = await orchestrator.llm.generate_storyboard(**storyboard_kwargs)
         actual_count = len(storyboard.scenes)
         unmatched_character_names = list(
             dict.fromkeys(
@@ -1340,7 +1380,7 @@ class ProjectService:
                 float(scene.duration),
                 duration,
                 characters_per_second=speech_cps,
-                preserve_spoken_text=short_ad,
+                preserve_spoken_text=preserve_spoken_text,
             )
             speaker_id = self._resolve_dialogue_speaker_id(
                 project,
@@ -1350,7 +1390,7 @@ class ProjectService:
                 scene.dialogue,
             )
             character_voice_speaker = next(
-                (event.speaker_id for event in voice_events if event.kind == "character" and event.speaker_id),
+                (event.speaker_id for event in voice_events if event.kind in {"character", "inner_monologue"} and event.speaker_id),
                 None,
             )
             if character_voice_speaker:
@@ -1442,7 +1482,11 @@ class ProjectService:
             if required_cps > speech_cps + 0.05:
                 storyboard_warnings.append(
                     f"镜头 {shot.ordinal} 需要约 {required_cps:.1f} 字/秒，超过项目口播档 {speech_cps:g} 字/秒；"
-                    "提交视频前请调整该镜时长、台词或语速"
+                    + (
+                        "完整保留模式不会删改文字，请增加镜头时长、镜头数或提高口播档"
+                        if preserve_spoken_text
+                        else "提交视频前请调整该镜时长、台词或语速"
+                    )
                 )
         requested_targets = ["seedance"] if prompt_targets is None else prompt_targets
         normalized_targets = [
@@ -1457,6 +1501,7 @@ class ProjectService:
         latest_project.storyboard_count_mode = "ai" if count_mode == "ai" else "manual"
         latest_project.manual_shot_count = count if count_mode == "manual" else None
         latest_project.storyboard_warnings = storyboard_warnings
+        latest_project.brief.spoken_text_policy = SpokenTextPolicy(policy_value)
         latest_project.status = ProjectStatus.STORYBOARD_DRAFT
         latest_project.storyboard_version += 1
         self.store.save_project(latest_project)
@@ -1528,6 +1573,7 @@ class ProjectService:
         speech_cps = speech_pacing_characters_per_second(project.brief.speech_pacing)
         dialogue_rate_percent = dialogue_rate_percent_for_cps(speech_cps)
         short_ad = project.brief.speech_pacing.value == "short_ad"
+        preserve_spoken_text = self.should_preserve_spoken_text(project)
         source_rows = [
             {str(key): str(value or "").strip() for key, value in row.items()}
             for row in rows[:500]
@@ -1553,7 +1599,7 @@ class ProjectService:
 必须严格返回 {len(source_rows)} 行，顺序不变，不合并、不拆分、不新增分镜；客户已填写的值原样保留。
 每镜时长不超过 15 秒，全部时长适配目标成片 {project.brief.target_duration_seconds:g} 秒。
 项目口播节奏档为 {'抓眼快口播广告' if short_ad else '紧凑讲解' if project.brief.speech_pacing.value == 'brisk' else '自然口播'}，按每秒约 {speech_cps:g} 个有效中文字符规划；项目叙事节奏“{project.brief.pacing or '未填写'}”和交付备注“{project.brief.delivery_notes or '未填写'}”均为硬约束。
-{'客户表中的广告台词、产品名、数字、责任范围和行动号召必须逐字保留。' if short_ad else ''}
+{'客户表中所有对白、旁白、系统播报、画外音和内心独白等需配音文字必须逐字保留，只允许分配镜头和调整时长。' if preserve_spoken_text else ''}
 AI 只需返回这些字段：{ai_fields}。visual_prompt、keyframe_prompt、h3_prompt、seedance_prompt 由系统本地编译；客户表中若已有这些列，系统会原样保留。
 character_names 使用逗号分隔项目中已有角色名；generation_mode 只能是 auto、i2v、r2v。
 严格返回 JSON：{{"rows": [{{上述 AI 字段}}]}}。
@@ -1650,7 +1696,7 @@ character_names 使用逗号分隔项目中已有角色名；generation_mode 只
                 voice_events = [
                     VoiceEvent(
                         kind=voice_kind,
-                        speaker_id=speaker_id if voice_kind == "character" else None,
+                        speaker_id=speaker_id if voice_kind in {"character", "inner_monologue"} else None,
                         speaker_name=row.get("dialogue_speaker", ""),
                         text=row.get("dialogue", ""),
                         start_seconds=0.35,
@@ -1844,6 +1890,94 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             if character.character_id not in existing_ids:
                 character.character_id = existing_by_name.get(character.name)
         return draft
+
+    async def analyze_and_backfill_script_characters(
+        self,
+        project_id: str,
+        user_suggestions: str = "",
+    ) -> dict[str, object]:
+        """Identify the current script's cast and append only missing characters.
+
+        This is intentionally separate from ``analyze_brief``: the full brief
+        analysis is an editable replacement draft, while this operation is a
+        roster reconciliation. Existing character records, including empty
+        fields, references, voice IDs, and appearance profiles, are untouched.
+        """
+        project = self.require_project(project_id)
+        existing_payload = [
+            {
+                "character_id": character.id,
+                "name": character.name,
+                "description": character.description,
+                "wardrobe": character.wardrobe,
+                "voice_description": character.voice_description,
+            }
+            for character in project.characters
+        ]
+        prompt = f"""只分析下面这份当前剧本中的可辨认角色、动物、鬼魂、拟人角色和其他需要跨镜保持外观的主体，帮助补齐角色库。
+
+已有角色（只用于去重，绝对不要修改这些角色）：
+{json.dumps(existing_payload, ensure_ascii=False, indent=2)}
+
+用户补充要求：{user_suggestions.strip() or '无'}
+
+当前剧本：
+{project.brief.story}
+
+严格返回 JSON，不要 Markdown：
+{{"characters":[{{"character_id":"已有角色填其 ID；新角色填 null","name":"角色名","description":"根据剧本整理的固定外貌、年龄感、体型、发型或物种特征","wardrobe":"固定服装、配饰；动物填写项圈或无服装","voice_description":"声音、口音、语气；不说话填写无台词","reference_observations":"从剧本中识别该角色的依据"}}]}}
+
+必须覆盖剧本中会被清晰拍到、说话、执行动作或与主要角色互动的每个可辨认主体。已有角色即使资料不完整也只返回其原 character_id 供去重，不要用新描述覆盖已有记录。新角色才需要填写完整档案；纯远景不可辨认的群众不要建立角色。"""
+        provider = settings.BRIEF_ANALYSIS_PROVIDER
+        if provider == "auto":
+            provider = settings.LLM_PROVIDER
+        llm = create_llm_generator(provider)
+        payload = await llm.generate_json(
+            "你是影视角色档案整理师，只负责从当前剧本识别角色并补足缺失角色，不改写已有角色。",
+            prompt,
+        )
+        normalized = _normalize_project_analysis_payload(payload, 1)
+        latest = self.require_project(project_id)
+        existing_by_id = {character.id: character for character in latest.characters}
+        existing_by_name = {
+            character.name.strip().casefold(): character
+            for character in latest.characters
+            if character.name.strip()
+        }
+        added: list[CharacterProfile] = []
+        seen_names = set(existing_by_name)
+        for item in normalized.get("characters", []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            character_id = str(item.get("character_id") or "").strip()
+            name_key = name.casefold()
+            if character_id in existing_by_id or name_key in seen_names:
+                continue
+            character = CharacterProfile(
+                name=name,
+                description=str(item.get("description") or "").strip(),
+                wardrobe=str(item.get("wardrobe") or "").strip(),
+                voice_description=str(item.get("voice_description") or "").strip(),
+            )
+            latest.characters.append(character)
+            added.append(character)
+            seen_names.add(name_key)
+        if added:
+            latest = self.store.save_project(latest)
+        return {
+            "project": latest,
+            "added_characters": added,
+            "added_count": len(added),
+            "existing_count": len(latest.characters) - len(added),
+            "message": (
+                f"已从当前剧本补足 {len(added)} 个角色，已有角色资料保持不变"
+                if added
+                else "当前剧本中的角色均已在角色库，已有角色资料保持不变"
+            ),
+        }
 
     def _extract_style_frames(self, project_id: str, asset: Asset) -> list[str]:
         source = resolve_media_path(asset.path)
@@ -2208,10 +2342,56 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         profile.reference_asset_ids = list(dict.fromkeys([*profile.reference_asset_ids, asset.id]))
         profile.approved = True
         profile.reference_status = "completed"
+        profile.reference_source = "ai"
         profile.reference_error = ""
         profile.version += 1
         self.store.save_project(project)
         return asset
+
+    def attach_scene_profile_reference(
+        self,
+        project_id: str,
+        scene_profile_id: str,
+        asset_id: str,
+        *,
+        replace_existing: bool = True,
+    ) -> SceneProfile:
+        """Bind an existing still image to a scene profile without invoking AI."""
+        self.ensure_scene_reference_idle(scene_profile_id)
+        project, profile = self.require_scene_profile(project_id, scene_profile_id)
+        asset = self.store.get_asset(asset_id)
+        if asset is None or asset.project_id != project_id:
+            raise KeyError("Scene reference asset not found")
+        if asset.type != AssetType.IMAGE:
+            raise ValueError("场景母版图必须是图片文件")
+        if replace_existing:
+            profile.reference_asset_ids = [asset.id]
+        else:
+            profile.reference_asset_ids = list(dict.fromkeys([*profile.reference_asset_ids, asset.id]))
+        profile.approved = True
+        profile.reference_status = "completed"
+        profile.reference_source = "upload"
+        profile.reference_error = ""
+        profile.reference_run_id = ""
+        profile.reference_generation_prompt = ""
+        profile.version += 1
+        self.store.save_project(project)
+        return profile
+
+    def clear_scene_profile_reference(self, project_id: str, scene_profile_id: str) -> SceneProfile:
+        """Remove scene-profile bindings while keeping uploaded/generated assets in the library."""
+        self.ensure_scene_reference_idle(scene_profile_id)
+        project, profile = self.require_scene_profile(project_id, scene_profile_id)
+        profile.reference_asset_ids = []
+        profile.approved = False
+        profile.reference_status = "idle"
+        profile.reference_source = "none"
+        profile.reference_error = ""
+        profile.reference_run_id = ""
+        profile.reference_generation_prompt = ""
+        profile.version += 1
+        self.store.save_project(project)
+        return profile
 
     async def generate_scene_reference(
         self,
@@ -3002,7 +3182,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 end = min(target, start + 0.5)
             speaker_id = event.speaker_id
             kind = event.kind
-            if kind == "character":
+            if kind in {"character", "inner_monologue"}:
                 # The model sometimes returns a correct speaker_name paired
                 # with the previous turn's speaker_id. The authored name is
                 # human-readable and wins whenever it resolves unambiguously;
@@ -3042,7 +3222,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 else speech_pacing_characters_per_second(project.brief.speech_pacing)
             ),
             preserve_spoken_text=(
-                project.brief.speech_pacing.value == "short_ad"
+                self.should_preserve_spoken_text(project)
                 if preserve_spoken_text is None
                 else preserve_spoken_text
             ),
@@ -3206,7 +3386,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             speaker_ids=[
                 shot.dialogue_speaker_id,
                 *(turn.speaker_id for turn in shot.dialogue_turns),
-                *(event.speaker_id for event in shot.voice_events if event.kind == "character"),
+                *(event.speaker_id for event in shot.voice_events if event.kind in {"character", "inner_monologue"}),
             ],
         )
         allowed = set(shot.character_ids)
@@ -3348,11 +3528,21 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         normalized = re.sub(r"[\s（）()【】\[\]：:]", "", (label or "")).casefold()
         if "系统" in normalized or "播报" in normalized:
             return "system_vo"
+        if "内心" in normalized or "心声" in normalized:
+            return "inner_monologue"
         if "旁白" in normalized:
             return "narration"
         if "画外音" in normalized or "广播" in normalized:
             return "offscreen"
         return "character"
+
+    @staticmethod
+    def should_preserve_spoken_text(project: Project) -> bool:
+        """Return the durable project-level text retention decision."""
+        return preserves_spoken_text(
+            project.brief.spoken_text_policy,
+            short_ad=getattr(project.brief.speech_pacing, "value", project.brief.speech_pacing) == "short_ad",
+        )
 
     @classmethod
     def _effective_voice_events(cls, shot: Shot) -> list[VoiceEvent]:
@@ -3367,10 +3557,12 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         return [
             VoiceEvent(
                 kind=voice_kind,
+                speaker_id=shot.dialogue_speaker_id if voice_kind == "inner_monologue" else None,
                 speaker_name={
                     "system_vo": "系统播报",
                     "narration": "旁白",
                     "offscreen": "画外音",
+                    "inner_monologue": "内心独白",
                 }.get(voice_kind, "画外音"),
                 text=cls.spoken_dialogue_text(shot.dialogue),
                 start_seconds=min(0.35, max(0.0, shot.duration_seconds - 0.5)),
@@ -3541,6 +3733,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             "system_vo": "冷静清晰的中性电子播报音，音高稳定、吐字精准、无真人口语感",
             "narration": "清晰自然的画外旁白，音色稳定、吐字从容、不过度表演",
             "offscreen": "与声音来源身份和场景距离一致的自然画外人声，音色全程稳定",
+            "inner_monologue": "贴近角色内心的克制独白声；画面人物不动嘴；音色沿用绑定角色",
         }.get(event.kind, "清晰自然且前后一致的画外人声")
 
     @classmethod
@@ -3625,6 +3818,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             ),
             "narration": "清楚自然的画外旁白；音色稳定；咬字从容；表演克制",
             "offscreen": "自然画外音；身份与现场距离符合来源；音色稳定",
+            "inner_monologue": "贴近角色内心的克制独白；沿用绑定角色音色；画面人物不动嘴",
         }.get(event.kind, "清楚自然、音色稳定的画外声音")
 
     @classmethod
@@ -3659,6 +3853,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 lip_rule = "画面人物不动嘴"
             elif event.kind == "narration":
                 source_role = "画外旁白"
+                lip_rule = "画面人物不动嘴"
+            elif event.kind == "inner_monologue":
+                source_role = "角色内心独白"
                 lip_rule = "画面人物不动嘴"
             else:
                 source_role = "画外对白"
@@ -4201,7 +4398,72 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         text = re.sub(r"\s+", " ", (value or "").strip())
         if len(text) <= limit:
             return text
-        return text[:limit].rsplit("。", 1)[0].rstrip("，；、 ") or text[:limit]
+        clipped = text[:limit]
+        # Prefer a complete Chinese clause when compacting long AI-generated
+        # descriptions; this also avoids cutting a safety rule in half.
+        cut_positions = [clipped.rfind(mark) for mark in ("。", "；", "，")]
+        cut = max(cut_positions)
+        return clipped[:cut].rstrip("，；、 ") if cut > 0 else clipped
+
+    def seedance_global_constraint_text(self, project: Project) -> str:
+        """Return the durable series/episode rule used by every Seedance prompt."""
+        project_rule = (project.seedance_global_constraints or "").strip()
+        if project_rule:
+            return project_rule
+        if project.series_id:
+            series = self.store.get_series(project.series_id)
+            return (series.seedance_global_constraints or "").strip() if series else ""
+        return ""
+
+    @staticmethod
+    def _seedance_constraint_block(prompt: str) -> str:
+        """Read only the final authored constraint block from an old prompt."""
+        match = re.search(r"【约束】\s*(.*)", prompt or "", flags=re.S)
+        return match.group(1).strip() if match else ""
+
+    def _extract_seedance_user_constraints(
+        self,
+        prompt: str,
+        project: Project,
+    ) -> str:
+        """Keep additions made in the Prompt editor across recompilation.
+
+        Older shots only stored one large compiled string.  We therefore
+        remove the director's stable boilerplate from its final constraint
+        block and retain the remaining clauses as user-owned text.  This is
+        intentionally conservative: an authored safety rule is preferable to
+        silently losing a sentence on the next role/style refresh.
+        """
+        block = self._seedance_constraint_block(prompt)
+        if not block:
+            return ""
+        global_rule = self.seedance_global_constraint_text(project)
+        if global_rule:
+            block = block.replace(global_rule, "")
+        boilerplate_patterns = (
+            r"画面内不生成任何可读文字、汉字、字母、数字、字幕、标题、UI 文案、Logo、水印或乱码；所有信息文字统一后期叠加",
+            r"仅保留参考素材中已经清晰存在且用户锁定的文字，不新增或改写任何文字",
+            r"严格保持同一角色身份、脸型、发型、服装与人物数量",
+            r"禁止人物复制、融合、重影、畸形肢体、身份互换、说话人错位和重复台词",
+            r"每个时间段只执行该段指定的一个主体动作和一种主要运镜，段与段之间连续衔接",
+        )
+        for pattern in boilerplate_patterns:
+            block = re.sub(pattern, "", block)
+        block = re.sub(r"(?:系列强制执行|用户本镜补充)：", "", block)
+        block = re.sub(r"[；。]+", "；", block).strip(" ；。\n")
+        return self._compact_prompt_text(block, 600)
+
+    def _seedance_character_forced_traits(self, project: Project, character_name: str) -> str:
+        """Put the two high-priority series rules before long character prose."""
+        global_rule = self.seedance_global_constraint_text(project)
+        if not global_rule:
+            return ""
+        traits: list[str] = []
+        if re.search(r"安全帽|头盔", global_rule):
+            traits.append("全程佩戴蓝色安全帽并系好下颌带")
+        if character_name.strip() == "林晓" and re.search(r"头发|发丝|头发丝", global_rule):
+            traits.append("头发全部收进安全帽内，帽外不得露发")
+        return "；".join(traits)
 
     def _compact_subject_motion(self, shot: Shot) -> str:
         """Keep concrete shot actions while removing generic contradictory beats."""
@@ -4680,6 +4942,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         return None
 
     def compile_seedance_prompt(self, project: Project, shot: Shot, assets: list[Asset]) -> str:
+        global_constraints = self.seedance_global_constraint_text(project)
         refs = self.seedance_reference_assets(shot, assets, project)
         resolved_reference_mode = self.resolve_seedance_reference_mode(project, shot, assets)
         image_numbers: dict[str, int] = {}
@@ -4724,21 +4987,24 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 for asset_id in character_ref_ids
                 if asset_id in image_numbers
             ]
+            forced_traits = self._seedance_character_forced_traits(project, character.name)
             traits = self._compact_prompt_text(
-                "，".join(
+                "；".join(
                     item
                     for item in [
+                        forced_traits,
                         appearance.time_context if appearance else "",
                         appearance.description if appearance else character.description,
                         appearance.wardrobe if appearance else character.wardrobe,
                     ]
                     if item
                 ),
-                180,
+                110,
             )
             if strict_first_frame:
                 definitions.append(
                     f"@图片1中的人物“{character.name}”保持身份、脸型、发型、服装和配饰不变"
+                    + (f"；{forced_traits}" if forced_traits else "")
                 )
             elif pictures:
                 definitions.append(
@@ -4768,7 +5034,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 continue
             prop_details = self._compact_prompt_text(
                 asset.description or "严格按参考图保持外形、结构、材质与尺度",
-                360,
+                80,
             )
             definitions.append(
                 f"将@图片{image_numbers[asset.id]}中的固定物品定义为“{self._compact_prompt_text(asset.name, 64)}”："
@@ -4780,10 +5046,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             self.project_rendering_style_text(project)
             if scene_profiles
             else self.project_style_text(project),
-            180,
+            80,
         )
-        event = self._compact_prompt_text(shot.narrative or shot.scene_description, 220)
-        audio_design = self._compact_prompt_text(shot.audio_design, 160)
+        event = self._compact_prompt_text(shot.narrative or shot.scene_description, 90)
+        audio_design = self._compact_prompt_text(shot.audio_design, 60)
 
         visual_beats = shot.visual_beats or self._scale_visual_beats(
             [],
@@ -4796,8 +5062,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         )
         beat_lines: list[str] = []
         for beat in visual_beats:
-            action = self._compact_prompt_text(beat.subject_action, 180)
-            environment = self._compact_prompt_text(beat.environment_action, 100)
+            action = self._compact_prompt_text(beat.subject_action, 70)
+            environment = self._compact_prompt_text(beat.environment_action, 40)
             camera = "，".join(
                 item
                 for item in [
@@ -4814,7 +5080,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     f"主体：{action}" if action else "",
                     f"环境：{environment}" if environment else "",
                     f"镜头：{camera}" if camera else "",
-                    f"声音卡点：{self._compact_prompt_text(beat.sound_cue, 80)}" if beat.sound_cue else "",
+                    f"声音卡点：{self._compact_prompt_text(beat.sound_cue, 40)}" if beat.sound_cue else "",
                 ]
                 if item
             )
@@ -4829,7 +5095,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         )
         if effective_voice_events:
             for voice in effective_voice_events:
-                text = self._compact_prompt_text(self.spoken_dialogue_text(voice.text), 180)
+                spoken_text = self.spoken_dialogue_text(voice.text)
+                text = spoken_text if self.should_preserve_spoken_text(project) else self._compact_prompt_text(spoken_text, 100)
                 if not text:
                     continue
                 speaker = next(
@@ -4837,8 +5104,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     None,
                 )
                 timing = f"{voice.start_seconds:.2f}–{voice.end_seconds:.2f}秒"
-                if voice.kind == "character" and speaker:
-                    lip_rule = "自然口型同步" if voice.lip_sync else "声音出现但不强调口型"
+                if voice.kind in {"character", "inner_monologue"} and speaker:
+                    lip_rule = "自然口型同步" if voice.kind == "character" and voice.lip_sync else "声音出现但画面人物不动嘴"
                     voice_anchor = self.character_voice_anchor(speaker)
                     voice_lines.append(
                         f"{timing}，唯一发言者“{speaker.name}”说：“{text}”，{lip_rule}；"
@@ -4850,6 +5117,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                         "system_vo": "系统播报",
                         "narration": "旁白",
                         "offscreen": "画外音",
+                        "inner_monologue": "角色内心独白",
                     }
                     source = source_names.get(voice.kind, voice.speaker_name or "画外音")
                     voice_anchor = self._voice_anchor_for_event(project, voice)
@@ -4915,7 +5183,17 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 "所有信息文字统一后期叠加"
             )
 
+        system_constraints = (
+            f"{text_constraint}；严格保持同一角色身份、脸型、发型、服装与人物数量；"
+            "禁止人物复制、融合、重影、畸形肢体、身份互换、说话人错位和重复台词；"
+            "每个时间段只执行该段指定的一个主体动作和一种主要运镜，段与段之间连续衔接"
+        )
+        user_constraints = self._compact_prompt_text(
+            shot.seedance_prompt_user_constraints,
+            600,
+        )
         parts = [
+            f"【系列强制约束】{global_constraints}" if global_constraints else "",
             "【素材定义】" + "；".join(definitions) if definitions else "",
             "【可用素材】" + "；".join(manifests) if manifests else "",
             "【参考要求】" + "；".join(reference_instructions) if reference_instructions else "",
@@ -4924,11 +5202,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             "【逐段时间轴】\n" + "\n".join(beat_lines),
             f"【对白与声音】{'；'.join(voice_lines)}。{audio_design or '生成与画面动作同步的清晰环境声'}" if voice_lines else f"【声音】无对白；{audio_design or '生成与画面动作同步的克制环境声'}",
             f"【视觉风格与画质】{style or '延续项目统一风格'}；主体清晰，动作可读，人物五官与肢体稳定",
-            (
-                "【约束】" + text_constraint + "；严格保持同一角色身份、脸型、发型、服装与人物数量；"
-                "禁止人物复制、融合、重影、畸形肢体、身份互换、说话人错位和重复台词；"
-                "每个时间段只执行该段指定的一个主体动作和一种主要运镜，段与段之间连续衔接"
-            ),
+            "【约束】" + system_constraints
+            + (f"；系列强制执行：{global_constraints}" if global_constraints else "")
+            + (f"；用户本镜补充：{user_constraints}" if user_constraints else ""),
         ]
         return "\n".join(part for part in parts if part).strip()
 
@@ -5022,9 +5298,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         return {"project_count": project_count, "shot_count": shot_count}
 
     @staticmethod
-    def _dialogue_text_tag(value: str) -> str:
+    def _dialogue_text_tag(value: str, *, preserve_spoken_text: bool = False) -> str:
         text = ProjectService.spoken_dialogue_text(value).strip()
-        if text and text[-1] not in "。！？.!?":
+        if text and not preserve_spoken_text and text[-1] not in "。！？.!?":
             text += "。"
         return f"<d>[Chinese] {text}</d>"
 
@@ -5096,7 +5372,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             shot.duration_seconds,
         )
         character_voice_events = [
-            event for event in effective_voice_events if event.kind == "character" and event.speaker_id
+            event for event in effective_voice_events if event.kind in {"character", "inner_monologue"} and event.speaker_id
         ]
         dialogue_audio_bound = bool(
             mode == GenerationMode.R2V
@@ -5116,7 +5392,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         if effective_voice_events:
             voice_parts: list[str] = []
             for event in effective_voice_events:
-                spoken = self._compact_prompt_text(self.spoken_dialogue_text(event.text), 160)
+                spoken_text = self.spoken_dialogue_text(event.text)
+                spoken = spoken_text if self.should_preserve_spoken_text(project) else self._compact_prompt_text(spoken_text, 160)
                 if not spoken:
                     continue
                 timing = f"{event.start_seconds:.2f}-{event.end_seconds:.2f}秒"
@@ -5124,9 +5401,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     (item for item in project.characters if item.id == event.speaker_id),
                     None,
                 )
-                if event.kind == "character" and speaker:
-                    speech = "由<Audio 1>提供唯一对白" if dialogue_audio_bound else f"说{self._dialogue_text_tag(spoken)}"
-                    lip_rule = "自然口型同步" if event.lip_sync else "不强调口型"
+                if event.kind in {"character", "inner_monologue"} and speaker:
+                    speech = "由<Audio 1>提供唯一对白" if dialogue_audio_bound else f"说{self._dialogue_text_tag(spoken, preserve_spoken_text=self.should_preserve_spoken_text(project))}"
+                    lip_rule = "自然口型同步" if event.kind == "character" and event.lip_sync else "画面人物不动嘴"
                     voice_direction = self.h3_voice_direction_english(project, event)
                     non_speakers = [
                         item.name
@@ -5144,10 +5421,11 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                         "system_vo": "系统播报",
                         "narration": "旁白",
                         "offscreen": "画外音",
+                        "inner_monologue": "角色内心独白",
                     }.get(event.kind, event.speaker_name or "画外音")
                     voice_direction = self.h3_voice_direction_english(project, event)
                     voice_parts.append(
-                        f"{timing}，{source}说{self._dialogue_text_tag(spoken)}；"
+                        f"{timing}，{source}说{self._dialogue_text_tag(spoken, preserve_spoken_text=self.should_preserve_spoken_text(project))}；"
                         f"声音表演说明（非口播）：{voice_direction}；"
                         "声音来自画外，画面人物均不张嘴、不做口型"
                     )
@@ -5177,7 +5455,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                         shot.dialogue,
                     )
                 speaker = next((item for item in project.characters if item.id == shot.dialogue_speaker_id), None)
-                spoken = self._compact_prompt_text(self.spoken_dialogue_text(shot.dialogue), 220)
+                spoken_text = self.spoken_dialogue_text(shot.dialogue)
+                spoken = spoken_text if self.should_preserve_spoken_text(project) else self._compact_prompt_text(spoken_text, 220)
                 if speaker:
                     non_speakers = [
                         item.name
@@ -5200,7 +5479,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                             f"{silence_rule}；单人声、口型同步、无抢话、无角色互换、无回声、无爆音、无背景音乐"
                         )
                     else:
-                        dialogue_tag = self._dialogue_text_tag(spoken)
+                        dialogue_tag = self._dialogue_text_tag(
+                            spoken,
+                            preserve_spoken_text=self.should_preserve_spoken_text(project),
+                        )
                         audio = (
                             f"对白表演：唯一发言者明确为{speaker.name} (S1){voice}，"
                             f"只由{speaker.name} (S1) 嘴唇自然张合并说 {dialogue_tag}；"
@@ -5317,7 +5599,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             if reserves_dialogue_audio and speaker:
                 subject_number = subject_numbers.get(speaker.id)
                 speaker_label = f"<Subject {subject_number}> (S1)" if subject_number else f"{speaker.name} (S1)"
-                dialogue_tag = self._dialogue_text_tag(shot.dialogue)
+                dialogue_tag = self._dialogue_text_tag(
+                    shot.dialogue,
+                    preserve_spoken_text=self.should_preserve_spoken_text(project),
+                )
                 voice_direction = self.h3_character_voice_direction_english(speaker)
                 dialogue_binding = (
                     f"<Audio 1>是直接复用给{speaker_label}的干净中文对白轨。声音表演说明（非口播）："
@@ -5553,7 +5838,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     shot.duration_seconds,
                     shot.duration_seconds,
                     characters_per_second=h3_speech_characters_per_second(shot.dialogue_rate_percent),
-                    preserve_spoken_text=project.brief.speech_pacing.value == "short_ad",
+                    preserve_spoken_text=self.should_preserve_spoken_text(project),
                 ),
             )
         events = self._resolve_voice_events(
@@ -5562,14 +5847,14 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             shot.duration_seconds,
             shot.duration_seconds,
             characters_per_second=h3_speech_characters_per_second(shot.dialogue_rate_percent),
-            preserve_spoken_text=project.brief.speech_pacing.value == "short_ad",
+                    preserve_spoken_text=self.should_preserve_spoken_text(project),
         )
         if not events:
             return "", None, []
         source_keys = {
             (
                 event.kind,
-                event.speaker_id if event.kind == "character" else (event.speaker_name or event.kind),
+                event.speaker_id if event.kind in {"character", "inner_monologue"} else (event.speaker_name or event.kind),
             )
             for event in events
         }
@@ -5580,7 +5865,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             for value in (self.spoken_dialogue_text(event.text) for event in events)
             if value
         )
-        speaker_id = events[0].speaker_id if events[0].kind == "character" else None
+        speaker_id = events[0].speaker_id if events[0].kind in {"character", "inner_monologue"} else None
         return text, speaker_id, events
 
     def h3_segment_plan(
@@ -5684,9 +5969,18 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 segment.dialogue_speaker_id = turn.get("speaker_id")
                 segment.dialogue_turns = [DialogueTurn.model_validate(turn)]
                 segment.visual_beats = []
+                turn_kind = next(
+                    (
+                        event.kind
+                        for event in shot.voice_events
+                        if event.text == str(turn["text"])
+                        and event.speaker_id == turn.get("speaker_id")
+                    ),
+                    "character" if turn.get("speaker_id") else "narration",
+                )
                 segment.voice_events = [
                     VoiceEvent(
-                        kind="character" if turn.get("speaker_id") else "narration",
+                        kind=turn_kind,
                         speaker_id=turn.get("speaker_id"),
                         speaker_name=next(
                             (item.name for item in project.characters if item.id == turn.get("speaker_id")),
@@ -5698,7 +5992,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                             generation_duration,
                             max(0.7, estimated_spoken_seconds(turn["text"], 0.25)),
                         ),
-                        lip_sync=bool(turn.get("speaker_id")),
+                        lip_sync=turn_kind == "character" and bool(turn.get("speaker_id")),
                     )
                 ]
                 speaker = next((item for item in project.characters if item.id == turn.get("speaker_id")), None)
@@ -5997,6 +6291,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             raise ValueError("Shot project mismatch")
         if incoming.version != existing.version:
             raise ShotVersionConflictError("本镜已有新的保存结果，已阻止旧页面覆盖。请刷新后再编辑保存。")
+        requested_seedance_user_constraints = incoming.seedance_prompt_user_constraints.strip()
         known_scene_ids = {profile.id for profile in project.scene_profiles}
         incoming.scene_profile_ids = [
             profile_id
@@ -6041,6 +6336,9 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         incoming.video_path = existing.video_path
         incoming.last_frame_asset_id = existing.last_frame_asset_id
         incoming.video_status = existing.video_status
+        # This small field is the durable home for sentences manually added
+        # to the otherwise compiled Seedance Prompt.
+        incoming.seedance_prompt_user_constraints = existing.seedance_prompt_user_constraints
         self.synchronize_shot_cast(project, incoming)
         content_changed = self._shot_content_signature(existing) != self._shot_content_signature(incoming)
         seedance_reference_mode_changed = (
@@ -6049,6 +6347,27 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         keyframe_authored = incoming.keyframe_prompt != existing.keyframe_prompt
         h3_authored = incoming.video_prompt != existing.video_prompt
         seedance_authored = incoming.seedance_prompt != existing.seedance_prompt
+        if seedance_authored:
+            extracted = self._extract_seedance_user_constraints(incoming.seedance_prompt, project)
+            preserved = [
+                existing.seedance_prompt_user_constraints.strip(),
+                requested_seedance_user_constraints,
+                extracted.strip(),
+            ]
+            incoming.seedance_prompt_user_constraints = "；".join(
+                dict.fromkeys(item for item in preserved if item)
+            )
+        elif requested_seedance_user_constraints:
+            incoming.seedance_prompt_user_constraints = "；".join(
+                dict.fromkeys(
+                    item
+                    for item in (
+                        existing.seedance_prompt_user_constraints.strip(),
+                        requested_seedance_user_constraints,
+                    )
+                    if item
+                )
+            )
         if content_changed:
             incoming.content_revision = existing.content_revision + 1
             character_ids = self.keyframe_character_ids(project, incoming, incoming.scene_description)
@@ -6179,6 +6498,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         speech_cps = speech_pacing_characters_per_second(project.brief.speech_pacing)
         dialogue_rate_percent = dialogue_rate_percent_for_cps(speech_cps)
         short_ad = project.brief.speech_pacing.value == "short_ad"
+        preserve_spoken_text = self.should_preserve_spoken_text(project)
         speech_profile = "抓眼快口播广告" if short_ad else "紧凑讲解" if project.brief.speech_pacing.value == "brisk" else "自然口播"
         suggestions = user_suggestions.strip()
         if not suggestions:
@@ -6198,10 +6518,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
 原镜头：{json.dumps(shot.model_dump(mode='json'), ensure_ascii=False)}
 用户建议（最高优先级）：{suggestions}
 
-先根据重做后的信息量选择 2–15 秒的自然镜头时长，不得为了沿用原来的 {shot.duration_seconds:g} 秒而加入静止等待、重复表情或无新信息留白；也不得用过短时长挤掉必要台词。visual_beats 从 0 秒连续覆盖所选 duration_seconds，每 2–4 秒有新的可见变化；每段只含一个主动作和一种主要运镜。系统播报、旁白、画外音须作为非 character 的 voice_event 且 lip_sync=false。voice_events 是唯一声音时序来源，dialogue 留空；本项目使用 {speech_profile} 档，整镜可朗读文字按每秒约 {speech_cps:g} 个有效字符编排，声音事件不重叠。{'客户广告原文、产品名、数字、责任范围和行动号召必须逐字保留。' if short_ad else '只保留剧情确实需要的短反应和环境声。'}默认 text_policy=post_overlay。
+先根据重做后的信息量选择 2–15 秒的自然镜头时长，不得为了沿用原来的 {shot.duration_seconds:g} 秒而加入静止等待、重复表情或无新信息留白；也不得用过短时长挤掉必要台词。visual_beats 从 0 秒连续覆盖所选 duration_seconds，每 2–4 秒有新的可见变化；每段只含一个主动作和一种主要运镜。系统播报、旁白、画外音和内心独白须作为非 character 的 voice_event 且 lip_sync=false。voice_events 是唯一声音时序来源，dialogue 留空；本项目使用 {speech_profile} 档，整镜可朗读文字按每秒约 {speech_cps:g} 个有效字符编排，声音事件不重叠。{'所有需配音文字必须逐字保留，只允许拆句、分配镜头和调整时长；不得删词、改写、概括或合并。' if preserve_spoken_text else '只保留剧情确实需要的短反应和环境声。'}默认 text_policy=post_overlay。
 
 严格返回紧凑 JSON（不要输出 visual_prompt、keyframe_prompt、motion_prompt 等系统本地编译字段）：
-{{"duration_seconds":8,"event":"本镜完整事件","opening_state":"0 秒静态起始状态","dialogue":"","dialogue_speaker":"","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","visual_beats":[{{"start_seconds":0,"end_seconds":3,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[{{"kind":"character/system_vo/narration/offscreen","speaker_name":"","text":"","start_seconds":0.5,"end_seconds":3.5,"lip_sync":false}}],"text_policy":"post_overlay"}}""",
+{{"duration_seconds":8,"event":"本镜完整事件","opening_state":"0 秒静态起始状态","dialogue":"","dialogue_speaker":"","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","visual_beats":[{{"start_seconds":0,"end_seconds":3,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[{{"kind":"character/system_vo/narration/offscreen/inner_monologue","speaker_name":"","text":"","start_seconds":0.5,"end_seconds":3.5,"lip_sync":false}}],"text_policy":"post_overlay"}}""",
         )
         original_duration = shot.duration_seconds
         try:
@@ -6323,7 +6643,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             parsed_voice_events = [
                 VoiceEvent(
                     kind=kind,
-                    speaker_id=speaker_id if kind == "character" else None,
+                    speaker_id=speaker_id if kind in {"character", "inner_monologue"} else None,
                     speaker_name=speaker_label,
                     text=shot.dialogue,
                     start_seconds=0.35,
@@ -6347,7 +6667,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             shot.duration_seconds,
             shot.duration_seconds,
             characters_per_second=speech_cps,
-            preserve_spoken_text=short_ad,
+            preserve_spoken_text=preserve_spoken_text,
         )
         text_policy = str(payload.get("text_policy") or "post_overlay")
         shot.text_policy = text_policy if text_policy in {"none", "post_overlay", "reference_locked"} else "post_overlay"
@@ -6388,6 +6708,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         source = self.require_shot(shot_id)
         speech_cps = speech_pacing_characters_per_second(project.brief.speech_pacing)
         short_ad = project.brief.speech_pacing.value == "short_ad"
+        preserve_spoken_text = self.should_preserve_spoken_text(project)
         if source.project_id != project_id:
             raise KeyError("Shot not found")
         source_version = source.version
@@ -6437,7 +6758,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
 4. visual_beats 从 0 秒无缝覆盖到该镜结尾；voice_events 是唯一声音时序来源。
 5. scene_profile_name 优先逐字使用已有场景档案名称；确有新场景时才填新名称和档案说明。
 6. character_names 只列画面中真正出现的已有角色。
-7. 本项目声音按每秒约 {speech_cps:g} 个有效中文字符分配；{'原镜的客户广告口播、产品名、数字、责任范围和行动号召必须逐字保留，只调整断句和分镜。' if short_ad else '让声音与镜头时长自然匹配。'}
+7. 本项目声音按每秒约 {speech_cps:g} 个有效中文字符分配；{'原镜中所有需配音文字必须逐字保留，只调整断句、分镜和时长。' if preserve_spoken_text else '让声音与镜头时长自然匹配。'}
 
 严格返回：
 {{"rationale":"拆分依据","segments":[{{"title":"","duration_seconds":4,"narrative":"","dialogue":"","scene_description":"","scene_profile_name":"","scene_profile_description":"","scene_continuity_notes":"","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","subject_motion":"","transition":"硬切","audio_design":"","visual_beats":[{{"start_seconds":0,"end_seconds":4,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[],"text_policy":"post_overlay"}}]}}""",
@@ -6494,6 +6815,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 voices,
                 max((event.end_seconds for event in voices), default=duration),
                 duration,
+                characters_per_second=speech_cps,
+                preserve_spoken_text=preserve_spoken_text,
             )
             policy = str(raw.get("text_policy") or source.text_policy)
             if policy not in {"none", "post_overlay", "reference_locked"}:
@@ -6606,8 +6929,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 segment.voice_events,
                 source_voice_duration,
                 duration,
+                characters_per_second=speech_pacing_characters_per_second(project.brief.speech_pacing),
+                preserve_spoken_text=self.should_preserve_spoken_text(project),
             )
-            speaker_ids = [event.speaker_id for event in voices if event.kind == "character" and event.speaker_id]
+            speaker_ids = [event.speaker_id for event in voices if event.kind in {"character", "inner_monologue"} and event.speaker_id]
             character_ids = self.resolve_character_ids(
                 project,
                 segment.title,
@@ -6699,7 +7024,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             shot.dialogue_turns = [
                 DialogueTurn(speaker_id=event.speaker_id, text=event.text)
                 for event in voices
-                if event.kind == "character" and event.text.strip()
+                if event.kind in {"character", "inner_monologue"} and event.text.strip()
             ]
             self.synchronize_shot_cast(project, shot)
             shot.visual_prompt = self.compile_visual_prompt(
@@ -6778,6 +7103,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         project = self.require_project(project_id)
         speech_cps = speech_pacing_characters_per_second(project.brief.speech_pacing)
         short_ad = project.brief.speech_pacing.value == "short_ad"
+        preserve_spoken_text = self.should_preserve_spoken_text(project)
         suggestions = user_suggestions.strip()
         if not suggestions:
             raise ValueError("请填写新增镜头的剧情和画面要求")
@@ -6827,7 +7153,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
 4. 已有场景档案能覆盖画面时，scene_profile_name 必须逐字选择其名称；新场景则填写一个简洁的新场景名称，并给出 scene_profile_description 和 scene_continuity_notes，避免套用其他空间的灯光与陈设。
 5. character_names 只列真正出现在画面中的既有角色；无名群演不要伪造成主角。
 6. voice_events 是唯一声音时序来源；无对白就返回空数组。默认 text_policy=post_overlay。
-7. 口播按项目每秒约 {speech_cps:g} 个有效中文字符编排；{'广告原文、产品名、数字、责任范围和行动号召逐字保留。' if short_ad else '保留必要的反应与环境声空间。'}
+7. 口播按项目每秒约 {speech_cps:g} 个有效中文字符编排；{'所有需配音文字（对白、旁白、系统播报、画外音、内心独白）逐字保留，只调整分配和时长。' if preserve_spoken_text else '保留必要的反应与环境声空间。'}
 
 严格返回紧凑 JSON，不要 Markdown，也不要输出系统本地编译的 Prompt：
 {{"title":"","duration_seconds":8,"event":"","opening_state":"","scene_profile_name":"","scene_profile_description":"新场景的固定空间、专属色彩与光影；已有场景留空","scene_continuity_notes":"后续机位变化仍需保持的布局、陈设和光线；已有场景留空","character_names":[],"shot_size":"","camera_angle":"","lens":"","camera_motion":"","subject_motion":"","transition":"硬切","audio_design":"","visual_beats":[{{"start_seconds":0,"end_seconds":3,"purpose":"","subject_action":"","environment_action":"","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}}],"voice_events":[],"text_policy":"post_overlay"}}""",
@@ -6897,7 +7223,14 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                     parsed_voices.append(VoiceEvent.model_validate(item))
                 except Exception:
                     continue
-        shot.voice_events = self._resolve_voice_events(project, parsed_voices, duration, duration)
+        shot.voice_events = self._resolve_voice_events(
+            project,
+            parsed_voices,
+            duration,
+            duration,
+            characters_per_second=speech_cps,
+            preserve_spoken_text=preserve_spoken_text,
+        )
         policy = str(payload.get("text_policy") or "post_overlay")
         shot.text_policy = policy if policy in {"none", "post_overlay", "reference_locked"} else "post_overlay"
 
@@ -6980,6 +7313,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
     ) -> list[Shot]:
         """Generate and persist H3 prompts with the official prompt schema plus a style Skill."""
         project = self.require_project(project_id)
+        preserve_spoken_text = self.should_preserve_spoken_text(project)
         skill = get_h3_prompt_skill(skill_id)
         all_shots = self.store.list_shots(project_id)
         shot_map = {shot.id: shot for shot in all_shots}
@@ -7023,11 +7357,11 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 shot.duration_seconds,
                 shot.duration_seconds,
                 characters_per_second=h3_speech_characters_per_second(shot.dialogue_rate_percent),
-                preserve_spoken_text=project.brief.speech_pacing.value == "short_ad",
+                preserve_spoken_text=self.should_preserve_spoken_text(project),
             )
             if effective_voice_events:
                 shot.voice_events = effective_voice_events
-                if all(event.kind != "character" for event in effective_voice_events):
+                if all(event.kind not in {"character", "inner_monologue"} for event in effective_voice_events):
                     shot.dialogue_speaker_id = None
                     shot.dialogue_turns = []
             shot_map[shot_id] = self.store.save_shot(shot)
@@ -7065,7 +7399,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             counters = {AssetType.IMAGE: 0, AssetType.VIDEO: 0, AssetType.AUDIO: 0}
             reference_manifest: list[str] = []
             has_character_voice = any(
-                event.kind == "character" and event.speaker_id for event in shot.voice_events
+                event.kind in {"character", "inner_monologue"} and event.speaker_id for event in shot.voice_events
             )
             if mode == GenerationMode.R2V and shot.dialogue.strip() and (not shot.voice_events or has_character_voice):
                 counters[AssetType.AUDIO] = 1
@@ -7126,7 +7460,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 shot.duration_seconds,
                 shot.duration_seconds,
                 characters_per_second=speech_cps,
-                preserve_spoken_text=project.brief.speech_pacing.value == "short_ad",
+                preserve_spoken_text=self.should_preserve_spoken_text(project),
             )
             for event in effective_voice_events:
                 speaker = next(
@@ -7203,7 +7537,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
 - 主体动作：{shot.subject_motion}
 - 精确对白或旁白：{shot.dialogue or '无'}
 - 口播节奏：{project.brief.speech_pacing.value}；目标约每秒{speech_cps:.1f}个有效中文字符；声音不得重叠
-- 口播硬预算：全部声音事件合计最多{speech_budget}个有效中文字符；{'逐字保留已确认广告口播，采用偏快但完全可懂的商业口播' if project.brief.speech_pacing.value == 'short_ad' else '保留开头与结尾反应或环境声空间'}
+- 口播硬预算：{'完整保留已确认的全部需配音文字，只允许拆分事件、分配镜头和调整时长' if preserve_spoken_text else f'全部声音事件合计最多{speech_budget}个有效中文字符；保留开头与结尾反应或环境声空间'}
 - 分段视觉时间轴：{json.dumps([beat.model_dump(mode='json') for beat in shot.visual_beats], ensure_ascii=False)}
 - 分段声音事件：{json.dumps([event.model_dump(mode='json') for event in shot.voice_events], ensure_ascii=False)}
 - 已确认声音锚点：{json.dumps(voice_anchor_manifest, ensure_ascii=False)}
@@ -7232,7 +7566,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             # interpreted by H3 as more dialogue. Remove legacy anchor blocks
             # and append a controlled Chinese, explicitly non-spoken contract.
             output = self.strip_h3_spoken_voice_metadata(output)
-            if project.brief.speech_pacing.value == "short_ad":
+            if preserve_spoken_text:
                 output = self.enforce_h3_exact_dialogue_tags(
                     output,
                     effective_voice_events,

@@ -47,6 +47,8 @@ export interface ProjectBrief {
     fps: number;
     language: string;
     speech_pacing: "natural" | "brisk" | "short_ad";
+    /** Whether generated voice text may be adapted or must remain verbatim. */
+    spoken_text_policy?: "adaptive" | "verbatim";
     visual_style: string;
     pacing: string;
     audience: string;
@@ -115,6 +117,7 @@ export interface ProductionSeries {
     name: string;
     description: string;
     speech_pacing: "natural" | "brisk" | "short_ad";
+    spoken_text_policy?: "adaptive" | "verbatim";
     aspect_ratio: string;
     width: number;
     height: number;
@@ -122,6 +125,7 @@ export interface ProductionSeries {
     style_bible: string;
     style_profile: StyleProfile | null;
     negative_prompt: string;
+    seedance_global_constraints: string;
     characters: CharacterProfile[];
     assets: SeriesAsset[];
     created_at: string;
@@ -139,6 +143,7 @@ export interface SceneProfile {
     version: number;
     reference_prompt: string;
     reference_status: "idle" | "generating" | "downloading" | "completed" | "download_failed" | "failed";
+    reference_source: "none" | "ai" | "upload";
     reference_error: string;
     reference_run_id: string;
     reference_generation_prompt: string;
@@ -150,6 +155,7 @@ export interface Project {
     brief: ProjectBrief;
     style_bible: string;
     style_profile: StyleProfile | null;
+    seedance_global_constraints: string;
     scene_consistency_mode: "off" | "optional" | "strict";
     scene_profiles: SceneProfile[];
     preferred_prompt_targets: ("h3" | "seedance")[];
@@ -274,7 +280,7 @@ export interface VisualBeat {
 }
 
 export interface VoiceEvent {
-    kind: "character" | "system_vo" | "narration" | "offscreen";
+    kind: "character" | "system_vo" | "narration" | "offscreen" | "inner_monologue";
     speaker_id: string | null;
     speaker_name: string;
     text: string;
@@ -356,6 +362,7 @@ export interface Shot {
     h3_director_version: string;
     h3_prompt_skill_output: string;
     seedance_prompt: string;
+    seedance_prompt_user_constraints: string;
     seedance_prompt_version: string;
     content_revision: number;
     keyframe_prompt_source_revision: number;

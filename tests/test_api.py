@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import io
 import tempfile
 import unittest
@@ -8,9 +9,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
-from src.video_workflow.domain import Asset, AssetRole, AssetType, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, ScriptDurationAssessment, Shot, ShotContinuityMode, StyleProfile
+from src.video_workflow.domain import Asset, AssetRole, AssetType, Delivery, JobStatus, JobType, ProjectBrief, RenderJob, SceneProfile, ScriptDurationAssessment, Shot, ShotContinuityMode, StyleProfile, VoiceEvent
 from src.video_workflow.server.app import app
 from src.video_workflow.server.routers import projects as router
 from src.video_workflow.services.finalize import Finalizer
@@ -130,6 +131,67 @@ class ProjectApiTests(unittest.TestCase):
             self.assertEqual(failed.status_code, 502)
             self.assertIn("下载失败", failed.json()["detail"])
         self.assertEqual(self.client.post(base + "/reference/retry-download").status_code, 400)
+
+    def test_script_character_backfill_route(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="角色补足接口", story="甲遇到乙"))
+        with patch.object(
+            router.project_service,
+            "analyze_and_backfill_script_characters",
+            new=AsyncMock(return_value={
+                "project": project,
+                "added_characters": [],
+                "added_count": 0,
+                "existing_count": 0,
+                "message": "当前剧本中的角色均已在角色库，已有角色资料保持不变",
+            }),
+        ) as analyze:
+            response = self.client.post(
+                f"/api/projects/{project.id}/characters/analyze-script",
+                json={"user_suggestions": "只补充缺少的角色"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["message"], "当前剧本中的角色均已在角色库，已有角色资料保持不变")
+        analyze.assert_awaited_once_with(project.id, "只补充缺少的角色")
+
+    def test_scene_reference_can_be_uploaded_and_cleared_without_ai(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="本地场景图", story="人物在客厅"))
+        profile = SceneProfile(name="客厅", description="固定窗户和木桌")
+        project.scene_profiles = [profile]
+        router.store.save_project(project)
+        base = f"/api/projects/{project.id}/scene-profiles/{profile.id}"
+
+        uploaded = self.client.post(
+            base + "/reference/upload",
+            files={"file": ("living-room.png", b"fake-png", "image/png")},
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        payload = uploaded.json()
+        self.assertEqual(payload["profile"]["reference_source"], "upload")
+        self.assertEqual(payload["profile"]["reference_status"], "completed")
+        self.assertTrue(payload["profile"]["approved"])
+        self.assertEqual(payload["profile"]["reference_asset_ids"], [payload["asset"]["id"]])
+        self.assertEqual(payload["asset"]["role"], "scene")
+        self.assertTrue(Path(payload["asset"]["path"]).is_file())
+        first_asset_path = payload["asset"]["path"]
+
+        replacement = self.client.post(
+            base + "/reference/upload",
+            files={"file": ("living-room-v2.webp", b"fake-webp", "image/webp")},
+        )
+        self.assertEqual(replacement.status_code, 200, replacement.text)
+        self.assertEqual(
+            replacement.json()["profile"]["reference_asset_ids"],
+            [replacement.json()["asset"]["id"]],
+        )
+        self.assertTrue(Path(first_asset_path).is_file())
+
+        cleared = self.client.delete(base + "/reference")
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(cleared.json()["reference_asset_ids"], [])
+        self.assertEqual(cleared.json()["reference_source"], "none")
+        self.assertFalse(cleared.json()["approved"])
+        self.assertTrue(Path(first_asset_path).is_file())
+        self.assertTrue(Path(replacement.json()["asset"]["path"]).is_file())
 
     def test_keyframe_prompt_patch_preserves_other_prompt_fields(self) -> None:
         project = self.client.post("/api/projects", json={"title": "首帧局部保存", "story": "人物开门"}).json()
@@ -582,6 +644,71 @@ class ProjectApiTests(unittest.TestCase):
         )
         self.assertEqual(empty.status_code, 400, empty.text)
         self.assertIn("没有可导出", empty.json()["detail"])
+
+    def test_storyboard_csv_exports_structured_voice_events_with_clear_speakers(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="对白导出", story="系统播报后角色回应"))
+        router.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="系统宣布规则，角色回应",
+            duration_seconds=8,
+            voice_events=[
+                VoiceEvent(
+                    kind="system_vo",
+                    speaker_name="系统",
+                    text="第一关开始。",
+                    start_seconds=0.5,
+                    end_seconds=2,
+                ),
+                VoiceEvent(
+                    kind="character",
+                    speaker_name="陆峥",
+                    text="立即停止作业。",
+                    start_seconds=2.2,
+                    end_seconds=4,
+                    lip_sync=True,
+                ),
+                VoiceEvent(
+                    kind="narration",
+                    speaker_name="陈野",
+                    text="众人终于意识到风险。",
+                    start_seconds=4.2,
+                    end_seconds=7,
+                ),
+            ],
+        ))
+        router.store.save_shot(Shot(
+            project_id=project.id,
+            ordinal=2,
+            narrative="旧分镜旁白",
+            dialogue="危险已经解除。",
+            duration_seconds=4,
+        ))
+
+        response = self.client.get(f"/api/projects/{project.id}/storyboard.csv")
+        self.assertEqual(response.status_code, 200, response.text)
+        rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
+        self.assertEqual(rows[0][3], "对白")
+        self.assertEqual(
+            rows[1][3],
+            "系统播报：第一关开始。\n陆峥：立即停止作业。\n陈野（旁白）：众人终于意识到风险。",
+        )
+        self.assertEqual(rows[2][3], "旁白（未指定角色）：危险已经解除。")
+
+        xlsx_response = self.client.get(f"/api/projects/{project.id}/storyboard.xlsx")
+        self.assertEqual(xlsx_response.status_code, 200, xlsx_response.text)
+        self.assertEqual(
+            xlsx_response.headers["content-type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        workbook = load_workbook(io.BytesIO(xlsx_response.content), data_only=True)
+        sheet = workbook["分镜表"]
+        self.assertEqual(sheet["D1"].value, "对白")
+        self.assertEqual(
+            sheet["D2"].value,
+            "系统播报：第一关开始。\n陆峥：立即停止作业。\n陈野（旁白）：众人终于意识到风险。",
+        )
+        self.assertEqual(sheet["D3"].value, "旁白（未指定角色）：危险已经解除。")
 
     def test_video_export_downloads_selected_completed_jobs_as_zip(self) -> None:
         project = router.project_service.create_project(ProjectBrief(title="视频批量导出", story="两个已完成视频"))

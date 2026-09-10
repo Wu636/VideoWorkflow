@@ -21,6 +21,16 @@ SPEECH_PACING_CHARACTERS_PER_SECOND = {
 }
 
 
+def preserves_spoken_text(policy: object, *, short_ad: bool = False) -> bool:
+    """Resolve the independent text-retention policy.
+
+    ``short_ad`` remains an implicit compatibility override for older projects;
+    new projects should use ``spoken_text_policy=\"verbatim\"`` explicitly.
+    """
+    value = getattr(policy, "value", policy)
+    return short_ad or str(value or "adaptive").strip().lower() == "verbatim"
+
+
 def spoken_character_count(value: str) -> int:
     """Count the characters that materially consume spoken time."""
     text = re.sub(r"[\s【】\[\]<>]", "", value or "")
@@ -192,49 +202,58 @@ def fit_voice_event_payloads(
     characters_per_second: float = SPEECH_CHARACTERS_PER_SECOND,
     preserve_spoken_text: bool = False,
 ) -> list[dict[str, Any]]:
-    """Fit timed voice events to a comfortable shot-level speech budget."""
+    """Fit timed voice events to a shot budget without rewriting verbatim text.
+
+    Adaptive mode may merge/compact events to stay within the comfortable
+    budget.  Verbatim mode only normalizes timing and leaves every authored
+    utterance and event entry intact.
+    """
     duration = max(0.25, float(duration_seconds))
     cleaned: list[dict[str, Any]] = []
     for event in events:
-        text = _clean_spoken_text(str(event.get("text") or ""))
-        if not text:
+        raw_text = str(event.get("text") or "")
+        # Verbatim mode keeps the authored utterance intact.  Adaptive mode
+        # retains the historical cleanup/normalization behavior.
+        text = raw_text if preserve_spoken_text else _clean_spoken_text(raw_text)
+        if not text.strip():
             continue
         cleaned.append({**event, "text": text})
     if not cleaned:
         return []
 
-    while len(cleaned) > 4:
-        merge_candidates = [
-            index
-            for index in range(len(cleaned) - 1)
-            if (
-                cleaned[index].get("kind"),
-                cleaned[index].get("speaker_id") or cleaned[index].get("speaker_name"),
+    if not preserve_spoken_text:
+        while len(cleaned) > 4:
+            merge_candidates = [
+                index
+                for index in range(len(cleaned) - 1)
+                if (
+                    cleaned[index].get("kind"),
+                    cleaned[index].get("speaker_id") or cleaned[index].get("speaker_name"),
+                )
+                == (
+                    cleaned[index + 1].get("kind"),
+                    cleaned[index + 1].get("speaker_id") or cleaned[index + 1].get("speaker_name"),
+                )
+            ]
+            if not merge_candidates:
+                break
+            index = min(
+                merge_candidates,
+                key=lambda item: spoken_character_count(str(cleaned[item]["text"]))
+                + spoken_character_count(str(cleaned[item + 1]["text"])),
             )
-            == (
-                cleaned[index + 1].get("kind"),
-                cleaned[index + 1].get("speaker_id") or cleaned[index + 1].get("speaker_name"),
-            )
-        ]
-        if not merge_candidates:
-            break
-        index = min(
-            merge_candidates,
-            key=lambda item: spoken_character_count(str(cleaned[item]["text"]))
-            + spoken_character_count(str(cleaned[item + 1]["text"])),
-        )
-        left = cleaned[index]
-        right = cleaned[index + 1]
-        separator = "" if str(left["text"]).endswith(("。", "！", "？", ".", "!", "?")) else "。"
-        try:
-            merged_end = max(float(left.get("end_seconds", 0.0)), float(right.get("end_seconds", 0.0)))
-        except (TypeError, ValueError):
-            merged_end = duration
-        cleaned[index:index + 2] = [{
-            **left,
-            "text": f"{left['text']}{separator}{right['text']}",
-            "end_seconds": merged_end,
-        }]
+            left = cleaned[index]
+            right = cleaned[index + 1]
+            separator = "" if str(left["text"]).endswith(("。", "！", "？", ".", "!", "?")) else "。"
+            try:
+                merged_end = max(float(left.get("end_seconds", 0.0)), float(right.get("end_seconds", 0.0)))
+            except (TypeError, ValueError):
+                merged_end = duration
+            cleaned[index:index + 2] = [{
+                **left,
+                "text": f"{left['text']}{separator}{right['text']}",
+                "end_seconds": merged_end,
+            }]
 
     total_budget = speech_budget_for_duration(duration, characters_per_second)
     source_texts = [str(event["text"]) for event in cleaned]

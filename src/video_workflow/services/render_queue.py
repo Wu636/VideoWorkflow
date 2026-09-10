@@ -347,9 +347,14 @@ class RenderQueue:
         if blockers:
             summary = "；".join(blockers[:8])
             suffix = f"；另有 {len(blockers) - 8} 镜" if len(blockers) > 8 else ""
+            speech_action = (
+                "完整保留模式不会删改音频文字，请增加镜头时长/镜头数或提高口播档后再提交"
+                if self.projects.should_preserve_spoken_text(project)
+                else "请按上述单镜提示补齐完整首帧，或调整台词、时长与口播节奏后再提交"
+            )
             raise ValueError(
                 f"高质量门禁已阻止提交：{summary}{suffix}。"
-                "请按上述单镜提示补齐完整首帧，或调整台词、时长与口播节奏后再提交；"
+                f"{speech_action}；"
                 "需要多素材自由重组时，在单镜参数中明确选择 R2V。"
             )
         for shot in planned_shots:
@@ -561,13 +566,25 @@ class RenderQueue:
             raise KeyError(f"Job not found: {job_id}")
         if job.status == JobStatus.QUEUED:
             job.status = JobStatus.CANCELLED
+            job.completed_at = utc_now()
+            job.error = "任务已取消"
         elif job.status in {JobStatus.SUBMITTING, JobStatus.RUNNING}:
+            # Persist the intent before the provider request so a concurrent
+            # poll/download cycle cannot turn a user cancellation into a
+            # completed candidate.
             job.status = JobStatus.CANCEL_REQUESTED
+            self.store.save_job(job)
             if job.prompt_id:
                 if job.provider == "ark_seedance":
                     await self.seedance_client.cancel(job.prompt_id)
                 elif job.provider == "comfyui_h3":
                     await self.client.cancel(job.prompt_id)
+            current = self.store.get_job(job.id) or job
+            if current.status == JobStatus.CANCEL_REQUESTED:
+                current.status = JobStatus.CANCELLED
+                current.completed_at = utc_now()
+                current.error = "任务已取消"
+                job = current
         self.store.save_job(job)
         if job.shot_id:
             shot = self.store.get_shot(job.shot_id)
@@ -591,7 +608,15 @@ class RenderQueue:
                 logger.exception("Render job %s failed", job.id)
                 job = self.store.get_job(job.id) or job
                 job.error = str(exc)
-                if isinstance(exc, httpx.TransportError) and job.status != JobStatus.CANCEL_REQUESTED:
+                if job.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}:
+                    # Cancellation is terminal even when the provider reports
+                    # a 404/transport error after the task has already gone.
+                    # Keep the local card cancelled instead of retrying or
+                    # turning it into a failure.
+                    job.status = JobStatus.CANCELLED
+                    job.completed_at = job.completed_at or utc_now()
+                    job.error = "任务已取消"
+                elif isinstance(exc, httpx.TransportError):
                     # Keep queued work durable while an on-demand GPU instance is off.
                     # Connectivity outages do not consume a model-generation retry.
                     job.attempt = max(0, job.attempt - 1)
@@ -604,8 +629,7 @@ class RenderQueue:
                     )
                     job.error = f"{service} 暂时不可连接，等待重试: {exc}"
                 elif (
-                    job.status != JobStatus.CANCEL_REQUESTED
-                    and job.attempt < job.max_attempts
+                    job.attempt < job.max_attempts
                     and not (job.provider == "ark_seedance" and not _is_transient_seedance_error(exc))
                 ):
                     job.status = JobStatus.QUEUED
@@ -1776,7 +1800,7 @@ class RenderQueue:
         result: dict[str, object] = {}
         while True:
             current = self.store.get_job(job.id) or job
-            if current.status == JobStatus.CANCEL_REQUESTED:
+            if current.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}:
                 await self.seedance_client.cancel(task_id)
                 current.status = JobStatus.CANCELLED
                 current.completed_at = utc_now()
@@ -1790,6 +1814,17 @@ class RenderQueue:
                 raise TimeoutError(f"Seedance 任务超过 {settings.SEEDANCE_JOB_TIMEOUT_SECONDS} 秒仍未完成")
             await asyncio.sleep(max(2.0, settings.SEEDANCE_POLL_INTERVAL_SECONDS))
             result = await self.seedance_client.get(task_id)
+            current = self.store.get_job(job.id) or current
+            if current.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}:
+                await self.seedance_client.cancel(task_id)
+                current.status = JobStatus.CANCELLED
+                current.completed_at = utc_now()
+                current.error = "任务已取消"
+                self.store.save_job(current)
+                shot = self.store.get_shot(shot.id) or shot
+                self._set_job_status_on_shot(shot, "cancelled")
+                self.store.save_shot(shot)
+                return
             status = str(result.get("status") or "").lower()
             if status == "succeeded":
                 break

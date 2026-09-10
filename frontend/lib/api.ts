@@ -61,8 +61,8 @@ export function projectInlineUrl(projectId: string, kind: "asset" | "job" | "del
     return `${projectDownloadUrl(projectId, kind, itemId)}?inline=true`;
 }
 
-export function storyboardCsvUrl(projectId: string) {
-    return `${API_BASE}/projects/${projectId}/storyboard.csv`;
+export function storyboardXlsxUrl(projectId: string) {
+    return `${API_BASE}/projects/${projectId}/storyboard.xlsx`;
 }
 
 export async function listProjects(): Promise<Project[]> {
@@ -88,6 +88,7 @@ function normalizeProjectBrief(brief: Partial<ProjectBrief> & Pick<ProjectBrief,
         fps: brief.fps || 24,
         language: brief.language || "zh-CN",
         speech_pacing: brief.speech_pacing || "natural",
+        spoken_text_policy: brief.spoken_text_policy || "adaptive",
         visual_style: brief.visual_style || "",
         pacing: brief.pacing || "",
         audience: brief.audience || "",
@@ -153,10 +154,11 @@ export async function generateStoryboard(
     userSuggestions = "",
     promptTargets?: ("h3" | "seedance")[],
     h3SkillId = "h3-prompt-writing",
+    spokenTextPolicy: "adaptive" | "verbatim" = "adaptive",
 ): Promise<{ shots: Shot[]; project: Project }> {
     return api(`/projects/${projectId}/storyboard/generate`, {
         method: "POST",
-        body: JSON.stringify({ shot_count: shotCount || null, count_mode: countMode, user_suggestions: userSuggestions, prompt_targets: promptTargets, h3_skill_id: h3SkillId }),
+        body: JSON.stringify({ shot_count: shotCount || null, count_mode: countMode, user_suggestions: userSuggestions, prompt_targets: promptTargets, h3_skill_id: h3SkillId, spoken_text_policy: spokenTextPolicy }),
     });
 }
 
@@ -211,6 +213,25 @@ export async function updateSceneProfile(projectId: string, profile: SceneProfil
 
 export async function retrySceneReferenceDownload(projectId: string, sceneProfileId: string): Promise<Asset> {
     return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference/retry-download`, { method: "POST" });
+}
+
+export async function uploadSceneProfileReference(
+    projectId: string,
+    sceneProfileId: string,
+    file: File,
+    replaceExisting = true,
+): Promise<{ asset: Asset; profile: SceneProfile }> {
+    const data = new FormData();
+    data.append("file", file);
+    data.append("replace_existing", String(replaceExisting));
+    return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference/upload`, {
+        method: "POST",
+        body: data,
+    });
+}
+
+export async function clearSceneProfileReference(projectId: string, sceneProfileId: string): Promise<SceneProfile> {
+    return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference`, { method: "DELETE" });
 }
 
 export async function generateSceneReference(projectId: string, sceneProfileId: string, prompt: string, expectedVersion: number): Promise<Asset> {
@@ -308,6 +329,21 @@ export async function importStoryboard(
 
 export async function analyzeProjectBrief(projectId: string): Promise<ProjectAnalysisDraft> {
     return api(`/projects/${projectId}/brief/analyze`, { method: "POST", body: "{}" });
+}
+
+export interface ScriptCharactersAnalyzeResult {
+    project: Project;
+    added_characters: CharacterProfile[];
+    added_count: number;
+    existing_count: number;
+    message: string;
+}
+
+export async function analyzeAndBackfillScriptCharacters(projectId: string, userSuggestions = ""): Promise<ScriptCharactersAnalyzeResult> {
+    return api(`/projects/${projectId}/characters/analyze-script`, {
+        method: "POST",
+        body: JSON.stringify({ user_suggestions: userSuggestions }),
+    });
 }
 
 export async function rewriteProjectScript(projectId: string, mode: "auto" | "expand" | "shorten", userSuggestions = ""): Promise<ScriptRewriteDraft> {

@@ -2,8 +2,8 @@
 
 /* eslint-disable @next/next/no-img-element */
 import { useState } from "react";
-import { FilePenLine, ImageIcon, Loader2, Maximize2, RefreshCw, Save, X } from "lucide-react";
-import { generateSceneReference, getSceneReferencePrompt, previewSceneReferencePrompt, projectInlineUrl, retrySceneReferenceDownload, updateSceneProfile } from "@/lib/api";
+import { FilePenLine, ImageIcon, Loader2, Maximize2, RefreshCw, Save, Trash2, Upload, X } from "lucide-react";
+import { clearSceneProfileReference, generateSceneReference, getSceneReferencePrompt, previewSceneReferencePrompt, projectInlineUrl, retrySceneReferenceDownload, updateSceneProfile, uploadSceneProfileReference } from "@/lib/api";
 import type { Asset, SceneProfile } from "@/types";
 
 type Props = {
@@ -23,10 +23,14 @@ export default function SceneProfileCard({ projectId, profile, assets, ordinals,
     const [imageFailed, setImageFailed] = useState(false);
     const [imageRetry, setImageRetry] = useState(0);
     const taskKey = `scene-ref-${profile.id}`;
+    const uploadKey = `scene-upload-${profile.id}`;
+    const clearKey = `scene-clear-${profile.id}`;
     const saving = busy.has(`scene-save-${profile.id}`);
     const active = busy.has(taskKey) || ["generating", "downloading"].includes(profile.reference_status);
+    const uploading = busy.has(uploadKey);
+    const clearing = busy.has(clearKey);
     const asset = [...profile.reference_asset_ids].reverse().map((id) => assets.find((item) => item.id === id)).find((item) => item?.type === "image");
-    const status = profile.reference_status === "downloading" ? "服务商已出图，正在下载保存" : active ? "正在生成母版图" : profile.reference_status === "download_failed" ? "结果待取回" : profile.reference_status === "failed" ? "上次处理失败" : asset ? "母版图已保存" : "文字档案";
+    const status = profile.reference_status === "downloading" ? "服务商已出图，正在下载保存" : active ? "正在生成母版图" : profile.reference_status === "download_failed" ? "结果待取回" : profile.reference_status === "failed" ? "上次处理失败" : asset && profile.reference_source === "upload" ? "本地场景图已绑定" : asset ? "AI 母版图已保存" : "文字档案";
 
     const openEditor = () => void action(`scene-open-${profile.id}`, async () => {
         const result = await getSceneReferencePrompt(projectId, profile.id);
@@ -66,6 +70,15 @@ export default function SceneProfileCard({ projectId, profile, assets, ordinals,
         } finally { setRebuilding(false); }
     };
 
+    const upload = (file: File) => {
+        void action(uploadKey, () => uploadSceneProfileReference(projectId, profile.id, file, true), "本地场景图已上传并绑定；后续首帧与视频 Prompt 会优先使用这张图");
+    };
+
+    const clearReference = () => {
+        if (!asset || active || uploading || clearing) return;
+        void action(clearKey, () => clearSceneProfileReference(projectId, profile.id), "已清除场景档案的图片绑定；原文件仍保留在项目素材库");
+    };
+
     return <article className="overflow-hidden rounded-xl border border-white/8 bg-black/15">
         {asset ? <div className="relative aspect-video overflow-hidden bg-black/30">
             <button type="button" className="block h-full w-full" onClick={() => preview(asset)}>
@@ -74,7 +87,7 @@ export default function SceneProfileCard({ projectId, profile, assets, ordinals,
             </button>
             {imageFailed && <button className="studio-secondary absolute left-3 top-3 text-xs" onClick={() => { setImageFailed(false); setImageRetry((value) => value + 1); }}>图片加载失败，点击重新加载</button>}
         </div> : <div className="flex aspect-video items-center justify-center border-b border-dashed border-white/8 text-center text-sm leading-6 text-white/40">
-            <span>{active ? <Loader2 className="mx-auto mb-2 animate-spin text-cyan-200" /> : <ImageIcon className="mx-auto mb-2" />} {status}<br />{active ? "刷新页面后仍可查看进度" : profile.reference_status === "download_failed" ? "无需重复付费生图，请重试取回结果" : "编辑档案并确认 Prompt 后再生成"}</span>
+            <span>{active ? <Loader2 className="mx-auto mb-2 animate-spin text-cyan-200" /> : <ImageIcon className="mx-auto mb-2" />} {status}<br />{active ? "刷新页面后仍可查看进度" : profile.reference_status === "download_failed" ? "无需重复付费生图，请重试取回结果" : "可上传本地场景图，也可编辑档案后再调用 AI 生图"}</span>
         </div>}
         <div className="p-4">
             <div className="flex items-start justify-between gap-3"><strong className="text-sm">{profile.name}</strong><span className="studio-status">{status}</span></div>
@@ -83,8 +96,12 @@ export default function SceneProfileCard({ projectId, profile, assets, ordinals,
             <p className="mt-2 whitespace-pre-wrap text-xs leading-5 text-white/40">连续性规则：{profile.continuity_notes || "暂无规则"}</p>
             {profile.reference_error && <p role="alert" className="studio-error mt-3 break-words text-xs">{profile.reference_error}</p>}
             {profile.reference_status === "download_failed" && <button className="studio-primary mt-3 w-full text-xs" disabled={active} onClick={() => void action(taskKey, () => retrySceneReferenceDownload(projectId, profile.id), "已有生图结果已取回并保存，没有重新提交生成")}><RefreshCw size={14} />取回已有结果 · 不重新生图</button>}
+            <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                <label className="studio-secondary cursor-pointer justify-center text-xs"><input className="hidden" type="file" accept="image/png,image/jpeg,image/webp,image/bmp" disabled={active || uploading || clearing} onChange={(event) => { const file = event.target.files?.[0]; if (file) upload(file); event.target.value = ""; }} />{uploading ? <Loader2 className="animate-spin" size={14} /> : <Upload size={14} />}上传本地场景图</label>
+                {asset && <button type="button" className="studio-secondary justify-center text-xs" disabled={active || uploading || clearing} onClick={clearReference}>{clearing ? <Loader2 className="animate-spin" size={14} /> : <Trash2 size={14} />}清除图片绑定</button>}
+            </div>
             <button className="studio-secondary mt-4 w-full text-xs" disabled={active || busy.has(`scene-open-${profile.id}`)} onClick={openEditor}><FilePenLine size={14} />编辑档案 / 查看与修改生图 Prompt</button>
-            {asset && <p className="mt-2 text-[11px] text-white/30">修改档案或 Prompt 后，已生成的图片仍保留；确认后可另行生成新版。</p>}
+            {asset && <p className="mt-2 text-[11px] text-white/30">上传新图会替换当前场景档案绑定；旧文件仍保留在素材库。修改档案或 Prompt 后，已生成的图片也会保留。</p>}
         </div>
         {draft && <div className="studio-modal" onMouseDown={() => { if (!saving && !active && !rebuilding) setDraft(null); }}>
             <section className="studio-dialog max-w-3xl" style={{ maxHeight: "calc(100dvh - 2rem)", overflowY: "auto", marginBlock: 0 }} role="dialog" aria-modal="true" aria-label="编辑场景档案与母版图 Prompt" onMouseDown={(event) => event.stopPropagation()}>

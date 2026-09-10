@@ -120,6 +120,13 @@ class SpeechPacingPreset(str, Enum):
     SHORT_AD = "short_ad"
 
 
+class SpokenTextPolicy(str, Enum):
+    """Whether generated voice text may be rewritten to fit a shot budget."""
+
+    ADAPTIVE = "adaptive"
+    VERBATIM = "verbatim"
+
+
 class ProjectBrief(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     # Retained for backwards compatibility with older project records. New
@@ -134,6 +141,7 @@ class ProjectBrief(BaseModel):
     fps: float = Field(default=24.0, ge=1.0, le=120.0)
     language: str = "zh-CN"
     speech_pacing: SpeechPacingPreset = SpeechPacingPreset.NATURAL
+    spoken_text_policy: SpokenTextPolicy = SpokenTextPolicy.ADAPTIVE
     visual_style: str = ""
     pacing: str = ""
     audience: str = ""
@@ -200,6 +208,7 @@ class SceneProfile(BaseModel):
     version: int = Field(default=1, ge=1)
     reference_prompt: str = ""
     reference_status: Literal["idle", "generating", "downloading", "completed", "download_failed", "failed"] = "idle"
+    reference_source: Literal["none", "ai", "upload"] = "none"
     reference_error: str = ""
     reference_run_id: str = ""
     reference_generation_prompt: str = ""
@@ -229,6 +238,7 @@ class ProductionSeries(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
     speech_pacing: SpeechPacingPreset = SpeechPacingPreset.NATURAL
+    spoken_text_policy: SpokenTextPolicy = SpokenTextPolicy.ADAPTIVE
     aspect_ratio: str = "16:9"
     width: int = Field(default=1344, ge=32, le=4096)
     height: int = Field(default=768, ge=32, le=4096)
@@ -236,6 +246,10 @@ class ProductionSeries(BaseModel):
     style_bible: str = ""
     style_profile: StyleProfile | None = None
     negative_prompt: str = ""
+    # Rules that must be repeated in every Seedance shot for this series.
+    # Kept separate from the visual style so refreshing a project/character
+    # never drops safety or continuity requirements.
+    seedance_global_constraints: str = ""
     characters: list[CharacterProfile] = Field(default_factory=list)
     assets: list[SeriesAsset] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now)
@@ -248,6 +262,10 @@ class Project(BaseModel):
     brief: ProjectBrief
     style_bible: str = ""
     style_profile: StyleProfile | None = None
+    # Series-level Seedance rules inherited by this episode.  This is a
+    # project field as well so an episode can be edited without changing the
+    # reusable style bible or losing the rules on refresh.
+    seedance_global_constraints: str = ""
     scene_consistency_mode: SceneConsistencyMode = SceneConsistencyMode.OFF
     scene_profiles: list[SceneProfile] = Field(default_factory=list)
     preferred_prompt_targets: list[Literal["h3", "seedance"]] = Field(
@@ -311,7 +329,7 @@ class VisualBeat(BaseModel):
 class VoiceEvent(BaseModel):
     """A timed voice event whose ownership is explicit and model-independent."""
 
-    kind: Literal["character", "system_vo", "narration", "offscreen"] = "narration"
+    kind: Literal["character", "system_vo", "narration", "offscreen", "inner_monologue"] = "narration"
     speaker_id: str | None = None
     speaker_name: str = ""
     text: str = ""
@@ -447,6 +465,10 @@ class Shot(BaseModel):
     # separate from the MiniMax H3 prompt so switching providers never destroys
     # either approved version.
     seedance_prompt: str = ""
+    # Extra text entered in the Seedance Prompt editor.  The server extracts
+    # it from the authored constraint block and re-attaches it whenever the
+    # canonical prompt is rebuilt.
+    seedance_prompt_user_constraints: str = ""
     seedance_prompt_version: str = ""
     content_revision: int = 1
     keyframe_prompt_source_revision: int = 1

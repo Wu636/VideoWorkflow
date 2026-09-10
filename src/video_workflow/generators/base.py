@@ -14,6 +14,7 @@ class LLMGenerator(ABC):
         character_description: str | None = None,
         image_style: str | None = None,
         user_suggestions: str | None = None,
+        preserve_spoken_text: bool = False,
     ) -> Storyboard:
         """Generate a storyboard from the brief plus optional user suggestions."""
         pass

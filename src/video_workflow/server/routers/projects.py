@@ -15,6 +15,9 @@ from uuid import uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -35,6 +38,7 @@ from src.video_workflow.domain import (
     ScriptDurationAssessment,
     Shot,
     ShotSplitPreview,
+    VoiceEvent,
 )
 from src.video_workflow.integrations.comfyui import (
     ComfyUIClient,
@@ -76,6 +80,7 @@ class StoryboardGenerateRequest(BaseModel):
     user_suggestions: str = Field(default="", max_length=4000)
     prompt_targets: list[Literal["h3", "seedance"]] | None = None
     h3_skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
+    spoken_text_policy: Literal["adaptive", "verbatim"] | None = None
 
 
 class StyleAnalyzeRequest(BaseModel):
@@ -130,6 +135,10 @@ class CharacterReferenceAnalyzeRequest(BaseModel):
     reference_asset_ids: list[str] = Field(min_length=1, max_length=10)
     appearance_profile_id: str | None = None
     appearance_label: str = Field(default="", max_length=100)
+    user_suggestions: str = Field(default="", max_length=4000)
+
+
+class ScriptCharactersAnalyzeRequest(BaseModel):
     user_suggestions: str = Field(default="", max_length=4000)
 
 
@@ -389,13 +398,17 @@ async def delete_project(project_id: str):
 @router.post("/{project_id}/storyboard/generate")
 async def generate_storyboard(project_id: str, request: StoryboardGenerateRequest):
     try:
-        shots = await project_service.generate_storyboard(
+        storyboard_args = (
             project_id,
             request.shot_count,
             request.count_mode,
             request.user_suggestions,
             request.prompt_targets,
             request.h3_skill_id,
+        )
+        shots = await project_service.generate_storyboard(
+            *storyboard_args,
+            **({"spoken_text_policy": request.spoken_text_policy} if request.spoken_text_policy is not None else {}),
         )
         return {"shots": shots, "project": store.get_project(project_id)}
     except KeyError as exc:
@@ -501,6 +514,69 @@ async def retry_scene_reference_download(project_id: str, scene_profile_id: str)
         raise HTTPException(status_code=502, detail=str(exc) or type(exc).__name__) from exc
 
 
+@router.post("/{project_id}/scene-profiles/{scene_profile_id}/reference/upload")
+async def upload_scene_reference(
+    project_id: str,
+    scene_profile_id: str,
+    file: UploadFile = File(...),
+    replace_existing: bool = Form(True),
+):
+    """Upload a ready-made scene still and bind it to the recognised profile."""
+    destination: Path | None = None
+    try:
+        _, profile = project_service.require_scene_profile(project_id, scene_profile_id)
+        project_service.ensure_scene_reference_idle(scene_profile_id)
+        filename = Path(file.filename or "scene-reference.png").name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}:
+            guessed = mimetypes.guess_extension(file.content_type or "") or ""
+            suffix = guessed.lower() if guessed.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"} else ""
+        if not suffix or (file.content_type and not file.content_type.lower().startswith("image/")):
+            raise ValueError("场景母版图请上传 PNG、JPG、WEBP 或 BMP 图片")
+        destination_dir = project_service.project_dir(project_id) / "assets"
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / f"{uuid4().hex}{suffix}"
+        with destination.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle)
+        asset = project_service.register_existing_asset(
+            project_id,
+            destination,
+            role=AssetRole.SCENE,
+            name=f"{profile.name} · 本地场景图",
+            description="用户上传的场景档案参考图",
+        )
+        asset.mime_type = file.content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        asset = store.save_asset(asset)
+        updated = project_service.attach_scene_profile_reference(
+            project_id,
+            scene_profile_id,
+            asset.id,
+            replace_existing=replace_existing,
+        )
+        return {"asset": asset, "profile": updated}
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except SceneReferenceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("本地场景母版图上传失败: %s", scene_profile_id)
+        raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
+
+
+@router.delete("/{project_id}/scene-profiles/{scene_profile_id}/reference")
+async def clear_scene_reference(project_id: str, scene_profile_id: str):
+    try:
+        return await asyncio.to_thread(project_service.clear_scene_profile_reference, project_id, scene_profile_id)
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except SceneReferenceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/{project_id}/scene-profiles/{scene_profile_id}/reference")
 async def generate_scene_reference(
     project_id: str,
@@ -543,6 +619,22 @@ async def analyze_character_references(project_id: str, request: CharacterRefere
         raise _not_found(str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/characters/analyze-script")
+async def analyze_script_characters(project_id: str, request: ScriptCharactersAnalyzeRequest):
+    try:
+        return await project_service.analyze_and_backfill_script_characters(
+            project_id,
+            request.user_suggestions,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("项目 %s 的剧本角色补足分析失败", project_id)
+        raise HTTPException(status_code=500, detail=str(exc) or type(exc).__name__) from exc
 
 
 @router.post("/{project_id}/characters/references/generate")
@@ -796,33 +888,142 @@ async def export_storyboard(project_id: str):
         raise _not_found("Project not found")
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["镜号", "时长", "叙事", "对白", "场景", "景别", "机位", "运镜", "主体动作", "通用分镜提示词", "首帧提示词", "H3提示词", "生成模式", "审核状态"])
-    storyboard_changed = False
+    writer.writerow(_STORYBOARD_EXPORT_HEADERS)
     for shot in store.list_shots(project_id):
-        writer.writerow(
-            [
-                shot.ordinal,
-                shot.duration_seconds,
-                shot.narrative,
-                shot.dialogue,
-                shot.scene_description,
-                shot.shot_size,
-                shot.camera_angle,
-                shot.camera_motion,
-                shot.subject_motion,
-                shot.visual_prompt,
-                shot.keyframe_prompt,
-                shot.video_prompt,
-                (shot.resolved_generation_mode or shot.generation_mode).value,
-                shot.approval_status.value,
-            ]
-        )
+        writer.writerow(_storyboard_export_row(project, shot))
     payload = "\ufeff" + output.getvalue()
     return StreamingResponse(
         iter([payload.encode("utf-8")]),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{project.id}-storyboard.csv"'},
     )
+
+
+@router.get("/{project_id}/storyboard.xlsx")
+async def export_storyboard_xlsx(project_id: str):
+    project = store.get_project(project_id)
+    if project is None:
+        raise _not_found("Project not found")
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "分镜表"
+    sheet.append(_STORYBOARD_EXPORT_HEADERS)
+    for shot in store.list_shots(project_id):
+        sheet.append(_storyboard_export_row(project, shot))
+
+    header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    dialogue_fill = PatternFill(fill_type="solid", fgColor="FFF7D6")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        row[3].fill = dialogue_fill
+
+    widths = [8, 10, 38, 46, 38, 10, 10, 14, 42, 56, 56, 70, 14, 14]
+    for column, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(column)].width = width
+    sheet.freeze_panes = "C2"
+    sheet.auto_filter.ref = f"A1:N{sheet.max_row}"
+    sheet.row_dimensions[1].height = 24
+    sheet.sheet_view.showGridLines = False
+
+    output = io.BytesIO()
+    workbook.save(output)
+    payload = output.getvalue()
+    return StreamingResponse(
+        iter([payload]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{project.id}-storyboard.xlsx"'},
+    )
+
+
+_STORYBOARD_EXPORT_HEADERS = [
+    "镜号",
+    "时长",
+    "叙事",
+    "对白",
+    "场景",
+    "景别",
+    "机位",
+    "运镜",
+    "主体动作",
+    "通用分镜提示词",
+    "首帧提示词",
+    "H3提示词",
+    "生成模式",
+    "审核状态",
+]
+
+
+def _storyboard_export_row(project: Project, shot: Shot) -> list[Any]:
+    return [
+        shot.ordinal,
+        shot.duration_seconds,
+        shot.narrative,
+        _storyboard_dialogue_export_text(project, shot),
+        shot.scene_description,
+        shot.shot_size,
+        shot.camera_angle,
+        shot.camera_motion,
+        shot.subject_motion,
+        shot.visual_prompt,
+        shot.keyframe_prompt,
+        shot.video_prompt,
+        (shot.resolved_generation_mode or shot.generation_mode).value,
+        shot.approval_status.value,
+    ]
+
+
+def _storyboard_voice_label(project: Project, event: VoiceEvent) -> str:
+    if event.kind == "system_vo":
+        return "系统播报"
+    if event.kind == "narration":
+        name = event.speaker_name.strip()
+        return f"{name}（旁白）" if name and name not in {"旁白", "系统"} else "旁白"
+    if event.kind == "offscreen":
+        name = event.speaker_name.strip()
+        return f"{name}（画外音）" if name and name != "画外音" else "画外音"
+    if event.kind == "inner_monologue":
+        character = next(
+            (item for item in project.characters if item.id == event.speaker_id),
+            None,
+        )
+        return f"{character.name}（内心独白）" if character else event.speaker_name.strip() or "内心独白"
+    character = next(
+        (item for item in project.characters if item.id == event.speaker_id),
+        None,
+    )
+    return character.name if character else event.speaker_name.strip() or "角色对白（未指定）"
+
+
+def _storyboard_dialogue_export_text(project: Project, shot: Shot) -> str:
+    voice_lines = [
+        f"{_storyboard_voice_label(project, event)}：{event.text.strip()}"
+        for event in shot.voice_events
+        if event.text.strip()
+    ]
+    if voice_lines:
+        return "\n".join(voice_lines)
+    dialogue = shot.dialogue.strip()
+    if not dialogue:
+        return ""
+    character = next(
+        (item for item in project.characters if item.id == shot.dialogue_speaker_id),
+        None,
+    )
+    if character:
+        label = character.name
+    elif "系统" in dialogue or "播报" in dialogue:
+        label = "系统播报"
+    elif "画外音" in dialogue:
+        label = "画外音"
+    else:
+        label = "旁白（未指定角色）"
+    return f"{label}：{dialogue}"
 
 
 @router.put("/{project_id}/shots/{shot_id}")
