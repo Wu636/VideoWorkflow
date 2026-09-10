@@ -65,6 +65,9 @@ async def download_generated_image(url: str, output_dir: str, scene_id: int = 1)
 GRSAI_MODELS: list[dict[str, str]] = [
     {"id": "gpt-image-2", "label": "gpt-image-2", "description": "GPT Image 2，适合中文提示词与角色构图"},
     {"id": "gpt-image-2-vip", "label": "gpt-image-2-vip", "description": "GPT Image 2 高质量版本，支持更高分辨率"},
+    {"id": "gpt-image-2.5", "label": "gpt-image-2.5", "description": "GPT Image 2.5，1K 版本，适合批量分镜"},
+    {"id": "gpt-image-2.5-sunburst", "label": "gpt-image-2.5-sunburst", "description": "GPT Image 2.5 Sunburst，支持 1K/2K/4K 与质量参数"},
+    {"id": "gpt-image-2.5-flare", "label": "gpt-image-2.5-flare", "description": "GPT Image 2.5 Flare，支持 1K/2K/4K 与质量参数"},
     {"id": "nano-banana-fast", "label": "nano-banana-fast", "description": "速度优先，适合批量分镜快速出图"},
     {"id": "nano-banana", "label": "nano-banana", "description": "平衡质量与速度的标准模型"},
     {"id": "nano-banana-2", "label": "nano-banana-2", "description": "新版本 Nano Banana，支持更高规格参数"},
@@ -84,7 +87,23 @@ GRSAI_IMAGE_SIZE_SUPPORTED_MODELS = {
     "nano-banana-pro-4k-vip",
 }
 
-GRSAI_GPT_IMAGE_MODELS = {"gpt-image-2", "gpt-image-2-vip"}
+GRSAI_GPT_IMAGE_25_MODELS = {
+    "gpt-image-2.5",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
+}
+GRSAI_GPT_IMAGE_MODELS = {
+    "gpt-image-2",
+    "gpt-image-2-vip",
+    *GRSAI_GPT_IMAGE_25_MODELS,
+}
+
+
+def _is_grsai_gpt_image_model(model: str) -> bool:
+    """Keep manually entered future ``gpt-image-*`` IDs on the GPT route."""
+    normalized = model.strip().lower()
+    return normalized in GRSAI_GPT_IMAGE_MODELS or normalized.startswith("gpt-image-")
+
 
 GRSAI_SUCCESS_STATUSES = {"success", "succeeded", "completed", "complete", "done", "finished"}
 GRSAI_FAILURE_STATUSES = {"failed", "failure", "error", "cancelled", "canceled"}
@@ -102,15 +121,83 @@ GRSAI_GPT_IMAGE_ASPECT_RATIOS = {
     "21:9": "1920x832",
 }
 
+# GRSAI's 2.5 endpoints use concrete pixel values for the 1K/2K/4K variants.
+# Keep the legacy GPT Image 2 mapping above unchanged for existing projects.
+GRSAI_GPT_IMAGE_25_ASPECT_RATIOS = {
+    "1K": {
+        "auto": "1024x1024",
+        "1:1": "1024x1024",
+        "16:9": "1280x720",
+        "9:16": "720x1280",
+        "4:3": "1152x864",
+        "3:4": "864x1152",
+        "3:2": "1536x1024",
+        "2:3": "1024x1536",
+        "5:4": "1120x896",
+        "4:5": "896x1120",
+        "21:9": "1456x624",
+        "9:21": "624x1456",
+        "1:2": "768x1536",
+        "2:1": "1536x768",
+        "1:3": "688x2048",
+        "3:1": "2048x688",
+    },
+    "2K": {
+        "auto": "2048x2048",
+        "1:1": "2048x2048",
+        "16:9": "2048x1152",
+        "9:16": "1152x2048",
+        "4:3": "2304x1728",
+        "3:4": "1728x2304",
+        "3:2": "2048x1360",
+        "2:3": "1360x2048",
+        "5:4": "2240x1792",
+        "4:5": "1792x2240",
+        "21:9": "2912x1248",
+        "9:21": "1248x2912",
+        "1:2": "1536x3072",
+        "2:1": "3072x1536",
+    },
+    "4K": {
+        "auto": "2880x2880",
+        "1:1": "2880x2880",
+        "16:9": "3840x2160",
+        "9:16": "2160x3840",
+        "4:3": "3264x2448",
+        "3:4": "2448x3264",
+        "3:2": "3504x2336",
+        "2:3": "2336x3504",
+        "5:4": "3200x2560",
+        "4:5": "2560x3200",
+        "21:9": "3840x1648",
+        "9:21": "1648x3840",
+        "1:2": "1920x3840",
+        "2:1": "3840x1920",
+        "1:3": "1280x3840",
+        "3:1": "3840x1280",
+    },
+}
+
 
 def grsai_image_endpoint(model: str) -> str:
     """Return the GRSAI legacy endpoint matching the configured image family."""
-    return "/v1/draw/completions" if model in GRSAI_GPT_IMAGE_MODELS else "/v1/draw/nano-banana"
+    return "/v1/draw/completions" if _is_grsai_gpt_image_model(model) else "/v1/draw/nano-banana"
 
 
 def grsai_image_aspect_ratio(model: str, aspect_ratio: str | None) -> str:
     resolved = aspect_ratio or settings.IMAGE_ASPECT_RATIO or "auto"
-    if model in GRSAI_GPT_IMAGE_MODELS:
+    normalized_model = model.strip().lower()
+    if normalized_model in GRSAI_GPT_IMAGE_25_MODELS:
+        # The base 2.5 model is 1K-only.  Sunburst/Flare honour the configured
+        # size, while custom pixel values remain available for advanced users.
+        configured_size = settings.GRSAI_IMAGE_SIZE.upper().strip()
+        size = "1K" if normalized_model == "gpt-image-2.5" else configured_size
+        size_map = GRSAI_GPT_IMAGE_25_ASPECT_RATIOS.get(
+            size,
+            GRSAI_GPT_IMAGE_25_ASPECT_RATIOS["1K"],
+        )
+        return size_map.get(resolved, resolved)
+    if _is_grsai_gpt_image_model(model):
         return GRSAI_GPT_IMAGE_ASPECT_RATIOS.get(resolved, resolved)
     return resolved
 
@@ -151,8 +238,8 @@ def get_image_provider_catalog() -> list[dict[str, Any]]:
         },
         {
             "provider": "grsai",
-            "label": "GRSAI Nano Banana",
-            "description": "使用 GRSAI 的 Nano Banana 系列接口生成图像。",
+            "label": "GRSAI 图像模型",
+            "description": "使用 GRSAI 的 GPT Image 与 Nano Banana 系列接口生成图像。",
             "default_model": settings.GRSAI_IMAGE_MODEL,
             "api_key_env": "GRSAI_API_KEY",
             "models": GRSAI_MODELS,
@@ -427,7 +514,7 @@ class GrsaiImageGenerator(ImageGenerator):
 
         self.api_key = settings.GRSAI_API_KEY
         self.base_url = settings.GRSAI_BASE_URL.rstrip("/")
-        self.model = model or settings.GRSAI_IMAGE_MODEL
+        self.model = (model or settings.GRSAI_IMAGE_MODEL).strip()
 
     async def generate_image(
         self,
@@ -449,7 +536,7 @@ class GrsaiImageGenerator(ImageGenerator):
             "shutProgress": True,
         }
 
-        image_size = self._resolve_image_size() if self.model not in GRSAI_GPT_IMAGE_MODELS else None
+        image_size = self._resolve_image_size() if not _is_grsai_gpt_image_model(self.model) else None
         if image_size:
             payload["imageSize"] = image_size
 

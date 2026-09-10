@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import httpx
@@ -168,8 +168,13 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(h3_frames_for_seconds(15), 362)
         self.assertEqual((h3_frames_for_seconds(9) - 5) % 17, 0)
         self.assertEqual(grsai_image_endpoint("gpt-image-2"), "/v1/draw/completions")
+        self.assertEqual(grsai_image_endpoint("gpt-image-2.5"), "/v1/draw/completions")
+        self.assertEqual(grsai_image_endpoint("gpt-image-2.5-sunburst"), "/v1/draw/completions")
         self.assertEqual(grsai_image_endpoint("nano-banana-fast"), "/v1/draw/nano-banana")
         self.assertEqual(grsai_image_aspect_ratio("gpt-image-2", "16:9"), "1672x941")
+        self.assertEqual(grsai_image_aspect_ratio("gpt-image-2.5", "16:9"), "1280x720")
+        with patch.object(settings, "GRSAI_IMAGE_SIZE", "2K"):
+            self.assertEqual(grsai_image_aspect_ratio("gpt-image-2.5-sunburst", "16:9"), "2048x1152")
         self.assertEqual(grsai_image_aspect_ratio("nano-banana-fast", "16:9"), "16:9")
 
         builder = H3WorkflowBuilder()
@@ -293,6 +298,52 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             generator._extract_result_url(parsed_stream),
             "https://files.example.invalid/generated.png",
         )
+
+    def test_grsai_gpt_image_25_submits_to_gpt_endpoint(self) -> None:
+        requests: list[httpx.Request] = []
+        actual_client = httpx.AsyncClient
+
+        def client(**kwargs: object) -> httpx.AsyncClient:
+            def handle(request: httpx.Request) -> httpx.Response:
+                requests.append(request)
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "gpt25-task",
+                        "status": "succeeded",
+                        "results": [{"url": "https://files.example.invalid/generated.png"}],
+                    },
+                )
+
+            return actual_client(transport=httpx.MockTransport(handle), **kwargs)
+
+        with tempfile.TemporaryDirectory() as folder:
+            with (
+                patch.object(settings, "GRSAI_API_KEY", "fixture-key"),
+                patch.object(settings, "GRSAI_BASE_URL", "https://grsai.example.invalid"),
+                patch("src.video_workflow.generators.image.httpx.AsyncClient", side_effect=client),
+                patch(
+                    "src.video_workflow.generators.image.download_generated_image",
+                    new=AsyncMock(return_value="/tmp/generated.png"),
+                ),
+            ):
+                result = asyncio.run(
+                    GrsaiImageGenerator("gpt-image-2.5").generate_image(
+                        Scene(id=1, duration=5, narrative="room", visual_prompt="EXACT", motion_prompt=""),
+                        folder,
+                        character_description="",
+                        image_style="",
+                        aspect_ratio="16:9",
+                    )
+                )
+
+        self.assertEqual(result, "/tmp/generated.png")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].url.path, "/v1/draw/completions")
+        payload = json.loads(requests[0].content)
+        self.assertEqual(payload["model"], "gpt-image-2.5")
+        self.assertEqual(payload["aspectRatio"], "1280x720")
+        self.assertNotIn("imageSize", payload)
 
     def test_media_paths_survive_host_and_container_roots(self) -> None:
         media = settings.PROJECTS_DIR / "project_portable" / "deliveries" / "final.mp4"

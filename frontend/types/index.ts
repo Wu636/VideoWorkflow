@@ -634,11 +634,16 @@ export const DEFAULT_IMAGE_PROVIDERS: ImageProviderOption[] = [
     },
     {
         provider: "grsai",
-        label: "GRSAI Nano Banana",
-        description: "接入 Nano Banana 系列模型，适合批量分镜和高质量关键帧。",
+        label: "GRSAI 图像模型",
+        description: "接入 GRSAI 的 GPT Image 与 Nano Banana 系列模型。",
         default_model: "nano-banana-fast",
         api_key_env: "GRSAI_API_KEY",
         models: [
+            { id: "gpt-image-2", label: "gpt-image-2", description: "GPT Image 2，适合中文提示词与角色构图" },
+            { id: "gpt-image-2-vip", label: "gpt-image-2-vip", description: "GPT Image 2 高质量版本" },
+            { id: "gpt-image-2.5", label: "gpt-image-2.5", description: "GPT Image 2.5，1K 版本" },
+            { id: "gpt-image-2.5-sunburst", label: "gpt-image-2.5-sunburst", description: "支持 1K/2K/4K 与质量参数" },
+            { id: "gpt-image-2.5-flare", label: "gpt-image-2.5-flare", description: "支持 1K/2K/4K 与质量参数" },
             { id: "nano-banana-fast", label: "nano-banana-fast", description: "速度优先，适合批量分镜" },
             { id: "nano-banana", label: "nano-banana", description: "平衡质量与速度的标准模型" },
             { id: "nano-banana-2", label: "nano-banana-2", description: "新版本 Nano Banana" },

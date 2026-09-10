@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # 可选: "grsai" | "ark"
     VIDEO_PROVIDER: str = "grsai"
 
-    # GRSAI Nano Banana
+    # GRSAI 图像模型（GPT Image / Nano Banana）
     GRSAI_API_KEY: str | None = None
     GRSAI_BASE_URL: str = "https://grsai.dakka.com.cn"
     GRSAI_IMAGE_MODEL: str = "nano-banana-fast"
