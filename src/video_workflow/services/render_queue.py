@@ -78,14 +78,23 @@ def _is_transient_seedance_error(exc: BaseException) -> bool:
     or as Ark's own "timeout while fetching resource" 400; Ark 5xx is also
     transient.  Genuine parameter/prompt errors must fail fast instead.
     """
-    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
+    if isinstance(exc, httpx.HTTPStatusError) and (
+        exc.response.status_code == 429 or exc.response.status_code >= 500
+    ):
         return True
     text = str(exc)
+    lowered = text.lower()
     return (
         "timeout while fetching resource" in text
         or "素材公网地址不可读取" in text
-        or "temporarily unavailable" in text.lower()
-        or "service unavailable" in text.lower()
+        or "temporarily unavailable" in lowered
+        or "service unavailable" in lowered
+        or "concurrent limit" in lowered
+        or "rate limit" in lowered
+        or "too many requests" in lowered
+        or "50429" in lowered
+        or "50430" in lowered
+        or "429" in lowered
     )
 
 
@@ -99,6 +108,7 @@ class RenderQueue:
         self.metaso_client = MetaSoH3Client()
         self.builder = H3WorkflowBuilder()
         self._task: asyncio.Task | None = None
+        self._job_tasks: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
 
     def reload_settings(self) -> None:
@@ -207,6 +217,95 @@ class RenderQueue:
         self.store.save_shot(source)
         return tail
 
+    async def _resolve_seedance_continuity_asset(self, project, shot: Shot) -> Asset:
+        """Wait for and resolve the previous shot's real Seedance tail frame.
+
+        The dispatcher may start adjacent continuous shots together.  A later
+        shot therefore waits on the previous shot's queued/running job instead
+        of failing immediately and consuming a retry.  Existing video files
+        are still converted lazily when their tail metadata predates the
+        current queue implementation.
+        """
+        source = self.projects.continuity_source_shot(project, shot)
+        if source is None:
+            raise ValueError(f"镜头 {shot.ordinal} 已选择连续续接，但没有可用的上一镜")
+        deadline = time.monotonic() + max(60, settings.SEEDANCE_JOB_TIMEOUT_SECONDS)
+        while True:
+            source = self.store.get_shot(source.id) or source
+            assets = self.store.list_assets(project.id)
+            asset_map = {asset.id: asset for asset in assets}
+            tail = asset_map.get(source.last_frame_asset_id or "")
+            tail_is_available = bool(
+                tail
+                and tail.type == AssetType.IMAGE
+                and (
+                    tail.path.startswith(("http://", "https://", "data:"))
+                    or resolve_media_path(tail.path).is_file()
+                )
+            )
+            if tail_is_available and tail is not None:
+                return tail
+
+            source_jobs = [
+                item
+                for item in self.store.list_jobs(project.id)
+                if item.shot_id == source.id and item.provider == "ark_seedance"
+            ]
+            active = any(
+                item.status
+                in {JobStatus.QUEUED, JobStatus.SUBMITTING, JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
+                for item in source_jobs
+            )
+
+            # If the source is currently rendering, wait for that candidate's
+            # tail instead of falling back to an older video_path.
+            if active:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"镜头 {shot.ordinal} 等待镜头 {source.ordinal} 尾帧超过 "
+                        f"{settings.SEEDANCE_JOB_TIMEOUT_SECONDS} 秒"
+                    )
+                await asyncio.sleep(min(2.0, max(0.25, deadline - time.monotonic())))
+                continue
+
+            if source.video_path:
+                source_path = resolve_media_path(source.video_path)
+                if source_path.is_file():
+                    destination = (
+                        self.projects.project_dir(project.id)
+                        / "images"
+                        / "last_frames"
+                        / f"{source.id}-seedance-continuity.png"
+                    )
+                    await asyncio.to_thread(self._extract_last_frame, source_path, destination)
+                    tail = self.projects.register_existing_asset(
+                        project.id,
+                        destination,
+                        role=AssetRole.LAST_FRAME,
+                        name=f"镜头 {source.ordinal} · Seedance 连续尾帧",
+                        description="从上一镜 Seedance 成片提取，作为本镜连续续接的严格首帧",
+                    )
+                    latest_source = self.store.get_shot(source.id) or source
+                    if not latest_source.last_frame_asset_id:
+                        latest_source.last_frame_asset_id = tail.id
+                        self.store.save_shot(latest_source)
+                    else:
+                        latest_tail = self.store.get_asset(latest_source.last_frame_asset_id)
+                        if latest_tail and latest_tail.type == AssetType.IMAGE:
+                            return latest_tail
+                    return tail
+
+            if not active:
+                raise ValueError(
+                    f"镜头 {shot.ordinal} 等待镜头 {source.ordinal} 的尾帧；请先完成上一镜再提交本镜"
+                )
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"镜头 {shot.ordinal} 等待镜头 {source.ordinal} 尾帧超过 "
+                    f"{settings.SEEDANCE_JOB_TIMEOUT_SECONDS} 秒"
+                )
+            await asyncio.sleep(min(2.0, max(0.25, deadline - time.monotonic())))
+
     def select_output(self, project_id: str, job_id: str) -> Shot:
         """Pin one completed render card as the shot's authoritative version."""
         self.projects.require_project(project_id)
@@ -270,6 +369,7 @@ class RenderQueue:
             return
         self.store.recover_interrupted_jobs()
         self._stop.clear()
+        self._job_tasks.clear()
         self._task = asyncio.create_task(self._run(), name="videoworkflow-h3-render-queue")
 
     async def stop(self) -> None:
@@ -286,6 +386,16 @@ class RenderQueue:
                 except (asyncio.CancelledError, Exception):
                     pass
             self._task = None
+        if self._job_tasks:
+            pending = list(self._job_tasks)
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._job_tasks.clear()
 
     def enqueue(
         self,
@@ -593,67 +703,105 @@ class RenderQueue:
                 self.store.save_shot(shot)
         return job
 
-    async def _run(self) -> None:
-        while not self._stop.is_set():
-            job = self.store.claim_next_job()
-            if job is None:
+    async def _run_job(self, job: RenderJob) -> None:
+        try:
+            await self._process(job)
+        except Exception as exc:
+            logger.exception("Render job %s failed", job.id)
+            job = self.store.get_job(job.id) or job
+            job.error = str(exc)
+            if job.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}:
+                # Cancellation is terminal even when the provider reports
+                # a 404/transport error after the task has already gone.
+                job.status = JobStatus.CANCELLED
+                job.completed_at = job.completed_at or utc_now()
+                job.error = "任务已取消"
+            elif isinstance(exc, httpx.TransportError):
+                # Keep queued work durable while an on-demand GPU instance is off.
+                # Connectivity outages do not consume a model-generation retry.
+                job.attempt = max(0, job.attempt - 1)
+                job.status = JobStatus.QUEUED
+                service = (
+                    "Seedance API" if job.provider == "ark_seedance"
+                    else "Atlas H3 API" if job.provider == "atlas_h3"
+                    else "MetaSo H3 API" if job.provider == "metaso_h3"
+                    else "ComfyUI"
+                )
+                job.error = f"{service} 暂时不可连接，等待重试: {exc}"
+            elif (
+                job.attempt < job.max_attempts
+                and not (job.provider == "ark_seedance" and not _is_transient_seedance_error(exc))
+            ):
+                job.status = JobStatus.QUEUED
+                if job.provider == "ark_seedance":
+                    job.error = f"Seedance 素材通道/方舟瞬时故障，自动重试（{job.attempt}/{job.max_attempts}）: {exc}"
+            else:
+                job.status = JobStatus.CANCELLED if job.status == JobStatus.CANCEL_REQUESTED else JobStatus.FAILED
+                job.completed_at = utc_now()
+            self.store.save_job(job)
+            if job.shot_id:
+                shot = self.store.get_shot(job.shot_id)
+                if shot:
+                    self._set_job_status_on_shot(
+                        shot,
+                        "failed" if job.status == JobStatus.FAILED else job.status.value,
+                    )
+                    self.store.save_shot(shot)
+            if isinstance(exc, httpx.TransportError) or (
+                job.status == JobStatus.QUEUED and job.provider == "ark_seedance"
+            ):
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=1.0)
+                    await asyncio.wait_for(self._stop.wait(), timeout=15.0)
                 except TimeoutError:
                     pass
-                continue
-            try:
-                await self._process(job)
-            except Exception as exc:
-                logger.exception("Render job %s failed", job.id)
-                job = self.store.get_job(job.id) or job
-                job.error = str(exc)
-                if job.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}:
-                    # Cancellation is terminal even when the provider reports
-                    # a 404/transport error after the task has already gone.
-                    # Keep the local card cancelled instead of retrying or
-                    # turning it into a failure.
-                    job.status = JobStatus.CANCELLED
-                    job.completed_at = job.completed_at or utc_now()
-                    job.error = "任务已取消"
-                elif isinstance(exc, httpx.TransportError):
-                    # Keep queued work durable while an on-demand GPU instance is off.
-                    # Connectivity outages do not consume a model-generation retry.
-                    job.attempt = max(0, job.attempt - 1)
-                    job.status = JobStatus.QUEUED
-                    service = (
-                        "Seedance API" if job.provider == "ark_seedance"
-                        else "Atlas H3 API" if job.provider == "atlas_h3"
-                        else "MetaSo H3 API" if job.provider == "metaso_h3"
-                        else "ComfyUI"
-                    )
-                    job.error = f"{service} 暂时不可连接，等待重试: {exc}"
-                elif (
-                    job.attempt < job.max_attempts
-                    and not (job.provider == "ark_seedance" and not _is_transient_seedance_error(exc))
-                ):
-                    job.status = JobStatus.QUEUED
-                    if job.provider == "ark_seedance":
-                        job.error = f"Seedance 素材通道/方舟瞬时故障，自动重试（{job.attempt}/{job.max_attempts}）: {exc}"
-                else:
-                    job.status = JobStatus.CANCELLED if job.status == JobStatus.CANCEL_REQUESTED else JobStatus.FAILED
-                    job.completed_at = utc_now()
-                self.store.save_job(job)
-                if job.shot_id:
-                    shot = self.store.get_shot(job.shot_id)
-                    if shot:
-                        self._set_job_status_on_shot(
-                            shot,
-                            "failed" if job.status == JobStatus.FAILED else job.status.value,
-                        )
-                        self.store.save_shot(shot)
-                if isinstance(exc, httpx.TransportError) or (
-                    job.status == JobStatus.QUEUED and job.provider == "ark_seedance"
-                ):
-                    try:
-                        await asyncio.wait_for(self._stop.wait(), timeout=15.0)
-                    except TimeoutError:
-                        pass
+
+    def _track_job_task(self, job: RenderJob) -> None:
+        task = asyncio.create_task(self._run_job(job), name=f"videoworkflow-{job.provider}-{job.id}")
+        self._job_tasks.add(task)
+        task.add_done_callback(self._job_tasks.discard)
+
+    async def _run(self) -> None:
+        """Dispatch one H3 job and a configurable number of Seedance jobs.
+
+        Seedance calls are remote asynchronous tasks, so their submit/poll
+        coroutines can safely overlap. H3 remains a single local/hosted worker;
+        continuous Seedance shots still enforce their previous-shot dependency
+        inside ``_process_seedance``.
+        """
+        h3_active = False
+        while not self._stop.is_set():
+            active_tasks = {task for task in self._job_tasks if not task.done()}
+            seedance_active = sum(
+                1 for task in active_tasks if task.get_name().startswith("videoworkflow-ark_seedance-")
+            )
+            seedance_limit = max(1, min(8, int(settings.SEEDANCE_RENDER_CONCURRENCY)))
+            launched = False
+            while seedance_active < seedance_limit and not self._stop.is_set():
+                job = self.store.claim_next_job(provider="ark_seedance")
+                if job is None:
+                    break
+                self._track_job_task(job)
+                seedance_active += 1
+                launched = True
+
+            if not h3_active and not self._stop.is_set():
+                job = self.store.claim_next_job(exclude_provider="ark_seedance")
+                if job is not None:
+                    self._track_job_task(job)
+                    h3_active = True
+                    launched = True
+
+            # Recompute the H3 flag from task names so completed tasks free the
+            # slot without needing a second queue-specific callback.
+            h3_active = any(
+                not task.done() and not task.get_name().startswith("videoworkflow-ark_seedance-")
+                for task in self._job_tasks
+            )
+            if not launched:
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=0.25)
+                except TimeoutError:
+                    pass
 
     async def _process(self, job: RenderJob) -> None:
         if job.provider == "ark_seedance":
@@ -1749,13 +1897,7 @@ class RenderQueue:
         # Continuous mode resolves the previous shot at execution time. This
         # lets a batch queue shot N+1 before shot N has produced its tail frame.
         if shot.continuity_mode == ShotContinuityMode.CONTINUOUS:
-            source = self.projects.continuity_source_shot(project, shot)
-            if source is None:
-                raise ValueError(f"镜头 {shot.ordinal} 已选择连续续接，但没有可用的上一镜")
-            if not source.last_frame_asset_id:
-                raise ValueError(
-                    f"镜头 {shot.ordinal} 等待镜头 {source.ordinal} 的尾帧；请先完成上一镜再提交本镜"
-                )
+            await self._resolve_seedance_continuity_asset(project, shot)
             assets = self.store.list_assets(job.project_id)
             refs = self.projects.seedance_reference_assets(shot, assets, project)
             config["reference_asset_ids"] = [asset.id for asset in refs]
@@ -1813,7 +1955,19 @@ class RenderQueue:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"Seedance 任务超过 {settings.SEEDANCE_JOB_TIMEOUT_SECONDS} 秒仍未完成")
             await asyncio.sleep(max(2.0, settings.SEEDANCE_POLL_INTERVAL_SECONDS))
-            result = await self.seedance_client.get(task_id)
+            try:
+                result = await self.seedance_client.get(task_id)
+            except Exception as exc:
+                # A rate-limited/transient status while polling should keep
+                # this already-created remote task alive.  Retrying the whole
+                # job here could submit a duplicate paid generation.
+                if not _is_transient_seedance_error(exc):
+                    raise
+                current = self.store.get_job(job.id) or job
+                current.error = f"Seedance 查询暂时受限，稍后重试: {exc}"
+                self.store.save_job(current)
+                await asyncio.sleep(min(15.0, max(3.0, settings.SEEDANCE_POLL_INTERVAL_SECONDS)))
+                continue
             current = self.store.get_job(job.id) or current
             if current.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}:
                 await self.seedance_client.cancel(task_id)

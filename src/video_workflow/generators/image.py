@@ -180,8 +180,8 @@ GRSAI_GPT_IMAGE_25_ASPECT_RATIOS = {
 
 
 def grsai_image_endpoint(model: str) -> str:
-    """Return the GRSAI legacy endpoint matching the configured image family."""
-    return "/v1/draw/completions" if _is_grsai_gpt_image_model(model) else "/v1/draw/nano-banana"
+    """Use GRSAI's current GPT endpoint while preserving the Nano route."""
+    return "/v1/api/generate" if _is_grsai_gpt_image_model(model) else "/v1/draw/nano-banana"
 
 
 def grsai_image_aspect_ratio(model: str, aspect_ratio: str | None) -> str:
@@ -533,8 +533,13 @@ class GrsaiImageGenerator(ImageGenerator):
             "model": self.model,
             "prompt": _build_image_prompt(scene, character_description, image_style),
             "aspectRatio": resolved_aspect_ratio,
-            "shutProgress": True,
         }
+
+        is_gpt_image = _is_grsai_gpt_image_model(self.model)
+        if is_gpt_image:
+            payload["replyType"] = "json"
+        else:
+            payload["shutProgress"] = True
 
         image_size = self._resolve_image_size() if not _is_grsai_gpt_image_model(self.model) else None
         if image_size:
@@ -542,7 +547,7 @@ class GrsaiImageGenerator(ImageGenerator):
 
         reference_urls = self._load_reference_inputs(reference_image_path)
         if reference_urls:
-            payload["urls"] = reference_urls
+            payload["images" if is_gpt_image else "urls"] = reference_urls
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -691,7 +696,10 @@ class GrsaiImageGenerator(ImageGenerator):
             await asyncio.sleep(settings.GRSAI_RESULT_POLL_INTERVAL_SECONDS)
 
             try:
-                result_response = await client.post("/v1/draw/result", json={"id": task_id})
+                if _is_grsai_gpt_image_model(self.model):
+                    result_response = await client.get("/v1/api/result", params={"id": task_id})
+                else:
+                    result_response = await client.post("/v1/draw/result", json={"id": task_id})
                 result_response.raise_for_status()
                 result_payload = _decode_grsai_response(result_response, "result polling")
             except Exception as exc:

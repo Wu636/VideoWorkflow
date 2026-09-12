@@ -58,6 +58,10 @@ RUNTIME_FIELDS = (
     ),
     RuntimeField("SEEDANCE_DEFAULT_RESOLUTION", "video", "Seedance 默认分辨率", options=("480p", "720p", "1080p", "4k")),
     RuntimeField(
+        "SEEDANCE_RENDER_CONCURRENCY", "video", "Seedance 并发数",
+        "同时提交和轮询的 Seedance 视频任务数，范围 1–8；实际上限还受方舟账号与模型配额影响。连续长镜头仍会等待上一镜尾帧。",
+    ),
+    RuntimeField(
         "SEEDANCE_PUBLIC_ASSET_BASE_URL", "video", "Seedance 素材公网地址",
         "本地分镜图/角色图通过此地址生成带时效签名的下载链接；留空时本地素材会在提交前被拦截。"
         "隧道域名过期后可运行 scripts/restart-seedance-tunnel.sh 一键刷新并回写。",
@@ -146,7 +150,10 @@ class RuntimeSettingsManager:
     @staticmethod
     def _coerce(key: str, value: Any) -> Any:
         annotation = type(settings).model_fields[key].annotation
-        return TypeAdapter(annotation).validate_python(value)
+        coerced = TypeAdapter(annotation).validate_python(value)
+        if key == "SEEDANCE_RENDER_CONCURRENCY" and not 1 <= int(coerced) <= 8:
+            raise ValueError("SEEDANCE_RENDER_CONCURRENCY 必须在 1–8 之间")
+        return coerced
 
     def load(self) -> None:
         path = self.path

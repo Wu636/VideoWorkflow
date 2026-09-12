@@ -70,8 +70,22 @@ from src.video_workflow.types import Scene
 
 logger = logging.getLogger(__name__)
 
-SEEDANCE_PROMPT_VERSION = "seedance-2.0-director-v7"
+SEEDANCE_PROMPT_VERSION = "seedance-2.0-director-v8"
 H3_DIRECTOR_VERSION = "h3-director-v11"
+
+SCENE_REFERENCE_EMPTY_SET_RULE = (
+    "【环境场景图硬约束｜最高优先级】这是一张纯环境空镜，只绘制建筑、空间结构、固定陈设、道具、材质和光影。"
+    "画面中绝对不出现任何人物、群演、人形、人体局部、剪影、倒影、照片/海报/屏幕中的人或人形雕像。"
+    "场景档案、连续性规则、用户补充建议或参考图若提到人物、站位、服装、表情、动作、队伍，"
+    "只提取其所在位置的环境信息，全部忽略人物内容；如果参考图已有人员，先移除并自然补全遮挡的背景。"
+    "最终成图必须是完全无人且没有人形痕迹的空场景。"
+)
+
+SCENE_REFERENCE_PERSON_TERMS = (
+    "人物", "角色", "群演", "人群", "人形", "人体", "真人", "工人", "人员", "工作人员",
+    "队员", "队伍", "团队", "站位", "服装", "穿着", "五官", "脸部", "发型", "背影", "身影",
+    "男女", "男子", "女子", "男孩", "女孩", "观众", "警察", "工程师", "承包商",
+)
 
 CHARACTER_REFERENCE_SHEET_LAYOUT = """生成一张横向 16:9 的单一角色四视图设定板，角色可以是人物、动物或拟人角色；画面严格只呈现同一个角色的四个视图，不是四个不同角色：
 1. 左侧约占画面三分之一：人物使用大尺寸正脸近照，动物使用大尺寸正面头部近照；完整呈现人物的发型、脸型、五官与颈肩细节，或动物的品种特征、耳形、口鼻、眼睛、毛色与独特斑纹；
@@ -2186,12 +2200,13 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         ]
         llm = create_llm_generator(settings.LLM_PROVIDER)
         payload = await llm.generate_json(
-            "你是影视场景连续性设计师，只合并确实发生在同一物理空间和同一时间氛围的镜头。",
+            "你是影视场景连续性设计师，只合并确实发生在同一物理空间和同一时间氛围的镜头。场景档案只描述无人环境，绝不写人物、群演、站位、服装或动作。",
             f"""根据分镜识别可选的场景一致性组。场景变化频繁或无需硬一致性的镜头可以不归入任何组。
 用户建议：{user_suggestions.strip() or '无'}
 项目风格：{self.project_style_text(project) or '未设定'}
 分镜：{json.dumps(payload_shots, ensure_ascii=False)}
 
+description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布局、固定陈设、道具、材质、光影及环境连续性；即使分镜里有人物，也不要写任何人物或其站位、服装、动作。
 严格返回 JSON：
 {{"scenes":[{{"name":"场景名","description":"稳定空间布局、固定陈设、材质与灯光","continuity_notes":"允许变化的机位与必须保持的环境要素","shot_ordinals":[1,2]}}]}}""",
         )
@@ -2269,13 +2284,66 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         # fields describe a specific reference scene, not a global environment.
         style = project.style_profile
         rendering = "；".join(value for value in (style.name, style.medium) if value) if style and style.approved else ""
-        return "\n".join(part for part in [
-            "【任务】影视场景设定母版，单张无人物环境图。展示清晰的主视角与空间布局，不做多格拼贴，不生成文字、标注、Logo 或水印。",
+        prompt = "\n".join(part for part in [
+            "【任务】影视场景设定母版，单张纯环境空镜。展示清晰的主视角与空间布局，不做多格拼贴，不生成文字、标注、Logo 或水印。",
             f"【场景】{profile.name}：{profile.description}",
             f"【连续性规则】{profile.continuity_notes}" if profile.continuity_notes else "",
             f"【绘制方式】{rendering}" if rendering else "【绘制方式】沿用项目的绘制媒介与笔触；具体光影、色彩和陈设只按本场景描述。",
             f"【画幅】{project.brief.aspect_ratio}",
         ] if part)
+        return ProjectService._enforce_empty_scene_reference(
+            ProjectService._scene_reference_environment_text(project, prompt)
+        )
+
+    @staticmethod
+    def _scene_reference_environment_text(project: Project, text: str) -> str:
+        """Keep environment clauses, never feed cast/placement prose as positive image instructions."""
+        names = [
+            re.split(r"[（(【[]", character.name, maxsplit=1)[0].strip()
+            for character in project.characters
+        ]
+        person_names = [name for name in names if len(name) >= 2]
+        clauses = re.split(r"[。；;，,\n]+", text.replace(SCENE_REFERENCE_EMPTY_SET_RULE, ""))
+        kept: list[str] = []
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            if any(term in clause for term in (*SCENE_REFERENCE_PERSON_TERMS, *person_names)):
+                continue
+            if re.search(r"(?:\d+|[一二三四五六七八九十两]+)人|\b(?:people|persons?|humans?|workers?|characters?|crowds?|actors?|men|women|man|woman)\b", clause, re.IGNORECASE):
+                continue
+            kept.append(clause)
+        return "；".join(kept)
+
+    @staticmethod
+    def _enforce_empty_scene_reference(prompt: str) -> str:
+        # A saved/custom prompt may predate the empty-set policy or conflict
+        # with it. Keep the user's text, but make the final instruction explicit.
+        return f"{prompt.replace(SCENE_REFERENCE_EMPTY_SET_RULE, '').strip()}\n{SCENE_REFERENCE_EMPTY_SET_RULE}"
+
+    @staticmethod
+    async def _scene_reference_contains_people(image_path: str, vision_generator) -> bool:
+        try:
+            result = await vision_generator.generate_json(
+                "你是严格的环境场景图质量检查员。只根据图片像素判断，不要参考生成意图。返回 JSON。",
+                "检查整张图片是否出现任何人物、群演、人体局部、人形剪影/倒影、屏幕/海报中的人或人形雕像。"
+                "座椅、工具、文字、普通图标和纯几何图形不算人物。只返回 {\"has_people\": true/false}；"
+                "看不清或拿不准时按 true 处理。",
+                reference_images=[image_path],
+            )
+        except Exception as exc:
+            raise ImageGenerationError(f"环境图人物校验失败，结果未绑定：{exc}") from exc
+        if type(result.get("has_people")) is not bool:
+            raise ImageGenerationError("环境图人物校验未返回明确结论，结果未绑定；请重试")
+        return result["has_people"]
+
+    @staticmethod
+    def _scene_reference_vision_generator():
+        provider = resolve_reference_llm_provider(settings.LLM_PROVIDER)
+        if provider == "deepseek":
+            raise ValueError("严格环境图校验需要配置支持图片识别的参考分析模型")
+        return create_llm_generator(provider)
 
     def scene_reference_prompt(self, project_id: str, scene_profile_id: str) -> dict:
         project, profile = self.require_scene_profile(project_id, scene_profile_id)
@@ -2339,7 +2407,10 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         if asset is None:
             asset = self.register_existing_asset(project_id, path, role=AssetRole.SCENE,
                                                  name=f"{profile.name} · 场景母版", description=profile.reference_generation_prompt)
-        profile.reference_asset_ids = list(dict.fromkeys([*profile.reference_asset_ids, asset.id]))
+        # Only the newest image should guide downstream keyframes. Historical
+        # versions remain registered as project assets, but must not leak an
+        # old (possibly people-filled) environment reference into new shots.
+        profile.reference_asset_ids = [asset.id]
         profile.approved = True
         profile.reference_status = "completed"
         profile.reference_source = "ai"
@@ -2403,48 +2474,122 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         *,
         prompt: str | None = None,
         expected_version: int | None = None,
+        reference_image_path: str | None = None,
+        preserve_reference_prompt: bool = False,
     ) -> Asset:
         self.ensure_scene_reference_idle(scene_profile_id)
         project, profile = self.require_scene_profile(project_id, scene_profile_id)
         if expected_version is not None and expected_version != profile.version:
             raise SceneReferenceConflictError("场景档案或 Prompt 已更新，请重新打开核对后生成")
-        effective_prompt = (prompt if prompt is not None else profile.reference_prompt or self.compile_scene_reference_prompt(project, profile)).strip()
-        if not effective_prompt:
+        base_prompt = (prompt if prompt is not None else profile.reference_prompt or self.compile_scene_reference_prompt(project, profile)).strip()
+        if not base_prompt:
             raise ValueError("母版图 Prompt 请填写完整")
         if prompt is None and user_suggestions.strip():
-            effective_prompt += f"\n【补充建议】{user_suggestions.strip()}"
+            base_prompt += f"\n【补充建议】{user_suggestions.strip()}"
+        environment_prompt = self._scene_reference_environment_text(project, base_prompt)
+        if not environment_prompt:
+            environment_prompt = self._scene_reference_environment_text(
+                project, self.compile_scene_reference_prompt(project, profile)
+            )
+        if not environment_prompt:
+            raise ValueError("环境图 Prompt 中没有可用的空间或道具描述，请先补充场景信息")
+        effective_prompt = self._enforce_empty_scene_reference(environment_prompt)
         image_gen = create_image_generator(image_provider=image_provider, model=image_model)
-        profile.reference_run_id = uuid4().hex
-        output_dir = self._scene_output_dir(project_id, profile)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        vision_gen = self._scene_reference_vision_generator()
+        output_dir: Path | None = None
         self._active_scene_references.add(scene_profile_id)
         try:
-            self._set_scene_reference_state(project_id, scene_profile_id, reference_run_id=profile.reference_run_id,
-                reference_prompt=effective_prompt, reference_generation_prompt=effective_prompt,
-                reference_status="generating", reference_error="")
-            scene = Scene(id=1, duration=5, narrative=profile.description, visual_prompt=effective_prompt, motion_prompt="")
-            output = await image_gen.generate_image(scene, str(output_dir), None,
-                seed=self._stable_seed(project_id, profile.id), character_description="", image_style="",
-                aspect_ratio=project.brief.aspect_ratio)
-            return self._finish_scene_reference(project_id, scene_profile_id, output)
+            current_prompt = effective_prompt
+            reference_path = reference_image_path
+            for attempt in range(2):
+                run_id = uuid4().hex
+                profile.reference_run_id = run_id
+                output_dir = self._scene_output_dir(project_id, profile)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                self._set_scene_reference_state(project_id, scene_profile_id, reference_run_id=run_id,
+                    reference_prompt=profile.reference_prompt if preserve_reference_prompt else base_prompt,
+                    reference_generation_prompt=current_prompt,
+                    reference_status="generating", reference_error="")
+                scene = Scene(id=1, duration=5, narrative=environment_prompt, visual_prompt=current_prompt, motion_prompt="")
+                output = await image_gen.generate_image(scene, str(output_dir), reference_path,
+                    seed=self._stable_seed(project_id, profile.id) + attempt, character_description="", image_style="",
+                    aspect_ratio=project.brief.aspect_ratio)
+                if not await self._scene_reference_contains_people(output, vision_gen):
+                    return self._finish_scene_reference(project_id, scene_profile_id, output)
+                self.register_existing_asset(project_id, Path(output), role=AssetRole.SCENE,
+                    name=f"{profile.name} · 含人物未绑定", description="自动检查发现人物，此图没有绑定到场景档案")
+                if attempt == 1:
+                    raise ImageGenerationError("连续两次出图都检测到人物；未绑定为场景母版，已将图片保留在素材库")
+                reference_path = output
+                current_prompt = self._enforce_empty_scene_reference(
+                    "【纠错编辑】以下参考图仅用于复用建筑、设备和光影。彻底擦除所有人物及其倒影，"
+                    "把被遮挡的桌面、地面、屏幕和背景自然补齐；不要复刻人物构图。\n"
+                    f"{environment_prompt}"
+                )
+            raise ImageGenerationError("环境图人物检查未通过")
         except Exception as exc:
             self._set_scene_reference_state(project_id, scene_profile_id,
-                reference_status="download_failed" if not isinstance(exc, ImageGenerationError) and (output_dir / "grsai_result.json").is_file() else "failed",
+                reference_status="download_failed" if not isinstance(exc, ImageGenerationError) and output_dir is not None and (output_dir / "grsai_result.json").is_file() else "failed",
                 reference_error=str(exc) or type(exc).__name__)
             raise
         finally:
             self._active_scene_references.discard(scene_profile_id)
+
+    async def revise_scene_reference(
+        self,
+        project_id: str,
+        scene_profile_id: str,
+        source_asset_id: str,
+        user_suggestions: str,
+        expected_version: int,
+        image_provider: str | None = None,
+        image_model: str | None = None,
+    ) -> Asset:
+        self.ensure_scene_reference_idle(scene_profile_id)
+        project, profile = self.require_scene_profile(project_id, scene_profile_id)
+        if expected_version != profile.version:
+            raise SceneReferenceConflictError("场景图片或档案已更新，请刷新后再修改当前图片")
+        if profile.reference_source != "ai" or not profile.reference_asset_ids:
+            raise ValueError("请先生成一张 AI 场景图，再按建议修改上一张图")
+        if source_asset_id != profile.reference_asset_ids[-1]:
+            raise SceneReferenceConflictError("上一次生成的场景图已变化，请刷新后重试")
+        suggestions = user_suggestions.strip()
+        if not suggestions:
+            raise ValueError("请填写这次要修改的具体建议")
+        asset = self.store.get_asset(source_asset_id)
+        if asset is None or asset.project_id != project.id or asset.type != AssetType.IMAGE:
+            raise ValueError("上一次生成的场景图已不存在，请重新生成")
+        source_path = resolve_media_path(asset.path)
+        if not source_path.is_file():
+            raise ValueError("上一次生成的场景图片文件未找到，请先检查素材")
+        base_prompt = profile.reference_prompt or self.compile_scene_reference_prompt(project, profile)
+        revision_prompt = (
+            "【任务】编辑所附的上一张场景图，以它为环境布局和画风参考，不是从零构图。"
+            "保留没有被修改意见涉及的建筑、道具、材质和光影；需要删去原图已有的所有人物，并自然补全背景。\n"
+            f"【用户本次修改建议】{suggestions}\n"
+            f"【原场景设定】{base_prompt}"
+        )
+        return await self.generate_scene_reference(
+            project_id, scene_profile_id, image_provider=image_provider, image_model=image_model,
+            prompt=revision_prompt, expected_version=expected_version,
+            reference_image_path=str(source_path), preserve_reference_prompt=True,
+        )
 
     async def retry_scene_reference_download(self, project_id: str, scene_profile_id: str) -> Asset:
         self.ensure_scene_reference_idle(scene_profile_id)
         _, profile = self.require_scene_profile(project_id, scene_profile_id)
         if profile.reference_status != "download_failed":
             raise ValueError("此场景没有待恢复的下载结果")
+        vision_gen = self._scene_reference_vision_generator()
         output_dir = self._scene_output_dir(project_id, profile)
         self._active_scene_references.add(scene_profile_id)
         try:
             self._set_scene_reference_state(project_id, scene_profile_id, reference_status="downloading", reference_error="")
             output = await GrsaiImageGenerator.resume_image(str(output_dir))
+            if await self._scene_reference_contains_people(output, vision_gen):
+                self.register_existing_asset(project_id, Path(output), role=AssetRole.SCENE,
+                    name=f"{profile.name} · 含人物未绑定", description="下载恢复后发现人物，此图没有绑定到场景档案")
+                raise ImageGenerationError("取回的环境图检测到人物，未绑定为场景母版；图片已保留在素材库")
             return self._finish_scene_reference(project_id, scene_profile_id, output)
         except Exception as exc:
             self._set_scene_reference_state(project_id, scene_profile_id, reference_status="failed" if isinstance(exc, ImageGenerationError) else "download_failed", reference_error=str(exc) or type(exc).__name__)
@@ -5175,18 +5320,27 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
                 continuity + "。" if continuity else "【连续长镜头】"
             ) + "@图片1是上一镜真实尾帧；从该画面无跳切地继续动作、视线、站位、光线和声音，不复述上一镜事件"
 
-        if shot.text_policy == "reference_locked":
-            text_constraint = "仅保留参考素材中已经清晰存在且用户锁定的文字，不新增或改写任何文字"
-        else:
-            text_constraint = (
-                "画面内不生成任何可读文字、汉字、字母、数字、字幕、标题、UI 文案、Logo、水印或乱码；"
-                "所有信息文字统一后期叠加"
+        # Seedance should follow visible screen/sign/UI content already authored
+        # in the shot instead of receiving a blanket no-text instruction. Keep
+        # a text restriction only when the shot explicitly selects one.
+        text_constraint = (
+            "仅保留参考素材中已经清晰存在且用户锁定的文字，不新增或改写任何文字"
+            if shot.text_policy == "reference_locked"
+            else (
+                "画面内不生成任何可读文字、汉字、字母、数字、字幕、标题、UI 文案、Logo、水印或乱码"
+                if shot.text_policy == "none"
+                else ""
             )
-
-        system_constraints = (
-            f"{text_constraint}；严格保持同一角色身份、脸型、发型、服装与人物数量；"
-            "禁止人物复制、融合、重影、畸形肢体、身份互换、说话人错位和重复台词；"
-            "每个时间段只执行该段指定的一个主体动作和一种主要运镜，段与段之间连续衔接"
+        )
+        system_constraints = "；".join(
+            item
+            for item in (
+                text_constraint,
+                "严格保持同一角色身份、脸型、发型、服装与人物数量",
+                "禁止人物复制、融合、重影、畸形肢体、身份互换、说话人错位和重复台词",
+                "每个时间段只执行该段指定的一个主体动作和一种主要运镜，段与段之间连续衔接",
+            )
+            if item
         )
         user_constraints = self._compact_prompt_text(
             shot.seedance_prompt_user_constraints,
@@ -5272,8 +5426,8 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
     def migrate_all_seedance_shots_to_multimodal(self) -> dict[str, int]:
         """Upgrade legacy Seedance prompts without overwriting current choices.
 
-        Older prompt versions predate the explicit AUTO/STRICT/MULTIMODAL
-        policy, so they are rebuilt with multimodal references once. Current
+        Versions before v7 predate the explicit AUTO/STRICT/MULTIMODAL policy,
+        so they are rebuilt with multimodal references once. V7 and newer
         prompts keep their per-shot mode and first-frame completeness choice.
         """
         project_count = 0
@@ -5284,7 +5438,12 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
             for shot in self.store.list_shots(project.id):
                 if shot.seedance_prompt_version == SEEDANCE_PROMPT_VERSION:
                     continue
-                shot.seedance_reference_mode = SeedanceReferenceMode.MULTIMODAL_REFERENCE
+                version_match = re.fullmatch(
+                    r"seedance-2\.0-director-v(\d+)",
+                    shot.seedance_prompt_version,
+                )
+                if version_match is None or int(version_match.group(1)) < 7:
+                    shot.seedance_reference_mode = SeedanceReferenceMode.MULTIMODAL_REFERENCE
                 self.synchronize_shot_cast(project, shot)
                 shot.seedance_prompt = self.compile_seedance_prompt(project, shot, assets)
                 shot.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
@@ -7098,6 +7257,7 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         user_suggestions: str,
         prompt_targets: list[str] | None = None,
         h3_skill_id: str = "h3-prompt-writing",
+        before_shot_id: str | None = None,
     ) -> Shot:
         """Generate and transactionally insert one new shot without replacing the board."""
         project = self.require_project(project_id)
@@ -7107,8 +7267,16 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         suggestions = user_suggestions.strip()
         if not suggestions:
             raise ValueError("请填写新增镜头的剧情和画面要求")
+        if after_shot_id is not None and before_shot_id is not None:
+            raise ValueError("新增镜头只能选择一个插入位置")
         existing = self.store.list_shots(project_id)
-        if after_shot_id is None:
+        if before_shot_id is not None:
+            next_shot = next((item for item in existing if item.id == before_shot_id), None)
+            if next_shot is None:
+                raise KeyError(f"Shot not found: {before_shot_id}")
+            anchor = next((item for item in existing if item.ordinal == next_shot.ordinal - 1), None)
+            intended_ordinal = next_shot.ordinal
+        elif after_shot_id is None:
             anchor = existing[-1] if existing else None
             next_shot = None
             intended_ordinal = len(existing) + 1
@@ -7281,7 +7449,11 @@ characters 必须覆盖剧情里每一个会被镜头清晰拍到、说话、执
         shot.seedance_prompt_version = SEEDANCE_PROMPT_VERSION
         shot.seedance_prompt_source_revision = shot.content_revision
         shot.keyframe_prompt_source_revision = shot.content_revision
-        inserted = self.store.insert_shot(shot, after_shot_id)
+        inserted = self.store.insert_shot(
+            shot,
+            after_shot_id=after_shot_id,
+            before_shot_id=before_shot_id,
+        )
         if scene_profile and inserted.id not in scene_profile.source_shot_ids:
             scene_profile.source_shot_ids.append(inserted.id)
             self.store.save_project(project)

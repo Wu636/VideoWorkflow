@@ -114,6 +114,7 @@ class ProjectApiTests(unittest.TestCase):
         preview = self.client.get(base + "/reference-prompt")
         self.assertEqual(preview.status_code, 200)
         self.assertIn("普通家居灯光", preview.json()["prompt"])
+        self.assertIn("绝对不出现任何人物", preview.json()["prompt"])
         payload = {"expected_version": 1, "name": "奶奶家", "description": "窗光", "continuity_notes": "保留桌椅", "reference_prompt": "EXACT USER PROMPT"}
         preview = self.client.post(base + "/reference-prompt", json=payload)
         self.assertEqual(preview.status_code, 200)
@@ -131,6 +132,25 @@ class ProjectApiTests(unittest.TestCase):
             self.assertEqual(failed.status_code, 502)
             self.assertIn("下载失败", failed.json()["detail"])
         self.assertEqual(self.client.post(base + "/reference/retry-download").status_code, 400)
+
+    def test_scene_reference_revise_route_validates_source_and_forwards_feedback(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="场景改图", story="无人空镜"))
+        profile = SceneProfile(name="大厅", description="水磨石地面")
+        project.scene_profiles = [profile]
+        router.store.save_project(project)
+        base = f"/api/projects/{project.id}/scene-profiles/{profile.id}/reference/revise"
+        self.assertEqual(self.client.post(base, json={
+            "source_asset_id": "", "user_suggestions": "改为清晨", "expected_version": 1,
+        }).status_code, 422)
+
+        mocked = AsyncMock(return_value=Asset(project_id=project.id, type=AssetType.IMAGE, role=AssetRole.SCENE,
+            name="修改版", path="/tmp/revised.png"))
+        with patch.object(router.project_service, "revise_scene_reference", new=mocked):
+            response = self.client.post(base, json={
+                "source_asset_id": "asset_old", "user_suggestions": "改为清晨", "expected_version": 1,
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        mocked.assert_awaited_once_with(project.id, profile.id, "asset_old", "改为清晨", 1, None, None)
 
     def test_script_character_backfill_route(self) -> None:
         project = router.project_service.create_project(ProjectBrief(title="角色补足接口", story="甲遇到乙"))
@@ -152,6 +172,36 @@ class ProjectApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["message"], "当前剧本中的角色均已在角色库，已有角色资料保持不变")
         analyze.assert_awaited_once_with(project.id, "只补充缺少的角色")
+
+    def test_insert_shot_route_forwards_before_first_anchor(self) -> None:
+        project = router.project_service.create_project(ProjectBrief(title="第二集转场", story="承接上一集"))
+        first = router.store.save_shot(
+            Shot(project_id=project.id, ordinal=1, title="原首镜", narrative="第二集正式开场")
+        )
+        inserted = Shot(project_id=project.id, ordinal=1, title="跨集过渡", narrative="上一集画面淡出")
+        mocked = AsyncMock(return_value=inserted)
+
+        with patch.object(router.project_service, "insert_shot_with_ai", new=mocked):
+            response = self.client.post(
+                f"/api/projects/{project.id}/shots/insert-ai",
+                json={
+                    "after_shot_id": None,
+                    "before_shot_id": first.id,
+                    "user_suggestions": "在第一个分镜前增加跨集过渡",
+                    "prompt_targets": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["title"], "跨集过渡")
+        mocked.assert_awaited_once_with(
+            project.id,
+            None,
+            "在第一个分镜前增加跨集过渡",
+            [],
+            "h3-prompt-writing",
+            before_shot_id=first.id,
+        )
 
     def test_scene_reference_can_be_uploaded_and_cleared_without_ai(self) -> None:
         project = router.project_service.create_project(ProjectBrief(title="本地场景图", story="人物在客厅"))

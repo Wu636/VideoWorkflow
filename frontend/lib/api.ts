@@ -241,6 +241,19 @@ export async function generateSceneReference(projectId: string, sceneProfileId: 
     });
 }
 
+export async function reviseSceneReference(
+    projectId: string,
+    sceneProfileId: string,
+    sourceAssetId: string,
+    userSuggestions: string,
+    expectedVersion: number,
+): Promise<Asset> {
+    return api(`/projects/${projectId}/scene-profiles/${sceneProfileId}/reference/revise`, {
+        method: "POST",
+        body: JSON.stringify({ source_asset_id: sourceAssetId, user_suggestions: userSuggestions, expected_version: expectedVersion }),
+    });
+}
+
 export async function generateCharacterReferences(projectId: string, characterIds?: string[], userSuggestions = ""): Promise<Asset[]> {
     return api(`/projects/${projectId}/characters/references/generate`, {
         method: "POST",
@@ -458,10 +471,17 @@ export async function insertShotWithAi(
     userSuggestions: string,
     promptTargets: ("h3" | "seedance")[],
     h3SkillId = "h3-prompt-writing",
+    beforeShotId: string | null = null,
 ): Promise<Shot> {
     return api(`/projects/${projectId}/shots/insert-ai`, {
         method: "POST",
-        body: JSON.stringify({ after_shot_id: afterShotId, user_suggestions: userSuggestions, prompt_targets: promptTargets, h3_skill_id: h3SkillId }),
+        body: JSON.stringify({
+            after_shot_id: afterShotId,
+            before_shot_id: beforeShotId,
+            user_suggestions: userSuggestions,
+            prompt_targets: promptTargets,
+            h3_skill_id: h3SkillId,
+        }),
     });
 }
 

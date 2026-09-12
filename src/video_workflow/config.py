@@ -1,4 +1,5 @@
 from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -76,6 +77,9 @@ class Settings(BaseSettings):
     VIDEO_GENERATION_TIMEOUT_SECONDS: int = 900
     SEEDANCE_DEFAULT_MODEL: str = "doubao-seedance-2-0-mini-260615"
     SEEDANCE_DEFAULT_RESOLUTION: str = "480p"
+    # Number of Seedance jobs that may be submitted/polled concurrently. The
+    # account/model quota may be lower; the queue backs off on provider limits.
+    SEEDANCE_RENDER_CONCURRENCY: int = Field(default=3, ge=1, le=8)
     SEEDANCE_POLL_INTERVAL_SECONDS: float = 10.0
     SEEDANCE_JOB_TIMEOUT_SECONDS: int = 3600
     SEEDANCE_INLINE_ASSET_MAX_MB: int = 25

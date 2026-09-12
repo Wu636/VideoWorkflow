@@ -5,6 +5,14 @@ export interface RenderJobStats {
     totalSeconds: number;
 }
 
+export interface ShotLockStats {
+    lockedShotCount: number;
+    totalShotCount: number;
+    unlockedShotIds: string[];
+    lockedVideoJobIds: string[];
+    unadoptedVideoJobIds: string[];
+}
+
 function positiveNumber(value: unknown): number | null {
     const parsed = typeof value === "number"
         ? value
@@ -57,4 +65,30 @@ export function summarizeRenderJobs(jobs: RenderJob[], shots: Shot[]): RenderJob
         return sum + duration;
     }, 0);
     return { taskCount: videoJobs.length, totalSeconds };
+}
+
+export function summarizeShotLocks(jobs: RenderJob[], shots: Shot[]): ShotLockStats {
+    const lockedShotIds = new Set(
+        shots.filter((shot) => !!shot.selected_video_job_id).map((shot) => shot.id),
+    );
+    const downloadableJobIds = new Set(
+        jobs
+            .filter((job) => job.type === "video" && job.status === "completed" && !!job.output_path)
+            .map((job) => job.id),
+    );
+    const lockedVideoJobIds = shots
+        .map((shot) => shot.selected_video_job_id)
+        .filter((jobId): jobId is string => !!jobId && downloadableJobIds.has(jobId));
+    const lockedVideoJobIdSet = new Set(lockedVideoJobIds);
+    const unadoptedVideoJobIds = jobs
+        .filter((job) => downloadableJobIds.has(job.id) && !lockedVideoJobIdSet.has(job.id))
+        .map((job) => job.id);
+
+    return {
+        lockedShotCount: lockedShotIds.size,
+        totalShotCount: shots.length,
+        unlockedShotIds: shots.filter((shot) => !lockedShotIds.has(shot.id)).map((shot) => shot.id),
+        lockedVideoJobIds,
+        unadoptedVideoJobIds,
+    };
 }

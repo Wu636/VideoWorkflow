@@ -325,7 +325,7 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("本段为首尾帧I2V", refreshed)
         self.assertIn("准确落到已提供尾帧构图", refreshed)
 
-    def test_h3_allows_authored_copy_while_seedance_remains_text_free(self) -> None:
+    def test_h3_and_seedance_keep_authored_visible_copy_without_a_blanket_ban(self) -> None:
         project = self.service.create_project(ProjectBrief(title="分引擎文字策略", story="电脑发布任务"))
         shot = Shot(
             project_id=project.id,
@@ -341,8 +341,23 @@ class H3PromptSkillsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("H3 可显示分镜明确写出的", h3_prompt)
         self.assertIn("逐字保留原文", h3_prompt)
         self.assertIn("紧急任务", h3_prompt)
+        self.assertIn("紧急任务", seedance_prompt)
+        self.assertNotIn("画面内不生成任何可读文字", seedance_prompt)
+        self.assertNotIn("所有信息文字统一后期叠加", seedance_prompt)
+
+    def test_seedance_none_policy_still_forbids_visible_text(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="Seedance 禁字策略", story="人物看向屏幕"))
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="人物看向屏幕",
+            text_policy="none",
+        )
+
+        seedance_prompt = self.service.compile_seedance_prompt(project, shot, [])
+
         self.assertIn("画面内不生成任何可读文字", seedance_prompt)
-        self.assertIn("所有信息文字统一后期叠加", seedance_prompt)
+        self.assertNotIn("所有信息文字统一后期叠加", seedance_prompt)
 
     def test_h3_none_policy_still_forbids_visible_text(self) -> None:
         project = self.service.create_project(ProjectBrief(title="H3 禁字策略", story="人物看向屏幕"))

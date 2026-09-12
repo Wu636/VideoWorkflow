@@ -185,6 +185,7 @@ def seedance_catalog() -> dict[str, Any]:
     return {
         "default_model": settings.SEEDANCE_DEFAULT_MODEL,
         "default_resolution": settings.SEEDANCE_DEFAULT_RESOLUTION,
+        "render_concurrency": settings.SEEDANCE_RENDER_CONCURRENCY,
         "models": [
             {
                 "id": model.id,

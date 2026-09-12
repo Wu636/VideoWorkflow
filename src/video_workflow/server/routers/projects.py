@@ -104,6 +104,14 @@ class SceneReferenceGenerateRequest(BaseModel):
     expected_version: int | None = Field(default=None, ge=1)
 
 
+class SceneReferenceReviseRequest(BaseModel):
+    source_asset_id: str = Field(min_length=1)
+    user_suggestions: str = Field(min_length=1, max_length=4000)
+    expected_version: int = Field(ge=1)
+    image_provider: str | None = None
+    image_model: str | None = None
+
+
 class SceneProfileUpdateRequest(BaseModel):
     expected_version: int = Field(ge=1)
     name: str = Field(min_length=1, max_length=200)
@@ -150,6 +158,7 @@ class ShotReviseRequest(BaseModel):
 
 class ShotInsertRequest(BaseModel):
     after_shot_id: str | None = None
+    before_shot_id: str | None = None
     user_suggestions: str = Field(min_length=1, max_length=4000)
     prompt_targets: list[Literal["h3", "seedance"]] = Field(default_factory=lambda: ["seedance"])
     h3_skill_id: str = Field(default="h3-prompt-writing", min_length=1, max_length=100)
@@ -601,6 +610,29 @@ async def generate_scene_reference(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("场景母版图生成或下载失败: %s", scene_profile_id)
+        raise HTTPException(status_code=502, detail=str(exc) or type(exc).__name__) from exc
+
+
+@router.post("/{project_id}/scene-profiles/{scene_profile_id}/reference/revise")
+async def revise_scene_reference(
+    project_id: str,
+    scene_profile_id: str,
+    request: SceneReferenceReviseRequest,
+):
+    try:
+        return await project_service.revise_scene_reference(
+            project_id, scene_profile_id, request.source_asset_id,
+            request.user_suggestions, request.expected_version,
+            request.image_provider, request.image_model,
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+    except SceneReferenceConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("场景母版图按建议修改失败: %s", scene_profile_id)
         raise HTTPException(status_code=502, detail=str(exc) or type(exc).__name__) from exc
 
 
@@ -1169,6 +1201,7 @@ async def insert_shot_with_ai(project_id: str, request: ShotInsertRequest):
             request.user_suggestions,
             request.prompt_targets,
             request.h3_skill_id,
+            before_shot_id=request.before_shot_id,
         )
     except KeyError as exc:
         raise _not_found(str(exc)) from exc

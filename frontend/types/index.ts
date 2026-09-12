@@ -465,6 +465,7 @@ export interface SeedanceModelOption {
 export interface SeedanceCatalog {
     default_model: string;
     default_resolution: string;
+    render_concurrency: number;
     models: SeedanceModelOption[];
     ratios: string[];
     configured: boolean;

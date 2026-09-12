@@ -217,8 +217,15 @@ class ProjectStore:
             )
         return shot
 
-    def insert_shot(self, shot: Shot, after_shot_id: str | None = None) -> Shot:
+    def insert_shot(
+        self,
+        shot: Shot,
+        after_shot_id: str | None = None,
+        before_shot_id: str | None = None,
+    ) -> Shot:
         """Insert one shot and renumber the tail in a single transaction."""
+        if after_shot_id is not None and before_shot_id is not None:
+            raise ValueError("Specify only one insertion anchor")
         shot.updated_at = utc_now()
         with self._lock, self._connect() as conn:
             rows = conn.execute(
@@ -226,7 +233,12 @@ class ProjectStore:
                 (shot.project_id,),
             ).fetchall()
             existing = [Shot.model_validate_json(row["data"]) for row in rows]
-            if after_shot_id is None:
+            if before_shot_id is not None:
+                anchor = next((item for item in existing if item.id == before_shot_id), None)
+                if anchor is None:
+                    raise KeyError(f"Shot not found: {before_shot_id}")
+                ordinal = anchor.ordinal
+            elif after_shot_id is None:
                 ordinal = len(existing) + 1
             else:
                 anchor = next((item for item in existing if item.id == after_shot_id), None)
@@ -400,17 +412,37 @@ class ProjectStore:
             rows = conn.execute(query, params).fetchall()
         return [RenderJob.model_validate_json(row["data"]) for row in rows]
 
-    def claim_next_job(self) -> RenderJob | None:
+    def claim_next_job(
+        self,
+        provider: str | None = None,
+        *,
+        exclude_provider: str | None = None,
+    ) -> RenderJob | None:
+        """Atomically claim the oldest queued job matching the filters.
+
+        Provider filtering happens after decoding the JSON payload because the
+        provider is intentionally kept inside ``RenderJob`` rather than as a
+        separate database column.  The transaction still protects the claim
+        from another queue loop or backend process.
+        """
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT data FROM render_jobs WHERE status=? ORDER BY created_at LIMIT 1",
+            rows = conn.execute(
+                "SELECT data FROM render_jobs WHERE status=? ORDER BY created_at",
                 (JobStatus.QUEUED.value,),
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            job: RenderJob | None = None
+            for row in rows:
+                candidate = RenderJob.model_validate_json(row["data"])
+                if provider is not None and candidate.provider != provider:
+                    continue
+                if exclude_provider is not None and candidate.provider == exclude_provider:
+                    continue
+                job = candidate
+                break
+            if job is None:
                 conn.commit()
                 return None
-            job = RenderJob.model_validate_json(row["data"])
             job.status = JobStatus.SUBMITTING
             job.started_at = job.started_at or utc_now()
             job.attempt += 1

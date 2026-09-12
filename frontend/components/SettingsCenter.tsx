@@ -31,7 +31,7 @@ export default function SettingsCenter() {
             const result = await updateRuntimeSettings(draft, clearKeys);
             setPayload(result); setClearKeys([]);
             setDraft(Object.fromEntries(result.groups.flatMap((group) => group.fields.map((field) => [field.key, field.value]))));
-            setNotice("配置已保存并即时生效，H3 队列连接也已刷新。新密钥不会回显到浏览器。");
+            setNotice("配置已保存并即时生效，视频队列连接也已刷新。新密钥不会回显到浏览器。");
         } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); }
         finally { setBusy(false); }
     };
@@ -67,10 +67,11 @@ export default function SettingsCenter() {
 function SettingField({ field, value, clear, onChange, onClear }: { field: RuntimeSettingField; value: unknown; clear: boolean; onChange: (value: unknown) => void; onClear: () => void }) {
     const isBool = typeof value === "boolean";
     const isNumber = typeof value === "number";
+    const isSeedanceConcurrency = field.key === "SEEDANCE_RENDER_CONCURRENCY";
     return <label><span className="studio-label flex items-center justify-between"><span>{field.label}</span>{field.secret && <span className={field.configured && !clear ? "text-emerald-300/70" : "text-white/25"}>{field.configured && !clear ? <span className="inline-flex items-center gap-1"><CheckCircle2 size={11} />{field.masked}</span> : "未配置"}</span>}</span><div className="studio-field">
         {field.secret ? <div className="flex gap-2"><div className="relative min-w-0 flex-1"><KeyRound className="absolute left-3 top-3 text-white/20" size={14} /><input className="!pl-9" type="password" value={String(value || "")} placeholder={clear ? "保存后清除密钥" : "留空则保持原密钥"} onChange={(event) => onChange(event.target.value)} /></div><button type="button" className={clear ? "studio-danger px-3" : "studio-secondary px-3"} title="清除已保存密钥" onClick={onClear}><Trash2 size={14} /></button></div>
             : field.options.length ? <select value={String(value ?? "")} onChange={(event) => onChange(event.target.value)}>{field.options.map((option) => <option key={option}>{option}</option>)}</select>
             : isBool ? <label className="flex h-[42px] items-center gap-2 rounded-lg border border-white/10 bg-black/25 px-3 text-sm text-white/70"><input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} />{value ? "开启" : "关闭"}</label>
-            : <input type={isNumber ? "number" : "text"} step={isNumber ? "any" : undefined} value={String(value ?? "")} onChange={(event) => onChange(isNumber ? Number(event.target.value) : event.target.value)} />}
+            : <input type={isNumber ? "number" : "text"} min={isSeedanceConcurrency ? 1 : undefined} max={isSeedanceConcurrency ? 8 : undefined} step={isSeedanceConcurrency ? 1 : isNumber ? "any" : undefined} value={String(value ?? "")} onChange={(event) => onChange(isNumber ? Number(event.target.value) : event.target.value)} />}
     </div>{field.description && <p className="mt-1 text-[11px] text-white/25">{field.description}</p>}</label>;
 }

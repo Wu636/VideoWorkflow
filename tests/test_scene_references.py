@@ -33,6 +33,10 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.root = Path(self.temp.name)
         self.store = ProjectStore(self.root / "state.sqlite3")
         self.service = ProjectService(self.store)
+        class EmptySetVision:
+            async def generate_json(_, *_args, **_kwargs):
+                return {"has_people": False}
+        self.service._scene_reference_vision_generator = lambda: EmptySetVision()
         self.service.project_dir = lambda project_id: self.root / project_id
         self.project = self.service.create_project(ProjectBrief(title="场景测试", story="家中与地府"))
         self.home = SceneProfile(name="奶奶家", description="普通客厅，正常室内灯", continuity_notes="保留沙发位置")
@@ -74,6 +78,81 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("全片地府蓝光", prompt)
         self.assertNotIn("全片双人物", prompt)
         self.assertEqual(self.latest().reference_prompt, "")  # preview is read-only
+
+    def test_old_scene_profile_removes_cast_and_human_style_before_generation(self):
+        project = self.service.require_project(self.project.id)
+        project.characters = [CharacterProfile(name="陆峥"), CharacterProfile(name="林晓")]
+        project.scene_profiles[0].description = (
+            "中央为弧形主控屏，前方是操作台；陆峥、林晓围绕操作台活动。"
+            "环境光以冷蓝为主，屏幕光映照人物与操作台。"
+            "环境与道具保留写实质感，控制台具有金属质感。"
+        )
+        project.scene_profiles[0].continuity_notes = "保持三人相对站位；弧形大屏与操作台方位一致"
+        project.style_profile.medium = "次世代 PBR；真人向写实动画质感"
+        self.store.save_project(project)
+
+        default_prompt = self.service.compile_scene_reference_prompt(project, project.scene_profiles[0])
+        positive = default_prompt.split("【环境场景图硬约束")[0]
+        self.assertIn("主控屏", positive)
+        self.assertIn("操作台", positive)
+        self.assertIn("PBR", positive)
+        for person_detail in ("陆峥", "林晓", "人物", "站位", "真人"):
+            self.assertNotIn(person_detail, positive)
+        self.assertIn("绝对不出现任何人物", default_prompt)
+
+    async def test_detected_people_trigger_one_correction_and_only_bind_clean_image(self):
+        seen: list[tuple[str | None, str]] = []
+        checked: list[str] = []
+
+        class Vision:
+            async def generate_json(_, _system, _prompt, reference_images):
+                checked.extend(reference_images)
+                return {"has_people": len(checked) == 1}
+
+        class Generator:
+            async def generate_image(_, scene, output_dir, reference_image_path, **_kwargs):
+                seen.append((reference_image_path, scene.visual_prompt))
+                output = Path(output_dir) / "result.png"
+                output.write_bytes(PNG)
+                return str(output)
+
+        self.service._scene_reference_vision_generator = lambda: Vision()
+        with patch("src.video_workflow.services.projects.create_image_generator", return_value=Generator()):
+            clean_asset = await self.service.generate_scene_reference(self.project.id, self.home.id)
+
+        self.assertEqual(len(seen), 2)
+        self.assertIsNone(seen[0][0])
+        self.assertEqual(seen[1][0], checked[0])
+        self.assertIn("彻底擦除所有人物", seen[1][1])
+        self.assertEqual(self.latest().reference_asset_ids, [clean_asset.id])
+        self.assertEqual(len(self.store.list_assets(self.project.id)), 2)
+        self.assertTrue(any("含人物未绑定" in item.name for item in self.store.list_assets(self.project.id)))
+
+    async def test_still_contains_people_after_correction_keeps_existing_reference(self):
+        old_path = self.root / "previous.png"
+        old_path.write_bytes(PNG)
+        old_asset = self.service.register_existing_asset(self.project.id, old_path, AssetRole.SCENE, "旧母版")
+        project = self.service.require_project(self.project.id)
+        project.scene_profiles[0].reference_asset_ids = [old_asset.id]
+        self.store.save_project(project)
+
+        class Vision:
+            async def generate_json(_, _system, _prompt, reference_images):
+                return {"has_people": True}
+
+        class Generator:
+            async def generate_image(_, scene, output_dir, reference_image_path, **_kwargs):
+                output = Path(output_dir) / "result.png"
+                output.write_bytes(PNG)
+                return str(output)
+
+        self.service._scene_reference_vision_generator = lambda: Vision()
+        with patch("src.video_workflow.services.projects.create_image_generator", return_value=Generator()):
+            with self.assertRaisesRegex(Exception, "连续两次出图都检测到人物"):
+                await self.service.generate_scene_reference(self.project.id, self.home.id)
+        self.assertEqual(self.latest().reference_status, "failed")
+        self.assertEqual(self.latest().reference_asset_ids, [old_asset.id])
+        self.assertEqual(len(self.store.list_assets(self.project.id)), 3)
 
     def test_batch_apply_uses_scene_as_authority_and_preserves_paid_outputs(self):
         scene_path = self.root / "home.png"
@@ -320,7 +399,7 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         class Generator:
             async def generate_image(_, scene, output_dir, *args, **kwargs):
                 calls.append((scene.visual_prompt, kwargs))
-                if scene.visual_prompt == "CUSTOM HOME":
+                if scene.visual_prompt.startswith("CUSTOM HOME\n"):
                     started.set()
                     await release.wait()
                 output = Path(output_dir) / "result.png"
@@ -337,7 +416,9 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.generate_scene_reference(self.project.id, self.office.id, prompt="CUSTOM OFFICE")
             release.set()
             await task
-        self.assertEqual([item[0] for item in calls], ["CUSTOM HOME", "CUSTOM OFFICE"])
+        self.assertTrue(calls[0][0].startswith("CUSTOM HOME\n"))
+        self.assertTrue(calls[1][0].startswith("CUSTOM OFFICE\n"))
+        self.assertTrue(all("绝对不出现任何人物" in prompt for prompt, _ in calls))
         for _, kwargs in calls:
             self.assertEqual(kwargs["image_style"], "")
             self.assertEqual(kwargs["character_description"], "")
@@ -365,6 +446,7 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed.reference_status, "download_failed")
         self.assertEqual(failed.reference_asset_ids, [asset.id])
         self.assertEqual(failed.reference_prompt, "PAID IMAGE PROMPT")
+        self.assertIn("绝对不出现任何人物", failed.reference_generation_prompt)
 
         async def resume(output_dir):
             result = Path(output_dir) / "result.png"
@@ -374,8 +456,10 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.video_workflow.services.projects.create_image_generator", side_effect=AssertionError("paid submission forbidden")), patch.object(GrsaiImageGenerator, "resume_image", side_effect=resume):
             await self.service.retry_scene_reference_download(self.project.id, self.home.id)
         self.assertEqual(self.latest().reference_status, "completed")
-        self.assertEqual(len(self.latest().reference_asset_ids), 2)
-        self.assertEqual(self.latest().reference_generation_prompt, "PAID IMAGE PROMPT")
+        self.assertEqual(len(self.latest().reference_asset_ids), 1)
+        self.assertNotEqual(self.latest().reference_asset_ids[0], asset.id)
+        self.assertIsNotNone(self.store.get_asset(asset.id))
+        self.assertTrue(self.latest().reference_generation_prompt.startswith("PAID IMAGE PROMPT\n"))
 
     def test_restart_and_download_stage_are_visible(self):
         profile = self.service._set_scene_reference_state(self.project.id, self.home.id,

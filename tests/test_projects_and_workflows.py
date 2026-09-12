@@ -167,9 +167,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(h3_frames_for_seconds(5), 124)
         self.assertEqual(h3_frames_for_seconds(15), 362)
         self.assertEqual((h3_frames_for_seconds(9) - 5) % 17, 0)
-        self.assertEqual(grsai_image_endpoint("gpt-image-2"), "/v1/draw/completions")
-        self.assertEqual(grsai_image_endpoint("gpt-image-2.5"), "/v1/draw/completions")
-        self.assertEqual(grsai_image_endpoint("gpt-image-2.5-sunburst"), "/v1/draw/completions")
+        self.assertEqual(grsai_image_endpoint("gpt-image-2"), "/v1/api/generate")
+        self.assertEqual(grsai_image_endpoint("gpt-image-2.5"), "/v1/api/generate")
+        self.assertEqual(grsai_image_endpoint("gpt-image-2.5-sunburst"), "/v1/api/generate")
         self.assertEqual(grsai_image_endpoint("nano-banana-fast"), "/v1/draw/nano-banana")
         self.assertEqual(grsai_image_aspect_ratio("gpt-image-2", "16:9"), "1672x941")
         self.assertEqual(grsai_image_aspect_ratio("gpt-image-2.5", "16:9"), "1280x720")
@@ -318,6 +318,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             return actual_client(transport=httpx.MockTransport(handle), **kwargs)
 
         with tempfile.TemporaryDirectory() as folder:
+            reference_path = Path(folder) / "previous.png"
+            reference_path.write_bytes(b"reference-image")
             with (
                 patch.object(settings, "GRSAI_API_KEY", "fixture-key"),
                 patch.object(settings, "GRSAI_BASE_URL", "https://grsai.example.invalid"),
@@ -331,6 +333,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                     GrsaiImageGenerator("gpt-image-2.5").generate_image(
                         Scene(id=1, duration=5, narrative="room", visual_prompt="EXACT", motion_prompt=""),
                         folder,
+                        reference_image_path=str(reference_path),
                         character_description="",
                         image_style="",
                         aspect_ratio="16:9",
@@ -339,11 +342,36 @@ class ProjectAndWorkflowTests(unittest.TestCase):
 
         self.assertEqual(result, "/tmp/generated.png")
         self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0].url.path, "/v1/draw/completions")
+        self.assertEqual(requests[0].url.path, "/v1/api/generate")
         payload = json.loads(requests[0].content)
         self.assertEqual(payload["model"], "gpt-image-2.5")
         self.assertEqual(payload["aspectRatio"], "1280x720")
+        self.assertEqual(payload["replyType"], "json")
+        self.assertEqual(len(payload["images"]), 1)
+        self.assertNotIn("urls", payload)
         self.assertNotIn("imageSize", payload)
+
+    def test_grsai_gpt_image_25_polls_current_result_endpoint(self) -> None:
+        requests: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"id": "task-25", "status": "succeeded", "results": [{"url": "https://files.example.invalid/done.png"}]})
+
+        async def run_poll() -> dict[str, object]:
+            async with httpx.AsyncClient(base_url="https://grsai.example.invalid", transport=httpx.MockTransport(handle)) as client:
+                return await GrsaiImageGenerator("gpt-image-2.5")._wait_for_result(
+                    client, {"id": "task-25", "status": "running"}
+                )
+
+        with patch.object(settings, "GRSAI_API_KEY", "fixture-key"), patch.object(settings, "GRSAI_RESULT_POLL_INTERVAL_SECONDS", 0):
+            result = asyncio.run(run_poll())
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].method, "GET")
+        self.assertEqual(requests[0].url.path, "/v1/api/result")
+        self.assertEqual(requests[0].url.params["id"], "task-25")
 
     def test_media_paths_survive_host_and_container_roots(self) -> None:
         media = settings.PROJECTS_DIR / "project_portable" / "deliveries" / "final.mp4"
@@ -834,7 +862,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                 return str(output)
 
         self_test = self
-        with patch(
+        vision = AsyncMock()
+        vision.generate_json.return_value = {"has_people": False}
+        with patch.object(self.service, "_scene_reference_vision_generator", return_value=vision), patch(
             "src.video_workflow.services.projects.create_image_generator",
             return_value=FakeImageGenerator(),
         ):
@@ -845,6 +875,56 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(saved_project.ai_recommended_shot_count, 77)
         self.assertIn(asset.id, saved_profile.reference_asset_ids)
         self.assertTrue(saved_profile.approved)
+
+    def test_scene_reference_enforces_empty_set_and_revises_from_last_image(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="环境空镜", story="工程现场交谈"))
+        profile = SceneProfile(
+            name="工程现场", description="左侧五名工人戴安全帽，右侧承包商站立；远处有钢架",
+            continuity_notes="保持两队人员的站位", reference_prompt="画出十名工人和钢架",
+        )
+        project.scene_profiles = [profile]
+        self.store.save_project(project)
+        calls: list[dict[str, object]] = []
+
+        class FakeImageGenerator:
+            async def generate_image(
+                self, scene: Scene, output_dir: str, reference_image_path: str | None,
+                **kwargs: object,
+            ) -> str:
+                calls.append({"prompt": scene.visual_prompt, "reference": reference_image_path, **kwargs})
+                output = Path(output_dir) / "scene.png"
+                output.write_bytes(f"scene-{len(calls)}".encode())
+                return str(output)
+
+        vision = AsyncMock()
+        vision.generate_json.return_value = {"has_people": False}
+        with patch.object(self.service, "_scene_reference_vision_generator", return_value=vision), patch("src.video_workflow.services.projects.create_image_generator", return_value=FakeImageGenerator()):
+            first = asyncio.run(self.service.generate_scene_reference(project.id, profile.id))
+            after_first = self.service.require_scene_profile(project.id, profile.id)[1]
+            base_prompt = after_first.reference_prompt
+            second = asyncio.run(self.service.revise_scene_reference(
+                project.id, profile.id, first.id, "把黄昏改成清晨，保留钢架", after_first.version,
+            ))
+
+        self.assertIsNone(calls[0]["reference"])
+        self.assertEqual(calls[0]["character_description"], "")
+        self.assertEqual(calls[0]["image_style"], "")
+        self.assertIn("绝对不出现任何人物", str(calls[0]["prompt"]))
+        self.assertNotIn("十名工人", str(calls[0]["prompt"]).split("【环境场景图硬约束")[0])
+        self.assertTrue(str(calls[0]["prompt"]).endswith("完全无人且没有人形痕迹的空场景。"))
+        self.assertEqual(calls[1]["reference"], str(resolve_media_path(first.path)))
+        self.assertIn("把黄昏改成清晨", str(calls[1]["prompt"]))
+        self.assertNotIn("十名工人", str(calls[1]["prompt"]).split("【环境场景图硬约束")[0])
+        self.assertNotEqual(first.id, second.id)
+        self.assertTrue(resolve_media_path(first.path).is_file())
+        saved_profile = self.service.require_scene_profile(project.id, profile.id)[1]
+        self.assertEqual(saved_profile.reference_asset_ids, [second.id])
+        self.assertEqual(saved_profile.reference_prompt, base_prompt)
+        self.assertEqual(saved_profile.reference_source, "ai")
+        with self.assertRaisesRegex(ValueError, "具体建议"):
+            asyncio.run(self.service.revise_scene_reference(
+                project.id, profile.id, second.id, "  ", saved_profile.version,
+            ))
 
     def test_scene_profile_manual_reference_is_used_by_automatic_material_selection(self) -> None:
         project = self.service.create_project(ProjectBrief(title="手工场景图", story="人物在客厅"))
@@ -1733,6 +1813,61 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         refreshed = self.service.require_project(project.id)
         self.assertIn(inserted.id, refreshed.scene_profiles[0].source_shot_ids)
 
+    def test_ai_insert_can_add_transition_before_first_shot(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="第二集", story="承接上一集后继续调查"))
+        first = self.store.save_shot(
+            Shot(
+                project_id=project.id,
+                ordinal=1,
+                title="原镜一",
+                narrative="角色进入新地点",
+                image_path="kept-first.png",
+                video_path="kept-first.mp4",
+            )
+        )
+        second = self.store.save_shot(
+            Shot(project_id=project.id, ordinal=2, title="原镜二", narrative="角色开始调查")
+        )
+        captured: dict[str, str] = {}
+
+        class FakeLLM:
+            async def generate_json(self, _system_prompt: str, user_prompt: str) -> dict[str, object]:
+                captured["prompt"] = user_prompt
+                return {
+                    "title": "跨集过渡",
+                    "duration_seconds": 5,
+                    "event": "上一集的夜景淡出，镜头转入第二集清晨",
+                    "opening_state": "上一集结尾地点的夜景空镜",
+                    "character_names": [],
+                    "shot_size": "大全景",
+                    "camera_angle": "平视",
+                    "camera_motion": "缓慢后拉",
+                    "subject_motion": "夜色逐渐过渡到清晨",
+                    "visual_beats": [],
+                    "voice_events": [],
+                }
+
+        with patch("src.video_workflow.services.projects.create_llm_generator", return_value=FakeLLM()):
+            inserted = asyncio.run(
+                self.service.insert_shot_with_ai(
+                    project.id,
+                    None,
+                    "在第二集第一个分镜前增加承接上一集的过渡镜头",
+                    [],
+                    before_shot_id=first.id,
+                )
+            )
+
+        shots = self.store.list_shots(project.id)
+        self.assertEqual([shot.id for shot in shots], [inserted.id, first.id, second.id])
+        self.assertEqual([shot.ordinal for shot in shots], [1, 2, 3])
+        self.assertEqual(shots[1].image_path, "kept-first.png")
+        self.assertEqual(shots[1].video_path, "kept-first.mp4")
+        self.assertIn("预期插入为第 1 镜", captured["prompt"])
+        self.assertIn("上一镜：{}", captured["prompt"])
+        self.assertIn("下一镜：", captured["prompt"])
+        self.assertIn("原镜一", captured["prompt"])
+
     def test_changing_seedance_reference_mode_recompiles_material_numbers(self) -> None:
         project = self.service.create_project(ProjectBrief(title="参考策略", story="角色稍后入画"))
         character = CharacterProfile(name="张小差", wardrobe="炭黑工装", reference_asset_ids=["character-ref"])
@@ -1800,7 +1935,28 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(first, {"project_count": 1, "shot_count": 1})
         self.assertEqual(second, {"project_count": 0, "shot_count": 0})
         self.assertEqual(migrated.seedance_reference_mode, SeedanceReferenceMode.MULTIMODAL_REFERENCE)
-        self.assertEqual(migrated.seedance_prompt_version, "seedance-2.0-director-v7")
+        self.assertEqual(migrated.seedance_prompt_version, "seedance-2.0-director-v8")
+
+    def test_seedance_v7_migration_preserves_current_reference_mode(self) -> None:
+        project = self.service.create_project(ProjectBrief(title="当前项目", story="保留严格首帧"))
+        shot = Shot(
+            project_id=project.id,
+            ordinal=1,
+            narrative="屏幕自然显示运行状态",
+            seedance_reference_mode=SeedanceReferenceMode.STRICT_FIRST_FRAME,
+            seedance_prompt="旧版 v7 提示词",
+            seedance_prompt_version="seedance-2.0-director-v7",
+        )
+        self.store.save_shot(shot)
+
+        result = self.service.migrate_all_seedance_shots_to_multimodal()
+        migrated = self.service.require_shot(shot.id)
+
+        self.assertEqual(result, {"project_count": 1, "shot_count": 1})
+        self.assertEqual(migrated.seedance_reference_mode, SeedanceReferenceMode.STRICT_FIRST_FRAME)
+        self.assertEqual(migrated.seedance_prompt_version, "seedance-2.0-director-v8")
+        self.assertIn("屏幕自然显示运行状态", migrated.seedance_prompt)
+        self.assertNotIn("所有信息文字统一后期叠加", migrated.seedance_prompt)
 
     def test_comfyui_submit_uses_canonical_uuid_prompt_id(self) -> None:
         captured: dict[str, object] = {}
@@ -2761,9 +2917,14 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         previous_model = settings.DEEPSEEK_MODEL
         previous_provider = settings.H3_PROVIDER
         previous_audio_mode = settings.H3_AUDIO_MODE
+        previous_seedance_concurrency = settings.SEEDANCE_RENDER_CONCURRENCY
         manager = RuntimeSettingsManager()
         try:
-            manager.update({"DEEPSEEK_API_KEY": "test-secret-1234", "DEEPSEEK_MODEL": "test-model"})
+            manager.update({
+                "DEEPSEEK_API_KEY": "test-secret-1234",
+                "DEEPSEEK_MODEL": "test-model",
+                "SEEDANCE_RENDER_CONCURRENCY": 2,
+            })
             settings.H3_PROVIDER = "comfyui_h3"
             settings.H3_AUDIO_MODE = "native"
             payload = manager.public_payload()
@@ -2771,6 +2932,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             self.assertEqual(fields["DEEPSEEK_API_KEY"]["value"], "")
             self.assertEqual(fields["DEEPSEEK_API_KEY"]["masked"], "••••1234")
             self.assertEqual(settings.DEEPSEEK_MODEL, "test-model")
+            self.assertEqual(settings.SEEDANCE_RENDER_CONCURRENCY, 2)
+            with self.assertRaises(ValueError):
+                manager.update({"SEEDANCE_RENDER_CONCURRENCY": 9})
             self.assertEqual(manager.path.stat().st_mode & 0o777, 0o600)
             routes = {route["id"]: route for route in payload["routes"]}
             self.assertEqual(routes["storyboard"]["setting_key"], "LLM_PROVIDER")
@@ -2784,6 +2948,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             settings.DEEPSEEK_MODEL = previous_model
             settings.H3_PROVIDER = previous_provider
             settings.H3_AUDIO_MODE = previous_audio_mode
+            settings.SEEDANCE_RENDER_CONCURRENCY = previous_seedance_concurrency
 
     def test_brief_analysis_uses_bound_reference_images(self) -> None:
         project = self.service.create_project(ProjectBrief(title="analysis", story="小雨在旧车站等母亲", target_duration_seconds=30))

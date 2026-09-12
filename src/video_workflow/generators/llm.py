@@ -29,7 +29,7 @@ COMPACT_STORYBOARD_SYSTEM_PROMPT = """
 {"topic":"", "scenes":[{"duration":6,"event":"本镜完整可见事件","opening_state":"0 秒静态起始状态","dialogue":"纯台词或空字符串","dialogue_speaker":"发言角色名/旁白/空字符串","character_names":["本镜可辨认角色完整名"],"shot_size":"中景","camera_angle":"平视","lens":"50mm","camera_motion":"固定或一种主要运镜","visual_beats":[{"start_seconds":0,"end_seconds":3,"purpose":"开场钩子/推进/结果","subject_action":"一个主动作","environment_action":"环境反馈","shot_size":"","camera_angle":"","camera_motion":"","sound_cue":""}],"voice_events":[{"kind":"character/system_vo/narration/offscreen/inner_monologue","speaker_name":"","text":"","start_seconds":0.5,"end_seconds":2.5,"lip_sync":false}]}]}
 每个镜头只保留一个 event 和一个 opening_state；visual_beats 从 0 秒连续覆盖到 duration，每 2–4 秒出现新的可见变化，形成触发、执行、反馈、结果的动作弧线。镜头时长 4–15 秒，严格按用户要求的镜头数输出。
 只在确有需要时输出 transition、audio_design、text_policy；不要输出 visual_prompt、keyframe_prompt、motion_prompt、story_beat、narrative、id 等冗余字段，这些字段由系统本地编译。不要在 beats 重复整镜的景别、角度和运镜，留空表示继承镜头级设置。
-所有声音统一以 voice_events 为唯一时序来源；dialogue 仅为兼容字段，已有 voice_events 时保持空字符串，避免重复输出同一句话。角色声音写 character 并绑定唯一 speaker_name，旁白/系统播报/画外音/内心独白使用对应 kind 且 lip_sync=false（内心独白可绑定角色 speaker_id 以复用角色音色）。默认按每秒 3.4 个有效中文字符控制整镜可朗读文字，并为画面反应和环境声留出空间；如果用户明确选择完整保留模式，所有需配音文字必须逐字保留，只允许拆句、分配镜头和调整时间，禁止删词、改写、概括、合并不同来源或重复。各声音事件不重叠。character_names 只列出当前镜头真正可辨认的人物，并逐字沿用角色档案中的名称。首帧 opening_state 只写静态状态，不写未来动作、声音或字幕；画面文字留给后期叠加。保持角色身份、服装、场景和统一风格连续。
+所有声音统一以 voice_events 为唯一时序来源；dialogue 仅为兼容字段，已有 voice_events 时保持空字符串，避免重复输出同一句话。角色声音写 character 并绑定唯一 speaker_name，旁白/系统播报/画外音/内心独白使用对应 kind 且 lip_sync=false（内心独白可绑定角色 speaker_id 以复用角色音色）。默认按每秒 3.4 个有效中文字符控制整镜可朗读文字，并为画面反应和环境声留出空间；如果用户明确选择完整保留模式，所有需配音文字必须逐字保留，只允许拆句、分配镜头和调整时间，禁止删词、改写、概括、合并不同来源或重复。各声音事件不重叠。character_names 只列出当前镜头真正可辨认的人物，并逐字沿用角色档案中的名称。首帧 opening_state 只写静态状态，不写未来动作或声音，也不把对白自动做成字幕；剧情明确需要的屏幕、标牌和界面内容必须保留在 event 或 visual_beats 中，供视频提示词自然呈现。保持角色身份、服装、场景和统一风格连续。
 """.strip()
 
 
@@ -451,7 +451,7 @@ def _build_prompt_context_text(
         "4. event 只写本镜完整可见事件，opening_state 只写 0 秒静态状态；dialogue 只写真正说出口的台词；voice_events 必须明确 kind、speaker_name、起止时间和 lip_sync。\n"
         "5. 系统播报、旁白和画外音不是画面角色：kind 分别使用 system_vo、narration 或 offscreen，lip_sync=false；只有 character 声音允许口型同步。\n"
         "6. character_names 必须列出本镜所有可辨认角色，并逐字使用角色设定中的完整名称；不得以泛称替代或凭空新增可辨认人物。\n"
-        "7. opening_state 只描述 0 秒静态画面，不写未来动作、运镜、声音或时长；默认 text_policy=post_overlay，画面中的字幕、标题、UI 文案均留给后期叠加。\n"
+        "7. opening_state 只描述 0 秒静态画面，不写未来动作、运镜、声音或时长；默认 text_policy=post_overlay，不把对白自动做成字幕；剧情明确需要的屏幕、标牌和界面内容保留在 event 或 visual_beats 中，供 Seedance 自然呈现。\n"
         "8. 具体时序、景别变化、环境反馈、单段运镜和声音卡点写入 visual_beats；镜头级景别、角度和运镜只写一次，beat 中相同值留空。\n"
         "9. 默认声音密度为 duration×3.4 个有效中文字符，前后留出反应和环境声；如用户的高优先级项目约束指定其他口播档及每秒字符数，按该预算编排。若用户明确选择完整保留模式，原始需配音文字逐字保留；未选择时才允许按预算做内容压缩。\n"
         "10. voice_events 是唯一声音时序来源；已有 voice_events 时 dialogue 留空，同一句话只出现一次。未选择完整保留模式时，系统规则或长旁白可压缩成推动本镜的1–3条关键信息；完整保留模式下只允许拆句、分配镜头和调整时间，15秒镜头最多4个声音事件，事件不得重叠。"
@@ -574,7 +574,7 @@ class DeepSeekGenerator(LLMGenerator):
 
 - visual_prompt 应当详细描述整镜的通用视觉方向；keyframe_prompt 必须单独描述视频开始前的静态首帧，二者不得复制成同一段文字。
 - motion_prompt 总结动作弧线，visual_beats 负责逐段动作、环境反馈、景别、运镜和声音卡点。
-- keyframe_prompt 默认不含可读文字；标题、字幕、对白字卡和 UI 文案使用 post_overlay 后期叠加。
+	- keyframe_prompt 只描述静态起始画面，不把对白自动做成字幕；剧情明确需要的屏幕、标牌和 UI 内容仍保留在 event 或 visual_beats 中。
 - 发言镜头必须填写 dialogue_speaker，其他人物明确保持闭嘴和静止反应。
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
 """
@@ -762,7 +762,7 @@ class OpenLuxGenerator(LLMGenerator):
 4. character_names 必须列出所有可辨认人物并始终使用相同角色名，不得临时改成泛称或凭空新增人物。
 5. 每个 visual beat 只指定一种机位和一种主要运镜；keyframe_prompt、visual_prompt、motion_prompt、visual_beats 各司其职，不得互相复制。
 6. 所有镜头严格遵守用户提供的角色参考图、场景资产和风格参考，保持人物、服装、空间结构、色彩、材质和光线连续。
-7. 系统播报、旁白与画外音必须使用非 character 的 voice kind 且 lip_sync=false；默认 text_policy=post_overlay，首帧与生成视频内不生成字幕、标题或 UI 文案。
+7. 系统播报、旁白与画外音必须使用非 character 的 voice kind 且 lip_sync=false；默认 text_policy=post_overlay，不把对白自动做成字幕；剧情明确需要的屏幕、标牌和 UI 内容必须保留，供 Seedance 自然呈现。
 """.strip()
 
         self.system_prompt = COMPACT_STORYBOARD_SYSTEM_PROMPT
@@ -1029,7 +1029,7 @@ class GLMGenerator(LLMGenerator):
 
 - visual_prompt 必须包含整镜的通用视觉方向；keyframe_prompt 必须单独描述静态开场首帧，并保持角色外观一致
 - motion_prompt 总结动作弧线，visual_beats 负责逐段动作、环境反馈、景别、运镜和声音卡点
-- keyframe_prompt 默认不含可读文字；标题、字幕、对白字卡和 UI 文案使用 post_overlay 后期叠加
+	- keyframe_prompt 只描述静态起始画面，不把对白自动做成字幕；剧情明确需要的屏幕、标牌和 UI 内容仍保留在 narrative 或 visual_beats 中
 - 发言镜头必须填写 dialogue_speaker，其他人物明确保持闭嘴和静止反应
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串
 """
@@ -1352,7 +1352,7 @@ class ArkLLMGenerator(LLMGenerator):
 
 - visual_prompt 应当详细描述整镜的通用视觉方向；keyframe_prompt 必须单独描述视频开始前的静态首帧，二者不得复制成同一段文字。
 - motion_prompt 总结动作弧线，visual_beats 负责逐段动作、环境反馈、景别、运镜和声音卡点。
-- keyframe_prompt 默认不含可读文字；标题、字幕、对白字卡和 UI 文案使用 post_overlay 后期叠加。
+	- keyframe_prompt 只描述静态起始画面，不把对白自动做成字幕；剧情明确需要的屏幕、标牌和 UI 内容仍保留在 narrative 或 visual_beats 中。
 - 发言镜头必须填写 dialogue_speaker，其他人物明确保持闭嘴和静止反应。
 - 严禁使用 Markdown 格式，仅返回纯 JSON 字符串。
 """

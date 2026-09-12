@@ -41,6 +41,7 @@ class SeedanceIntegrationTests(unittest.TestCase):
         )
         catalog = seedance_catalog()
         self.assertEqual(len(catalog["models"]), 3)
+        self.assertEqual(catalog["render_concurrency"], settings.SEEDANCE_RENDER_CONCURRENCY)
         self.assertEqual(
             {item["example_720p_yuan_per_second"] for item in catalog["models"]},
             {0.9936, 0.7992, 0.4968},
@@ -473,6 +474,8 @@ class SeedanceIntegrationTests(unittest.TestCase):
 
         self.assertTrue(_is_transient_seedance_error(ValueError("content[1].image_url 的素材公网地址不可读取：")))
         self.assertTrue(_is_transient_seedance_error(RuntimeError("Seedance 提交失败 (400): timeout while fetching resource")))
+        self.assertTrue(_is_transient_seedance_error(RuntimeError("Seedance 提交失败 (429): concurrent limit")))
+        self.assertTrue(_is_transient_seedance_error(RuntimeError("50430 Request Has Reached API Concurrent Limit")))
         self.assertFalse(_is_transient_seedance_error(ValueError("Unsupported resolution: 360p")))
 
 
