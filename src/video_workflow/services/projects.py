@@ -66,6 +66,12 @@ from src.video_workflow.speech_budget import (
     spoken_character_count,
 )
 from src.video_workflow.storage import ProjectStore
+from src.video_workflow.prompt_profiles import (
+    PromptTemplateVersion,
+    profile_hash,
+    system_default_profile,
+    validate_template_variables,
+)
 from src.video_workflow.types import Scene
 
 logger = logging.getLogger(__name__)
@@ -275,6 +281,55 @@ class ProjectService:
         self.project_dir(project.id).mkdir(parents=True, exist_ok=True)
         return self.store.save_project(project)
 
+    def prompt_profile_for_project(self, project: Project) -> PromptTemplateVersion:
+        """Resolve the exact prompt profile used by this project."""
+        if project.prompt_template_snapshot:
+            try:
+                profile = PromptTemplateVersion.model_validate(project.prompt_template_snapshot)
+                if not validate_template_variables(profile.content):
+                    return profile
+            except Exception:
+                logger.warning("项目 %s 的 Prompt 模板快照无效，回退系统默认", project.id)
+        if project.series_id:
+            series = self.store.get_series(project.series_id)
+            if series and series.prompt_template_snapshot:
+                try:
+                    profile = PromptTemplateVersion.model_validate(series.prompt_template_snapshot)
+                    if not validate_template_variables(profile.content):
+                        return profile
+                except Exception:
+                    logger.warning("系列 %s 的 Prompt 模板快照无效，回退系统默认", series.id)
+        return system_default_profile()
+
+    def apply_prompt_profile(
+        self,
+        project_id: str,
+        profile: PromptTemplateVersion,
+        *,
+        source: Literal["system", "series", "user", "ai"] | None = None,
+    ) -> Project:
+        project = self.require_project(project_id)
+        unknown = validate_template_variables(profile.content)
+        if unknown:
+            raise ValueError(f"Prompt 模板包含未知变量: {', '.join(unknown)}")
+        project.prompt_template_id = profile.id
+        project.prompt_template_version = profile.version
+        project.prompt_template_source = source or profile.source
+        project.prompt_template_snapshot = profile.model_dump(mode="json")
+        project.prompt_template_hash = profile_hash(profile)
+        return self.store.save_project(project)
+
+    def reset_prompt_profile(self, project_id: str) -> Project:
+        return self.apply_prompt_profile(
+            project_id,
+            system_default_profile(),
+            source="system",
+        )
+
+    def downstream_prompt_rule(self, project: Project, target: str) -> str:
+        profile = self.prompt_profile_for_project(project)
+        return profile.content.downstream_rules.get(target, "").strip()
+
     def require_series(self, series_id: str) -> ProductionSeries:
         series = self.store.get_series(series_id)
         if series is None:
@@ -440,6 +495,9 @@ class ProjectService:
         series.visual_style = self.reusable_series_style_text(project)
         series.style_bible = self.reusable_series_style_bible(project)
         series.negative_prompt = project.brief.negative_prompt
+        series.prompt_template_id = project.prompt_template_id
+        series.prompt_template_version = project.prompt_template_version
+        series.prompt_template_snapshot = dict(project.prompt_template_snapshot)
         if project.seedance_global_constraints.strip() or current is None:
             series.seedance_global_constraints = project.seedance_global_constraints.strip()
         series.style_profile = (
@@ -509,6 +567,15 @@ class ProjectService:
         project.episode_number = max(existing_numbers, default=0) + 1
         project.style_bible = series.style_bible
         project.seedance_global_constraints = series.seedance_global_constraints
+        project.prompt_template_id = series.prompt_template_id
+        project.prompt_template_version = series.prompt_template_version
+        project.prompt_template_source = "series" if series.prompt_template_snapshot else "system"
+        project.prompt_template_snapshot = dict(series.prompt_template_snapshot)
+        project.prompt_template_hash = profile_hash(
+            PromptTemplateVersion.model_validate(series.prompt_template_snapshot)
+            if series.prompt_template_snapshot
+            else system_default_profile()
+        )
 
         character_map = {
             character.id: new_id("character")
@@ -1298,16 +1365,36 @@ class ProjectService:
 每段必须按自身duration编写从0秒连续覆盖到结尾的visual_beats；{'抓眼广告每1.1至1.8秒出现一次与语义一致的景别、角度、主持人动作或观众反馈变化' if short_ad else '普通内容每2至4秒出现一次新的可见变化'}，形成完整动作弧线，禁止用静止等待填满时长。scene级shot_size、camera_angle描述首帧机位；每个visual beat分别写自己的景别、角度、运镜和硬切逻辑。
 第 1 镜必须承担故事开端，第 {count} 镜必须完整呈现原剧情结局；中间 {max(0, count - 2)} 镜覆盖关键因果、转折与必要对白，确保{'完整保留所有需配音文字后' if preserve_spoken_text else '压缩后'}仍是完整故事。
 输出 JSON 前先自行计数校验，只有 scenes 恰好 {count} 项才能提交。"""
-        base_suggestions = "\n\n".join(
-            item
-            for item in [
-                user_suggestions,
-                speech_contract,
-                stage_ad_contract,
-                count_constraint,
-            ]
-            if item
-        )
+        # Keep the stage-specific rules inside the generated system contract,
+        # while leaving run_notes reserved for the user's current request.
+        if stage_ad_contract:
+            count_constraint = f"{count_constraint}\n\n{stage_ad_contract}"
+        requested_targets = ["seedance"] if prompt_targets is None else prompt_targets
+        normalized_targets = [
+            target for target in dict.fromkeys(requested_targets) if target in {"h3", "seedance"}
+        ]
+        prompt_profile = self.prompt_profile_for_project(project)
+        prompt_profile_payload = prompt_profile.model_dump(mode="json")
+        prompt_profile_payload["context_values"] = {
+            "story": project.brief.story,
+            "title": project.brief.title,
+            "shot_count": count,
+            "target_duration": f"{project.brief.target_duration_seconds:g}",
+            "average_shot_duration": f"{average_duration:.2f}",
+            "characters": self.character_bible(project),
+            "style": self.project_style_text(project),
+            "aspect_ratio": project.brief.aspect_ratio,
+            "pacing": project.brief.pacing or "未填写",
+            "speech_pacing": project.brief.speech_pacing.value,
+            "spoken_text_policy": policy_value,
+            "delivery_notes": project.brief.delivery_notes or "未填写",
+            "scene_profiles": "；".join(profile.name for profile in project.scene_profiles) or "未提供",
+            "series_constraints": project.seedance_global_constraints or "未提供",
+            "run_notes": user_suggestions or "无",
+            "prompt_targets": ", ".join(normalized_targets) or "storyboard",
+            "count_contract": count_constraint,
+            "speech_contract": speech_contract,
+        }
         # One click performs one paid generation. Provider/SKD retries and
         # post-validation re-generations are deliberately disabled: an invalid
         # result remains recoverable and visible instead of charging 2–3 times.
@@ -1318,7 +1405,8 @@ class ProjectService:
             "include_dialogue": True,
             "character_description": self.character_bible(project),
             "image_style": self.project_style_text(project),
-            "user_suggestions": base_suggestions,
+            "user_suggestions": user_suggestions,
+            "prompt_profile": prompt_profile_payload,
         }
         if preserve_spoken_text:
             storyboard_kwargs["preserve_spoken_text"] = True
@@ -1502,10 +1590,6 @@ class ProjectService:
                         else "提交视频前请调整该镜时长、台词或语速"
                     )
                 )
-        requested_targets = ["seedance"] if prompt_targets is None else prompt_targets
-        normalized_targets = [
-            target for target in dict.fromkeys(requested_targets) if target in {"h3", "seedance"}
-        ]
         # The LLM call above can take a while. Merge the storyboard fields onto
         # the newest project instead of saving the stale pre-call snapshot and
         # accidentally erasing scene/character assets created in parallel.
@@ -2464,6 +2548,27 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
         self.store.save_project(project)
         return profile
 
+    def _direct_style_reference_paths(
+        self,
+        project: Project,
+        assets_by_id: dict[str, Asset] | None = None,
+    ) -> list[str]:
+        if settings.IMAGE_STYLE_REFERENCE_MODE != "direct":
+            return []
+        assets = assets_by_id or {asset.id: asset for asset in self.store.list_assets(project.id)}
+        if project.style_profile is not None:
+            selected_ids = project.style_profile.reference_asset_ids
+        else:
+            style_assets = [asset for asset in assets.values() if asset.role == AssetRole.STYLE]
+            selected_ids = [asset.id for asset in sorted(style_assets, key=lambda item: item.created_at, reverse=True)[:1]]
+        return [
+            str(resolve_media_path(assets[asset_id].path))
+            for asset_id in dict.fromkeys(selected_ids)
+            if asset_id in assets
+            and assets[asset_id].type == AssetType.IMAGE
+            and resolve_media_path(assets[asset_id].path).is_file()
+        ][:3]
+
     async def generate_scene_reference(
         self,
         project_id: str,
@@ -2494,6 +2599,9 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
         if not environment_prompt:
             raise ValueError("环境图 Prompt 中没有可用的空间或道具描述，请先补充场景信息")
         effective_prompt = self._enforce_empty_scene_reference(environment_prompt)
+        style_reference_paths = self._direct_style_reference_paths(project)
+        if style_reference_paths:
+            effective_prompt += "\n【画风参照】所附风格图只指导绘制媒介、线条、上色、配色和材质；环境结构和陈设以本场景档案为准。"
         image_gen = create_image_generator(image_provider=image_provider, model=image_model)
         vision_gen = self._scene_reference_vision_generator()
         output_dir: Path | None = None
@@ -2513,7 +2621,8 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                 scene = Scene(id=1, duration=5, narrative=environment_prompt, visual_prompt=current_prompt, motion_prompt="")
                 output = await image_gen.generate_image(scene, str(output_dir), reference_path,
                     seed=self._stable_seed(project_id, profile.id) + attempt, character_description="", image_style="",
-                    aspect_ratio=project.brief.aspect_ratio)
+                    aspect_ratio=project.brief.aspect_ratio,
+                    style_reference_image_path=",".join(style_reference_paths) or None)
                 if not await self._scene_reference_contains_people(output, vision_gen):
                     return self._finish_scene_reference(project_id, scene_profile_id, output)
                 self.register_existing_asset(project_id, Path(output), role=AssetRole.SCENE,
@@ -2669,6 +2778,11 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                     if asset.role == AssetRole.STYLE and asset.type == AssetType.IMAGE
                 ],
             ]
+            style_reference_paths = self._direct_style_reference_paths(project, assets_by_id)
+            direct_style_ids = {
+                asset_id for asset_id, asset in assets_by_id.items()
+                if str(resolve_media_path(asset.path)) in style_reference_paths
+            }
             requested_character_context_ids = [
                 asset_id
                 for asset_id in requested_context_ids
@@ -2699,6 +2813,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                     and assets_by_id[asset_id].character_id == character.id
                 )
                 and assets_by_id[asset_id].type == AssetType.IMAGE
+                and asset_id not in direct_style_ids
                 and resolve_media_path(assets_by_id[asset_id].path).is_file()
             ][:10]
             reference_paths = [
@@ -2718,7 +2833,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                     "只继承画风，禁止复制参考图人物身份或动物角色身份，也不复制其脸、发型、服装、年龄或性别。目标角色必须根据剧本档案"
                     "设计独立且可区分的面部或物种特征、体型、毛发与服装配饰。"
                 )
-            elif context_ids:
+            elif context_ids or style_reference_paths:
                 reference_instruction = (
                     "输入参考图是项目画风参考，严格继承其绘制媒介、线条、角色造型比例、上色方式、材质颗粒和年代语言；"
                     "目标角色必须根据剧本档案设计独立且可区分的身份，禁止复制参考图人物身份或动物角色身份。"
@@ -2726,9 +2841,14 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             else:
                 reference_instruction = "当前没有目标角色身份参考图，根据剧本角色档案设计唯一、稳定、可跨镜复用的角色身份；若为动物，必须固定品种、毛色斑纹、耳尾形态、体型与项圈等识别特征。"
             suggestion = user_suggestions.strip()
+            direct_style_instruction = (
+                "所附独立风格图在绘制媒介、线条、上色、配色及材质上优先于文字描述；"
+                "只借画风，不借其人物身份、服装或场景。"
+                if style_reference_paths else ""
+            )
             prompt = (
                 f"【角色四视图设定板版式】\n{CHARACTER_REFERENCE_SHEET_LAYOUT}\n"
-                f"【参考图使用规则】\n{reference_instruction}"
+                f"【参考图使用规则】\n{reference_instruction}{direct_style_instruction}"
                 f"角色：{character.name}。形象档案：{appearance_label}。剧情时期/状态：{appearance_time}。"
                 f"外貌：{appearance_description}。服装：{appearance_wardrobe}。"
                 f"项目剧情依据：{self._compact_prompt_text(project.brief.story, 1800)}。"
@@ -2747,6 +2867,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                 character_description="，".join(filter(None, [appearance_description, appearance_wardrobe])),
                 image_style=self.character_rendering_style_text(project),
                 aspect_ratio="16:9",
+                style_reference_image_path=",".join(style_reference_paths) or None,
             )
             asset = self.register_existing_asset(
                 project_id,
@@ -4081,8 +4202,8 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             parts.append(f"{character.name}：{details}" if details else character.name)
         return "；".join(parts)
 
-    @staticmethod
     def compile_visual_prompt(
+        self,
         project: Project,
         description: str,
         character_ids: list[str] | None = None,
@@ -4101,7 +4222,9 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             f"{scene_profile.continuity_notes}；忽略其他冲突的全局环境、光线和色彩描述"
             if scene_profile else ""
         )
-        return "，".join(item.strip("，。 ") for item in [style, scene_text, character_text, description] if item)
+        custom_rule = self.downstream_prompt_rule(project, "visual")
+        parts = [style, scene_text, character_text, description, custom_rule]
+        return "，".join(item.strip("，。 ") for item in parts if item)
 
     @staticmethod
     def character_visual_bible(
@@ -4138,8 +4261,8 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             parts.append(f"{character.name}：{details}" if details else character.name)
         return "；".join(parts)
 
-    @staticmethod
     def compile_keyframe_prompt(
+        self,
         project: Project,
         description: str,
         character_ids: list[str] | None = None,
@@ -4207,6 +4330,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             if text_policy == "reference_locked"
             else "画面内不生成任何可读文字、汉字、字母、数字、字幕、标题、UI 文案、Logo、水印或乱码，文字统一后期叠加"
         )
+        keyframe_rule = self.downstream_prompt_rule(project, "keyframe")
         parts = [
             f"【首帧画面】{ProjectService._compact_prompt_text(source, 520)}" if source else "",
             (
@@ -4224,6 +4348,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                 "不表现未来动作、动作过程、运镜、转场、时长、对白、配音或音效；"
                 f"{text_rule}"
             ),
+            f"【项目首帧生成规则】{keyframe_rule}" if keyframe_rule else "",
         ]
         return "\n".join(part for part in parts if part).strip()
 
@@ -5051,6 +5176,44 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             "warnings": warnings,
         }
 
+    def h3_material_diagnostics(
+        self,
+        project: Project,
+        shot: Shot,
+        assets: list[Asset],
+    ) -> dict[str, object]:
+        """Expose the exact H3 R2V reference order for the Prompt editor.
+
+        H3 and Seedance share the ordered reference resolver, but the H3
+        Prompt uses ``<Picture N>``/``<Video N>``/``<Audio N>`` tags. Keeping
+        this mapping server-side prevents automatic scene, character and
+        continuity references from drifting away from the visual labels.
+        """
+        supported = {AssetType.IMAGE, AssetType.VIDEO, AssetType.AUDIO}
+        refs = [
+            asset
+            for asset in self._reference_assets_in_shot_order(project, shot, assets)
+            if asset.type in supported
+        ]
+
+        def item(asset: Asset) -> dict[str, object]:
+            return {
+                "id": asset.id,
+                "name": asset.name,
+                "type": asset.type.value,
+                "role": asset.role.value,
+                "character_id": asset.character_id,
+            }
+
+        return {
+            "materials": [item(asset) for asset in refs],
+            "available_materials": [
+                item(asset)
+                for asset in assets
+                if asset.type in supported and asset.role != AssetRole.OUTPUT
+            ],
+        }
+
     def continuity_source_shot(self, project: Project, shot: Shot) -> Shot | None:
         if shot.continuity_mode != ShotContinuityMode.CONTINUOUS:
             return None
@@ -5088,6 +5251,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
 
     def compile_seedance_prompt(self, project: Project, shot: Shot, assets: list[Asset]) -> str:
         global_constraints = self.seedance_global_constraint_text(project)
+        profile_rule = self.downstream_prompt_rule(project, "seedance")
         refs = self.seedance_reference_assets(shot, assets, project)
         resolved_reference_mode = self.resolve_seedance_reference_mode(project, shot, assets)
         image_numbers: dict[str, int] = {}
@@ -5356,6 +5520,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
             "【逐段时间轴】\n" + "\n".join(beat_lines),
             f"【对白与声音】{'；'.join(voice_lines)}。{audio_design or '生成与画面动作同步的清晰环境声'}" if voice_lines else f"【声音】无对白；{audio_design or '生成与画面动作同步的克制环境声'}",
             f"【视觉风格与画质】{style or '延续项目统一风格'}；主体清晰，动作可读，人物五官与肢体稳定",
+            f"【项目 Seedance 模板规则】{profile_rule}" if profile_rule else "",
             "【约束】" + system_constraints
             + (f"；系列强制执行：{global_constraints}" if global_constraints else "")
             + (f"；用户本镜补充：{user_constraints}" if user_constraints else ""),
@@ -5377,6 +5542,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
         project_id: str,
         shot_ids: list[str] | None = None,
         input_mode: Literal["frame", "reference"] | None = None,
+        user_suggestions: str = "",
     ) -> list[Shot]:
         project = self.require_project(project_id)
         all_shots = self.store.list_shots(project_id)
@@ -5387,6 +5553,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
         assets = self.store.list_assets(project_id)
         if input_mode not in {None, "frame", "reference"}:
             raise ValueError("Seedance Prompt 输入类型必须是帧模式或全能参考")
+        suggestions = user_suggestions.strip()
         if input_mode == "frame":
             cross_scene = [
                 shot for shot in shots
@@ -5400,6 +5567,8 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                 )
         saved: list[Shot] = []
         for shot in shots:
+            if suggestions:
+                shot.seedance_prompt_user_constraints = suggestions
             if input_mode == "frame":
                 shot.seedance_reference_mode = SeedanceReferenceMode.STRICT_FIRST_FRAME
             elif input_mode == "reference":
@@ -7689,6 +7858,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                     "仅使用参考：只采用已编号的Picture/Video/Audio清单；"
                     "不把任何参考声称为硬首帧或尾帧"
                 )
+            h3_profile_rule = self.downstream_prompt_rule(project, "h3")
             prompt = f"""为下面已确认的生成段编写一份最终MiniMax H3提示词。最终提示词正文必须使用中文，官方字段名、参考标签和<d>[Chinese]标签格式保留英文。
 
 项目
@@ -7723,6 +7893,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
 - 已确认首帧素材：{self._compact_prompt_text(first_frame_asset.name, 100) if first_frame_asset else '尚未绑定'}
 - 已确认尾帧素材：{self._compact_prompt_text(last_frame_asset.name, 100) if last_frame_asset else '未绑定'}
 - 当前通用分镜提示词：{self._compact_prompt_text(shot.visual_prompt, 400) or '无'}
+- 项目 H3 模板规则：{h3_profile_rule or '无'}
 - 本次用户指令：{suggestions or '无'}
 
 结果中只保留本段需要的内容，不复制完整项目圣经或所有角色。权威场景上下文是本段环境、灯光、色彩和固定陈设的唯一来源，丢弃旧分镜文字或宽泛风格分析中与之冲突的环境细节。严格执行已编排的分段视觉时间轴：每段一个主要动作和一种主要运镜，但时间段之间允许按语义干净硬切并改变景别、角度或切入纯观众画面。准确保留角色数量、声音事件类型、说话人归属、口型标记、对白和参考标签。把每个已确认声音锚点压缩成中文非口播制作说明，置于对应对白标签之前，保留年龄感、性别表现、音色、音高、口音、节奏与情绪；不得把声音说明当台词。每条声音事件只出现一个对白标签，只有标签内部文字可以发声。人名、标签、时间、括号、元数据、表演说明、声音描述、时间轴摘要、声景或音乐说明均不得被朗读或重复。system_vo、narration和offscreen始终为画外声音。帧模式只执行API帧输入约束，不引入Subject/Video/Audio参考标签；参考模式只使用清单中的标签，不把任何参考描述为硬首帧或尾帧。text_policy=post_overlay时，H3可以在指定时间渲染分镜明确编写的逐字画面文案；text_policy=reference_locked时只保留锁定参考中已清晰存在的文字；text_policy=none时不渲染可读文字。只返回要求的JSON字段。"""
@@ -7823,10 +7994,6 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
         image_gen = create_image_generator(image_provider=image_provider, model=image_model)
         image_dir = self.project_dir(project_id) / "images"
         image_dir.mkdir(parents=True, exist_ok=True)
-        fallback_style_reference = next(
-            (str(resolve_media_path(asset.path)) for asset in assets if asset.type == AssetType.IMAGE and asset.role == AssetRole.STYLE),
-            None,
-        )
         asset_map = {asset.id: asset for asset in assets}
         semaphore = asyncio.Semaphore(max(1, settings.WORKFLOW_CONCURRENCY))
 
@@ -7865,14 +8032,20 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                     assets,
                     effective_character_ids,
                 )
+                style_reference_paths = (
+                    self._direct_style_reference_paths(project, asset_map)
+                    if shot.keyframe_reference_asset_ids is None else [
+                        str(resolve_media_path(asset.path))
+                        for asset in keyframe_references if asset.role == AssetRole.STYLE
+                    ] if settings.IMAGE_STYLE_REFERENCE_MODE == "direct" else []
+                )
                 reference_paths.extend(
                     str(resolve_media_path(asset.path))
                     for asset in keyframe_references
                     if asset.id != previous_keyframe_id
+                    and str(resolve_media_path(asset.path)) not in style_reference_paths
                 )
                 reference_paths = list(dict.fromkeys(reference_paths))
-                if not reference_paths and fallback_style_reference:
-                    reference_paths.append(fallback_style_reference)
 
                 suggestion_is_duplicate = bool(
                     user_suggestions
@@ -7945,6 +8118,7 @@ description 与 continuity_notes 仅供纯环境空镜生图：只写建筑布�
                         character_description="",
                         image_style="",
                         aspect_ratio=project.brief.aspect_ratio,
+                        style_reference_image_path=",".join(style_reference_paths) or None,
                     )
                     path = Path(output)
                     asset = self.register_existing_asset(

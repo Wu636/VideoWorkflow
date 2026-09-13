@@ -320,6 +320,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             reference_path = Path(folder) / "previous.png"
             reference_path.write_bytes(b"reference-image")
+            style_path = Path(folder) / "style.png"
+            style_path.write_bytes(b"style-image")
             with (
                 patch.object(settings, "GRSAI_API_KEY", "fixture-key"),
                 patch.object(settings, "GRSAI_BASE_URL", "https://grsai.example.invalid"),
@@ -334,6 +336,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                         Scene(id=1, duration=5, narrative="room", visual_prompt="EXACT", motion_prompt=""),
                         folder,
                         reference_image_path=str(reference_path),
+                        style_reference_image_path=str(style_path),
                         character_description="",
                         image_style="",
                         aspect_ratio="16:9",
@@ -347,7 +350,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(payload["model"], "gpt-image-2.5")
         self.assertEqual(payload["aspectRatio"], "1280x720")
         self.assertEqual(payload["replyType"], "json")
-        self.assertEqual(len(payload["images"]), 1)
+        self.assertEqual(len(payload["images"]), 2)
+        self.assertIn("第 2 张仅作为画风参考", payload["prompt"])
         self.assertNotIn("urls", payload)
         self.assertNotIn("imageSize", payload)
 
@@ -411,7 +415,10 @@ class ProjectAndWorkflowTests(unittest.TestCase):
             shots = asyncio.run(self.service.generate_storyboard(project.id, 1, "manual", suggestion))
 
         self.assertIn(suggestion, str(captured["user_suggestions"]))
-        self.assertIn("镜头数量最高优先级硬约束", str(captured["user_suggestions"]))
+        profile_context = captured["prompt_profile"]["context_values"]  # type: ignore[index]
+        self.assertEqual(profile_context["run_notes"], suggestion)  # type: ignore[index]
+        self.assertIn("镜头数量最高优先级硬约束", profile_context["count_contract"])  # type: ignore[index]
+        self.assertIn("项目交付与口播硬约束", profile_context["speech_contract"])  # type: ignore[index]
         self.assertEqual(len(shots), 1)
         prompt_text = _build_user_suggestions_text(suggestion)
         self.assertIn("用户本次分镜建议｜高优先级", prompt_text)
@@ -474,7 +481,13 @@ class ProjectAndWorkflowTests(unittest.TestCase):
                 )
             )
 
-        contract = str(captured["user_suggestions"])
+        profile_context = captured["prompt_profile"]["context_values"]  # type: ignore[index]
+        contract = "\n\n".join(
+            [
+                str(profile_context["count_contract"]),  # type: ignore[index]
+                str(profile_context["speech_contract"]),  # type: ignore[index]
+            ]
+        )
         self.assertIn("抓眼快口播广告", contract)
         self.assertIn("舞台互动型抓眼广告多机位语法", contract)
         self.assertIn("不等于一镜到底", contract)
@@ -1071,7 +1084,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
 
         class FakeImageGenerator:
             async def generate_image(self, scene: Scene, output_dir: str, reference_images: str | None, **kwargs: object) -> str:
-                image_calls.append({"prompt": scene.visual_prompt, "references": reference_images, "style": kwargs.get("image_style"), "aspect_ratio": kwargs.get("aspect_ratio")})
+                image_calls.append({"prompt": scene.visual_prompt, "references": reference_images, "style_reference": kwargs.get("style_reference_image_path"), "style": kwargs.get("image_style"), "aspect_ratio": kwargs.get("aspect_ratio")})
                 output = Path(output_dir) / f"character-{len(image_calls)}.png"
                 output.write_bytes(f"character-{len(image_calls)}".encode())
                 return str(output)
@@ -1091,7 +1104,8 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         self.assertEqual(len(result["assets"]), 2)
         self.assertEqual([character.name for character in saved.characters], ["阿青", "小满"])
         self.assertTrue(all(character.reference_asset_ids for character in saved.characters))
-        self.assertTrue(all(call["references"] == str(style_path.resolve()) for call in image_calls))
+        self.assertTrue(all(call["references"] is None for call in image_calls))
+        self.assertTrue(all(call["style_reference"] == str(style_path.resolve()) for call in image_calls))
         self.assertTrue(all("项目剧情依据：阿青带着弟弟小满" in str(call["prompt"]) for call in image_calls))
         self.assertTrue(all("禁止复制参考图人物身份" in str(call["prompt"]) for call in image_calls))
         self.assertTrue(all("所有角色保持统一雨衣材质" in str(call["prompt"]) for call in image_calls))
@@ -1195,6 +1209,7 @@ class ProjectAndWorkflowTests(unittest.TestCase):
         class FakeImageGenerator:
             async def generate_image(self, scene: Scene, output_dir: str, reference_images: str | None, **kwargs: object) -> str:
                 captured["references"] = reference_images
+                captured["style_reference"] = kwargs.get("style_reference_image_path")
                 captured["prompt"] = scene.visual_prompt
                 captured["style"] = kwargs.get("image_style")
                 output = Path(output_dir) / "elder-stylized.png"
@@ -1210,8 +1225,9 @@ class ProjectAndWorkflowTests(unittest.TestCase):
 
         self.assertEqual(
             str(captured["references"]).split(","),
-            [str(zhang_path.resolve()), str(style_path.resolve())],
+            [str(zhang_path.resolve())],
         )
+        self.assertEqual(captured["style_reference"], str(style_path.resolve()))
         self.assertNotIn(str(old_path.resolve()), str(captured["references"]))
         self.assertIn("最高优先级画风锚点", str(captured["prompt"]))
         self.assertIn("禁止真人照片", str(captured["prompt"]))

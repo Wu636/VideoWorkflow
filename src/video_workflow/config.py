@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     OPENLUX_REQUEST_TIMEOUT_SECONDS: float = 900.0
     OPENLUX_STREAM: bool = True
     OPENLUX_SAVE_RAW_RESPONSES: bool = True
+    # Dedicated high-quality model for designing/reviewing prompt profiles.
+    # It intentionally uses the OpenLux connection, independent of the normal
+    # storyboard generation provider.
+    PROMPT_OPTIMIZER_MODEL: str = "claude-opus-5"
+
+    # OpenAI-compatible Claude relay (for example bb-api). Kept separate from
+    # OpenLux so switching gateways never reuses a key at the wrong host.
+    CLAUDE_API_KEY: str | None = None
+    CLAUDE_BASE_URL: str = "https://www.bb-api.com/v1"
+    CLAUDE_MODEL: str = "claude-opus-5"
+    CLAUDE_VISION_MODEL: str = "claude-sonnet-5"
 
     # LLM Provider Selection
     # Options: "deepseek" | "glm" | "openlux" | "ark_doubao" | "ark_deepseek"
@@ -33,6 +44,7 @@ class Settings(BaseSettings):
     
     # Ark LLM Model (火山方舟托管的模型)
     ARK_LLM_MODEL: str = "doubao-1-5-pro-32k"  # 豆包1.5/1.8 或 deepseek-v3
+    ARK_DEEPSEEK_MODEL: str = "deepseek-v4-pro-ga-260813"
 
     # Volcengine Ark
     ARK_API_KEY: str | None = None
@@ -51,6 +63,8 @@ class Settings(BaseSettings):
     GRSAI_API_KEY: str | None = None
     GRSAI_BASE_URL: str = "https://grsai.dakka.com.cn"
     GRSAI_IMAGE_MODEL: str = "nano-banana-fast"
+    GRSAI_LLM_MODEL: str = "gpt-5.6-terra"
+    GRSAI_LLM_VISION_MODEL: str = "gpt-5.6-sol"
     GRSAI_VIDEO_MODEL: str = "veo3.1-fast"
     GRSAI_VIDEO_ASPECT_RATIO: str = "16:9"
     GRSAI_VIDEO_WEBHOOK: str = "-1"
@@ -64,6 +78,7 @@ class Settings(BaseSettings):
     IMAGE_ASPECT_RATIO: str = "16:9"  # 支持: "1:1", "16:9", "9:16", "4:3", "3:4"
     IMAGE_STYLE: str | None = None  # 可选风格描述，如 "赛璐璐渲染", "工作室灯光"
     IMAGE_STYLE_WEIGHT: float = 0.7  # 参考图风格权重 (0.0-1.0)
+    IMAGE_STYLE_REFERENCE_MODE: str = "direct"  # direct | text_only
     
     # Character Consistency Parameters
     IMAGE_SEED: str | None = None  # 固定随机种子，留空则自动生成

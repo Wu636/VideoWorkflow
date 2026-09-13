@@ -126,6 +126,9 @@ export interface ProductionSeries {
     style_profile: StyleProfile | null;
     negative_prompt: string;
     seedance_global_constraints: string;
+    prompt_template_id: string;
+    prompt_template_version: number;
+    prompt_template_snapshot: Record<string, unknown>;
     characters: CharacterProfile[];
     assets: SeriesAsset[];
     created_at: string;
@@ -159,6 +162,11 @@ export interface Project {
     scene_consistency_mode: "off" | "optional" | "strict";
     scene_profiles: SceneProfile[];
     preferred_prompt_targets: ("h3" | "seedance")[];
+    prompt_template_id: string;
+    prompt_template_version: number;
+    prompt_template_source: "system" | "series" | "user" | "ai";
+    prompt_template_snapshot: Record<string, unknown>;
+    prompt_template_hash: string;
     storyboard_warnings: string[];
     characters: CharacterProfile[];
     ai_recommended_shot_count: number | null;
@@ -170,6 +178,70 @@ export interface Project {
     storyboard_version: number;
     created_at: string;
     updated_at: string;
+}
+
+export interface PromptProfileContent {
+    schema_version: number;
+    machine_contract: string;
+    director_template: string;
+    context_template: string;
+    downstream_rules: {
+        visual: string;
+        keyframe: string;
+        seedance: string;
+        h3: string;
+        [key: string]: string;
+    };
+}
+
+export interface PromptTemplateVariableInfo {
+    name: string;
+    label: string;
+    description: string;
+    source: string;
+    example: string;
+}
+
+export interface PromptTemplateExampleInfo {
+    id: string;
+    label: string;
+    description: string;
+    content: string;
+}
+
+export interface PromptTemplateMetadata {
+    schema_version: number;
+    variables: PromptTemplateVariableInfo[];
+    examples: PromptTemplateExampleInfo[];
+    machine_contract_note: string;
+}
+
+export interface PromptTemplateVersion {
+    id: string;
+    name: string;
+    description: string;
+    source: "system" | "user" | "ai";
+    version: number;
+    based_on_default_version: number;
+    content: PromptProfileContent;
+    change_summary: string[];
+    created_by: "system" | "user" | "ai";
+    created_at: string;
+    updated_at: string;
+}
+
+export interface PromptTemplateAiDraft {
+    draft: PromptTemplateVersion;
+    expected_effects: string[];
+    warnings: string[];
+    variables_used: string[];
+}
+
+export interface PromptTemplatePreview {
+    system_prompt: string;
+    context_prompt: string;
+    downstream_rules: PromptProfileContent["downstream_rules"];
+    profile_hash: string;
 }
 
 export interface CharacterAnalysisDraft {
@@ -255,6 +327,70 @@ export interface RuntimeLogRecord {
     logger: string;
     message: string;
     exception: string;
+}
+
+export interface ProviderConnection {
+    id: string;
+    name: string;
+    protocol: "openai_chat" | "ark" | "anthropic_messages" | "gemini" | string;
+    base_url: string;
+    models_url: string;
+    api_key_header: string;
+    enabled: boolean;
+    builtin: boolean;
+    configured: boolean;
+    masked: string;
+    last_checked_at: string | null;
+    last_status: string;
+    last_error: string;
+    last_discovery_at?: string | null;
+    last_discovery_status?: string;
+    last_discovery_error?: string;
+    last_discovery_count?: number | null;
+    last_test_at?: string | null;
+    last_test_status?: string;
+    last_test_error?: string;
+}
+
+export interface ProviderModel {
+    id: string;
+    connection_id: string;
+    model_id: string;
+    label: string;
+    capabilities: string[];
+    input_price_per_million: number | null;
+    output_price_per_million: number | null;
+    cache_price_per_million: number | null;
+    currency: string;
+    enabled: boolean;
+    source: "builtin" | "discovered" | "manual" | string;
+    last_seen_at: string | null;
+}
+
+export interface ModelRegistryRouteOption {
+    value: string;
+    connection_id: string;
+    model_id: string;
+    label: string;
+}
+
+export interface ModelRegistryRoute {
+    id: string;
+    label: string;
+    capability: "text" | "vision" | string;
+    setting_key: string;
+    selected: string;
+    selected_connection_id: string;
+    selected_model_id: string;
+    options: ModelRegistryRouteOption[];
+    description?: string;
+}
+
+export interface ModelRegistryPayload {
+    connections: ProviderConnection[];
+    models: ProviderModel[];
+    routes: ModelRegistryRoute[];
+    path: string;
 }
 
 export interface H3PromptSkill {
@@ -503,6 +639,11 @@ export interface SeedanceMaterialDiagnostics {
     available_materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
     selection_mode: "automatic" | "manual";
     warnings: string[];
+}
+
+export interface H3MaterialDiagnostics {
+    materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
+    available_materials: { id: string; name: string; type: AssetType; role: AssetRole; character_id: string | null }[];
 }
 
 export interface KeyframeMaterialDiagnostics {

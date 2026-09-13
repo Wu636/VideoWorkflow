@@ -15,6 +15,7 @@ class LLMGenerator(ABC):
         image_style: str | None = None,
         user_suggestions: str | None = None,
         preserve_spoken_text: bool = False,
+        prompt_profile: dict[str, Any] | None = None,
     ) -> Storyboard:
         """Generate a storyboard from the brief plus optional user suggestions."""
         pass
@@ -48,6 +49,7 @@ class ImageGenerator(ABC):
         character_description: str | None = None,
         image_style: str | None = None,
         aspect_ratio: str | None = None,
+        style_reference_image_path: str | None = None,
     ) -> str:
         """Generate an image for the scene and return the file path."""
         pass

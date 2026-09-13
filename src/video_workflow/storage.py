@@ -21,6 +21,7 @@ from src.video_workflow.domain import (
     Shot,
     utc_now,
 )
+from src.video_workflow.prompt_profiles import PromptTemplateVersion
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -69,6 +70,17 @@ class ProjectStore:
             updated_at TEXT NOT NULL,
             data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS prompt_template_versions (
+            template_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            data TEXT NOT NULL,
+            PRIMARY KEY(template_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_prompt_templates_updated
+            ON prompt_template_versions(updated_at);
         CREATE TABLE IF NOT EXISTS shots (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -187,6 +199,60 @@ class ProjectStore:
         with self._connect() as conn:
             rows = conn.execute("SELECT data FROM production_series ORDER BY updated_at DESC").fetchall()
         return [ProductionSeries.model_validate_json(row["data"]) for row in rows]
+
+    def save_prompt_template(self, template: PromptTemplateVersion) -> PromptTemplateVersion:
+        now = utc_now()
+        if not template.created_at:
+            template.created_at = now
+        template.updated_at = now
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO prompt_template_versions(template_id,version,name,source,updated_at,data)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(template_id,version) DO UPDATE SET
+                name=excluded.name,source=excluded.source,updated_at=excluded.updated_at,data=excluded.data""",
+                (
+                    template.id,
+                    template.version,
+                    template.name,
+                    template.source,
+                    template.updated_at,
+                    self._dump(template),
+                ),
+            )
+        return template
+
+    def get_prompt_template(self, template_id: str, version: int | None = None) -> PromptTemplateVersion | None:
+        with self._connect() as conn:
+            if version is None:
+                row = conn.execute(
+                    """SELECT data FROM prompt_template_versions
+                    WHERE template_id=? ORDER BY version DESC LIMIT 1""",
+                    (template_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT data FROM prompt_template_versions WHERE template_id=? AND version=?",
+                    (template_id, version),
+                ).fetchone()
+        return self._load(row, PromptTemplateVersion)
+
+    def list_prompt_templates(self) -> list[PromptTemplateVersion]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT data FROM prompt_template_versions current
+                WHERE version=(SELECT MAX(version) FROM prompt_template_versions latest
+                               WHERE latest.template_id=current.template_id)
+                ORDER BY updated_at DESC"""
+            ).fetchall()
+        return [PromptTemplateVersion.model_validate_json(row["data"]) for row in rows]
+
+    def list_prompt_template_versions(self, template_id: str) -> list[PromptTemplateVersion]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT data FROM prompt_template_versions WHERE template_id=? ORDER BY version DESC",
+                (template_id,),
+            ).fetchall()
+        return [PromptTemplateVersion.model_validate_json(row["data"]) for row in rows]
 
     def replace_shots(self, project_id: str, shots: Iterable[Shot]) -> list[Shot]:
         items = list(shots)

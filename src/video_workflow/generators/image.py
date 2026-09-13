@@ -315,6 +315,29 @@ def _collect_reference_sources(reference_image_path: str | None) -> list[str]:
     return collected[:10]
 
 
+def _reference_groups(content_path: str | None, style_path: str | None) -> tuple[list[str], list[str]]:
+    """Keep content/identity first and reserve slots for genuine style images."""
+    content = list(dict.fromkeys(_collect_reference_sources(content_path)))
+    style = [source for source in dict.fromkeys(_collect_reference_sources(style_path)) if source not in content][:3]
+    content = content[: 10 - len(style)]
+    return content, style
+
+
+def _style_reference_instruction(content_count: int, style_count: int) -> str:
+    if not style_count:
+        return ""
+    start = content_count + 1
+    end = content_count + style_count
+    label = f"第 {start} 张" if start == end else f"第 {start}–{end} 张"
+    content_rule = f"前 {content_count} 张用于主体身份、场景内容或布局；" if content_count else ""
+    return (
+        f"\n【输入图片分工】{content_rule}{label}仅作为画风参考。"
+        "继承其绘画媒介、笔触线条、上色方式、配色关系和材质感；"
+        "不要复制风格图里的人物身份、服装、道具、场景布局或构图。"
+        "生成内容以本条场景与角色描述为准。"
+    )
+
+
 def _encode_local_image(path: Path) -> tuple[str | None, str | None]:
     try:
         with open(path, "rb") as file_handle:
@@ -436,10 +459,13 @@ class ArkImageGenerator(ImageGenerator):
         character_description: str | None = None,
         image_style: str | None = None,
         aspect_ratio: str | None = None,
+        style_reference_image_path: str | None = None,
     ) -> str:
         loop = asyncio.get_running_loop()
         size = self.aspect_ratio_sizes.get(aspect_ratio or settings.IMAGE_ASPECT_RATIO, "2048x1800")
+        content_sources, style_sources = _reference_groups(reference_image_path, style_reference_image_path)
         prompt = _build_image_prompt(scene, character_description, image_style)
+        prompt += _style_reference_instruction(len(content_sources), len(style_sources))
 
         def _generate():
             params = {
@@ -455,12 +481,13 @@ class ArkImageGenerator(ImageGenerator):
                 "watermark": False,
             }
 
-            if reference_image_path:
-                ref_images = self._load_reference_images(reference_image_path)
+            if content_sources or style_sources:
+                ref_images = self._load_reference_images(",".join([*content_sources, *style_sources]))
                 if ref_images:
                     extra_body["reference_images"] = ref_images
                     extra_body["reference_weight"] = settings.IMAGE_STYLE_WEIGHT
-                    extra_body["reference_mode"] = "character"
+                    if content_sources:
+                        extra_body["reference_mode"] = "character"
                     logger.info(
                         "Using %s reference images with weight %.2f for Ark generation",
                         len(ref_images),
@@ -525,13 +552,16 @@ class GrsaiImageGenerator(ImageGenerator):
         character_description: str | None = None,
         image_style: str | None = None,
         aspect_ratio: str | None = None,
+        style_reference_image_path: str | None = None,
     ) -> str:
         del seed
 
         resolved_aspect_ratio = grsai_image_aspect_ratio(self.model, aspect_ratio)
+        content_sources, style_sources = _reference_groups(reference_image_path, style_reference_image_path)
         payload: dict[str, Any] = {
             "model": self.model,
-            "prompt": _build_image_prompt(scene, character_description, image_style),
+            "prompt": _build_image_prompt(scene, character_description, image_style)
+            + _style_reference_instruction(len(content_sources), len(style_sources)),
             "aspectRatio": resolved_aspect_ratio,
         }
 
@@ -545,7 +575,7 @@ class GrsaiImageGenerator(ImageGenerator):
         if image_size:
             payload["imageSize"] = image_size
 
-        reference_urls = self._load_reference_inputs(reference_image_path)
+        reference_urls = self._load_reference_inputs(",".join([*content_sources, *style_sources]))
         if reference_urls:
             payload["images" if is_gpt_image else "urls"] = reference_urls
 

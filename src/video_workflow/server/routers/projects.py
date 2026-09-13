@@ -246,6 +246,7 @@ class H3PromptGenerateRequest(BaseModel):
 class SeedancePromptGenerateRequest(BaseModel):
     shot_ids: list[str] | None = None
     input_mode: Literal["frame", "reference"]
+    user_suggestions: str = Field(default="", max_length=4000)
 
 
 class SeedanceEstimateRequest(BaseModel):
@@ -1176,6 +1177,22 @@ async def seedance_materials(project_id: str, shot_id: str):
         raise _not_found(str(exc)) from exc
 
 
+@router.get("/{project_id}/shots/{shot_id}/h3-materials")
+async def h3_materials(project_id: str, shot_id: str):
+    try:
+        project = project_service.require_project(project_id)
+        shot = project_service.require_shot(shot_id)
+        if shot.project_id != project_id:
+            raise KeyError("Shot not found")
+        return project_service.h3_material_diagnostics(
+            project,
+            shot,
+            store.list_assets(project_id),
+        )
+    except KeyError as exc:
+        raise _not_found(str(exc)) from exc
+
+
 @router.get("/{project_id}/shots/{shot_id}/keyframe-materials")
 async def keyframe_materials(project_id: str, shot_id: str):
     try:
@@ -1453,6 +1470,7 @@ async def generate_seedance_prompts(project_id: str, request: SeedancePromptGene
             project_id,
             request.shot_ids,
             request.input_mode,
+            request.user_suggestions,
         )
     except KeyError as exc:
         raise _not_found(str(exc)) from exc

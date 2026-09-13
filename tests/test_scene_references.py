@@ -20,6 +20,7 @@ from src.video_workflow.domain import (
     StyleProfile,
 )
 from src.video_workflow.generators.image import GrsaiImageGenerator, ImageDownloadError, download_generated_image
+from src.video_workflow.config import settings
 from src.video_workflow.services.projects import ProjectService, SceneReferenceConflictError
 from src.video_workflow.storage import ProjectStore
 from src.video_workflow.types import Scene
@@ -127,6 +128,40 @@ class SceneReferenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.latest().reference_asset_ids, [clean_asset.id])
         self.assertEqual(len(self.store.list_assets(self.project.id)), 2)
         self.assertTrue(any("含人物未绑定" in item.name for item in self.store.list_assets(self.project.id)))
+
+    async def test_scene_master_passes_uploaded_style_image_on_both_attempts(self):
+        style_path = self.root / "style.png"
+        style_path.write_bytes(PNG)
+        style_asset = self.service.register_existing_asset(self.project.id, style_path, AssetRole.STYLE, "用户画风")
+        project = self.service.require_project(self.project.id)
+        project.style_profile.reference_asset_ids = [style_asset.id]
+        self.store.save_project(project)
+        seen = []
+
+        class Vision:
+            def __init__(self):
+                self.calls = 0
+
+            async def generate_json(self, *_args, **_kwargs):
+                self.calls += 1
+                return {"has_people": self.calls == 1}
+
+        class Generator:
+            async def generate_image(_, scene, output_dir, reference_image_path, **kwargs):
+                seen.append((reference_image_path, kwargs.get("style_reference_image_path"), scene.visual_prompt))
+                output = Path(output_dir) / "result.png"
+                output.write_bytes(PNG)
+                return str(output)
+
+        vision = Vision()
+        self.service._scene_reference_vision_generator = lambda: vision
+        with patch.object(settings, "IMAGE_STYLE_REFERENCE_MODE", "direct"), patch("src.video_workflow.services.projects.create_image_generator", return_value=Generator()):
+            await self.service.generate_scene_reference(self.project.id, self.home.id)
+        self.assertEqual(len(seen), 2)
+        self.assertIsNone(seen[0][0])
+        self.assertIsNotNone(seen[1][0])
+        self.assertTrue(all(item[1] == str(style_path.resolve()) for item in seen))
+        self.assertIn("只指导绘制媒介", seen[0][2])
 
     async def test_still_contains_people_after_correction_keeps_existing_reference(self):
         old_path = self.root / "previous.png"

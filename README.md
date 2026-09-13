@@ -20,12 +20,17 @@
 12. 旧项目迁移：自动扫描 `outputs/*/script.json`，复制旧分镜图和视频到新项目。
 13. 剧本智能建档：上传 TXT / Markdown / DOCX / PDF，AI 分析后按勾选项回填视觉风格、节奏、受众、风格圣经、负面提示词、交付备注和角色一致性。
 14. 智能拆镜数量：可手动指定，也可由 AI 根据目标时长、剧情转折、场景变化、动作和对白节奏推荐数量。
-15. 统一模型设置：在 `/settings` 管理各环节 API、模型和 ComfyUI 地址；密钥仅显示配置状态，保存后即时生效。
-16. 运行日志中心：在 `/logs` 实时筛选、搜索、暂停、下载和清空 API、生成队列与成片日志。
+15. 统一模型设置：在 `/settings` 的“功能路由 / 接口连接 / 模型目录 / 高级参数”四个工作区管理各环节 API、模型和 ComfyUI 地址；密钥仅显示配置状态，保存后即时生效。
+16. 项目级 Prompt 模板：在“分镜设计”页编辑核心分镜导演模板、项目约束拼接模板及视觉/首帧/Seedance/H3 下游规则；模板按版本保存，可一键恢复系统默认。
+17. 运行日志中心：在 `/logs` 实时筛选、搜索、暂停、下载和清空 API、生成队列与成片日志。
 
 模型设置页顶部的“各功能当前优先配置”会分别显示剧本分析、AI 镜头数、详细分镜、角色参考图、分镜首帧、H3 视频、旧版视频与最终剪辑正在使用的服务和模型。可切换项直接在路由卡片中修改；自动模式会列出备用顺序和配置状态。
 
+模型管理页的“接口连接”内置 GRSAI、OpenLux、Claude 中转、火山方舟、DeepSeek 和 GLM。添加自定义接口时填写 OpenAI 兼容的 Base URL 与 API Key，再点击“发现模型”；接口没有标准 `/models` 列表时，可在“模型目录”手动录入模型 ID 与能力（`text,json,vision`）。模型目录保存在 `outputs/model_registry.json`，文件权限为仅当前用户可读写；内置接口的密钥不会复制到该文件。
+
 首次生成分镜和 AI 重做都会先打开“本次分镜建议”面板。用户可补充要保留的剧情、节奏、景别、运镜、对白或角色一致性要求；建议会和剧本、角色及风格设定一并进入模型 Prompt，AI 判断镜头数时也会参考这些要求。
+
+项目的 Prompt 模板管理器位于“分镜设计”页。系统机器 JSON 协议保持只读，用户可以修改导演模板、项目约束变量拼接方式和四类下游 Prompt 规则；“最终预览”会按当前项目资料替换变量。点击“让 Opus 5 优化本剧模板”后，优化请求通过 OpenLux 发送到 `PROMPT_OPTIMIZER_MODEL`（默认 `claude-opus-5`），只返回待审核草稿，确认后再保存为自定义模板或新版本。
 
 客户剧本与目标时长不匹配时，可在“需求与角色”中使用“AI 扩写/缩写”。支持自动判断、只扩写、只缩写及用户改写建议；AI 先返回完整新剧本、预计可实现时长、改动摘要和制作提醒，用户对比原稿并确认后才会覆盖保存。
 
@@ -38,6 +43,7 @@ VideoWorkflow/
 │   ├── domain.py                     # 项目、分镜、素材、任务、审核、交付模型
 │   ├── storage.py                    # SQLite 持久化仓库
 │   ├── runtime_settings.py            # 浏览器统一配置、密钥脱敏与热更新
+│   ├── model_registry.py               # 接口连接、模型目录、模型发现与功能路由
 │   ├── logging_runtime.py             # 页面日志缓冲与轮转日志文件
 │   ├── integrations/comfyui.py       # MiniMax H3 / ComfyUI 客户端
 │   ├── services/
@@ -83,19 +89,37 @@ OPENLUX_API_KEY=你的OpenLuxKey
 OPENLUX_BASE_URL=https://api.openlux.ai/v1
 OPENLUX_MODEL=claude-sonnet-5
 OPENLUX_VISION_MODEL=gpt-5.6-sol
+# Prompt 模板优化固定走 OpenLux；默认使用 Claude Opus 5
+PROMPT_OPTIMIZER_MODEL=claude-opus-5
 LLM_PROVIDER=openlux
 BRIEF_ANALYSIS_PROVIDER=auto
 SHOT_COUNT_PROVIDER=auto
 REFERENCE_ANALYSIS_PROVIDER=auto
 
+# GRSAI OpenAI 兼容 GPT 路由（与图像 Key 共用）
+GRSAI_API_KEY=你的GRSAIKey
+GRSAI_BASE_URL=https://grsai.dakka.com.cn
+GRSAI_LLM_MODEL=gpt-5.6-terra
+GRSAI_LLM_VISION_MODEL=gpt-5.6-sol
+
+# 可选：独立 Claude 中转。设置中心可在 Sonnet 5 / Sonnet 4.6 / Opus 5 间切换
+CLAUDE_API_KEY=你的Claude中转Key
+CLAUDE_BASE_URL=https://www.bb-api.com/v1
+CLAUDE_MODEL=claude-sonnet-5
+CLAUDE_VISION_MODEL=claude-sonnet-5
+
 # 火山方舟继续用于 Seedance / Seedream，也可作为剧本模型备用
 ARK_API_KEY=你的方舟Key
 ARK_LLM_MODEL=你的模型或推理接入点
+# 火山 DeepSeek 资源包（剧本分析/镜头数建议可独立走此模型）
+ARK_DEEPSEEK_MODEL=deepseek-v4-pro-ga-260813
 SEEDANCE_DEFAULT_MODEL=doubao-seedance-2-0-mini-260615
 SEEDANCE_DEFAULT_RESOLUTION=720p
 
 IMAGE_PROVIDER=ark
 ARK_IMAGE_MODEL=doubao-seedream-4-5-251128
+# direct：把画风参考图原图一并传给生图模型；text_only：只用文字风格
+IMAGE_STYLE_REFERENCE_MODE=direct
 
 # 当前已实测实例；更换实例后只替换域名，不要带 # 后面的前端工作流 ID
 COMFYUI_BASE_URL=https://u71482-7873955e7ee9.westd.seetacloud.com:8443

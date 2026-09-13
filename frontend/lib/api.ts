@@ -4,12 +4,18 @@ import type {
     AssetRole,
     CharacterProfile,
     Delivery,
+    H3MaterialDiagnostics,
     H3PromptSkill,
     ImageProviderOption,
     KeyframeMaterialDiagnostics,
     Project,
     ProjectBrief,
     ProjectBundle,
+    PromptProfileContent,
+    PromptTemplateAiDraft,
+    PromptTemplateMetadata,
+    PromptTemplatePreview,
+    PromptTemplateVersion,
     ProductionSeries,
     ProjectAnalysisDraft,
     ScriptDurationAssessment,
@@ -19,6 +25,7 @@ import type {
     SeedanceMaterialDiagnostics,
     RuntimeLogRecord,
     RuntimeSettingsPayload,
+    ModelRegistryPayload,
     RenderJob,
     Review,
     Shot,
@@ -125,6 +132,85 @@ export async function getProject(projectId: string): Promise<ProjectBundle> {
 
 export async function updateProject(project: Project): Promise<Project> {
     return api<Project>(`/projects/${project.id}`, { method: "PUT", body: JSON.stringify(project) });
+}
+
+export async function listPromptTemplates(): Promise<PromptTemplateVersion[]> {
+    return api<PromptTemplateVersion[]>("/prompt-templates");
+}
+
+export async function getPromptTemplateMetadata(): Promise<PromptTemplateMetadata> {
+    return api<PromptTemplateMetadata>("/prompt-templates/metadata");
+}
+
+export async function getPromptTemplate(templateId: string, version?: number): Promise<PromptTemplateVersion> {
+    const query = version ? `?version=${version}` : "";
+    return api<PromptTemplateVersion>(`/prompt-templates/${encodeURIComponent(templateId)}${query}`);
+}
+
+export async function createPromptTemplate(
+    name: string,
+    description: string,
+    content: PromptProfileContent,
+    changeSummary: string[] = [],
+): Promise<PromptTemplateVersion> {
+    return api<PromptTemplateVersion>("/prompt-templates", {
+        method: "POST",
+        body: JSON.stringify({ name, description, content, change_summary: changeSummary }),
+    });
+}
+
+export async function createPromptTemplateVersion(
+    templateId: string,
+    name: string,
+    description: string,
+    content: PromptProfileContent,
+    changeSummary: string[] = [],
+): Promise<PromptTemplateVersion> {
+    return api<PromptTemplateVersion>(`/prompt-templates/${encodeURIComponent(templateId)}/versions`, {
+        method: "POST",
+        body: JSON.stringify({ name, description, content, change_summary: changeSummary }),
+    });
+}
+
+export async function applyProjectPromptTemplate(projectId: string, templateId: string, version?: number): Promise<Project> {
+    return api<Project>(`/prompt-templates/projects/${projectId}/prompt-profile`, {
+        method: "PUT",
+        body: JSON.stringify({ template_id: templateId, version: version || null }),
+    });
+}
+
+export async function resetProjectPromptTemplate(projectId: string): Promise<Project> {
+    return api<Project>(`/prompt-templates/projects/${projectId}/prompt-profile/reset`, { method: "POST", body: "{}" });
+}
+
+export async function optimizePromptTemplate(options: {
+    projectId?: string;
+    templateId?: string;
+    version?: number;
+    instruction: string;
+    scopes?: ("storyboard" | "visual" | "keyframe" | "seedance" | "h3")[];
+}): Promise<PromptTemplateAiDraft> {
+    return api<PromptTemplateAiDraft>("/prompt-templates/ai-draft", {
+        method: "POST",
+        body: JSON.stringify({
+            project_id: options.projectId || null,
+            template_id: options.templateId || null,
+            version: options.version || null,
+            instruction: options.instruction,
+            scopes: options.scopes || ["storyboard", "visual", "keyframe", "seedance", "h3"],
+        }),
+    });
+}
+
+export async function previewPromptTemplate(
+    content: PromptProfileContent,
+    contextValues: Record<string, unknown>,
+    userNotes = "",
+): Promise<PromptTemplatePreview> {
+    return api<PromptTemplatePreview>("/prompt-templates/render-preview", {
+        method: "POST",
+        body: JSON.stringify({ content, context_values: contextValues, user_notes: userNotes }),
+    });
 }
 
 export async function deleteProject(projectId: string): Promise<{ deleted: boolean }> {
@@ -384,6 +470,38 @@ export async function updateRuntimeSettings(values: Record<string, unknown>, cle
     return api("/settings", { method: "PUT", body: JSON.stringify({ values, clear_keys: clearKeys }) });
 }
 
+export async function getModelRegistry(): Promise<ModelRegistryPayload> {
+    return api("/model-registry");
+}
+
+export async function createModelConnection(values: Record<string, unknown>): Promise<ModelRegistryPayload> {
+    return api("/model-registry/connections", { method: "POST", body: JSON.stringify(values) });
+}
+
+export async function updateModelConnection(connectionId: string, values: Record<string, unknown>): Promise<ModelRegistryPayload> {
+    return api(`/model-registry/connections/${encodeURIComponent(connectionId)}`, { method: "PUT", body: JSON.stringify(values) });
+}
+
+export async function deleteModelConnection(connectionId: string): Promise<ModelRegistryPayload> {
+    return api(`/model-registry/connections/${encodeURIComponent(connectionId)}`, { method: "DELETE" });
+}
+
+export async function discoverModelConnection(connectionId: string): Promise<{ supported: boolean; requires_manual?: boolean; message?: string; count?: number; registry: ModelRegistryPayload }> {
+    return api(`/model-registry/connections/${encodeURIComponent(connectionId)}/discover`, { method: "POST", body: "{}" });
+}
+
+export async function testModelConnection(connectionId: string, modelId?: string): Promise<{ ok: boolean; message?: string; model_id?: string; registry: ModelRegistryPayload }> {
+    return api(`/model-registry/connections/${encodeURIComponent(connectionId)}/test`, { method: "POST", body: JSON.stringify({ model_id: modelId || null }) });
+}
+
+export async function addModelToConnection(connectionId: string, values: Record<string, unknown>): Promise<ModelRegistryPayload> {
+    return api(`/model-registry/connections/${encodeURIComponent(connectionId)}/models`, { method: "POST", body: JSON.stringify(values) });
+}
+
+export async function updateModelRoute(routeId: string, connectionId: string, modelId: string): Promise<ModelRegistryPayload> {
+    return api(`/model-registry/routes/${encodeURIComponent(routeId)}`, { method: "PUT", body: JSON.stringify({ connection_id: connectionId, model_id: modelId }) });
+}
+
 export async function getRuntimeLogs(options: { level?: string; search?: string; limit?: number } = {}): Promise<{ records: RuntimeLogRecord[]; file: string }> {
     const query = new URLSearchParams();
     if (options.level) query.set("level", options.level);
@@ -487,6 +605,10 @@ export async function insertShotWithAi(
 
 export async function getSeedanceMaterials(projectId: string, shotId: string): Promise<SeedanceMaterialDiagnostics> {
     return api(`/projects/${projectId}/shots/${shotId}/seedance-materials`);
+}
+
+export async function getH3Materials(projectId: string, shotId: string): Promise<H3MaterialDiagnostics> {
+    return api(`/projects/${projectId}/shots/${shotId}/h3-materials`);
 }
 
 export async function getKeyframeMaterials(projectId: string, shotId: string): Promise<KeyframeMaterialDiagnostics> {
@@ -598,10 +720,11 @@ export async function generateSeedancePrompts(
     projectId: string,
     shotIds: string[],
     inputMode: "frame" | "reference",
+    userSuggestions = "",
 ): Promise<Shot[]> {
     return api(`/projects/${projectId}/seedance-prompts/generate`, {
         method: "POST",
-        body: JSON.stringify({ shot_ids: shotIds, input_mode: inputMode }),
+        body: JSON.stringify({ shot_ids: shotIds, input_mode: inputMode, user_suggestions: userSuggestions }),
     });
 }
 

@@ -6,7 +6,14 @@ from typing import List
 from src.video_workflow.config import settings
 from src.video_workflow.types import Storyboard, Scene, GenerationStatus
 from src.video_workflow.generators.base import ImageGenerator
-from src.video_workflow.generators.llm import DeepSeekGenerator, GLMGenerator, OpenLuxGenerator, ArkLLMGenerator
+from src.video_workflow.generators.llm import (
+    DeepSeekGenerator,
+    GLMGenerator,
+    OpenLuxGenerator,
+    ClaudeGatewayGenerator,
+    GrsaiLLMGenerator,
+    ArkLLMGenerator,
+)
 from src.video_workflow.generators.image import create_image_generator
 from src.video_workflow.generators.video import create_video_generator
 
@@ -27,8 +34,29 @@ def create_llm_generator(provider: str | None = None):
         return GLMGenerator()
     if resolved == "openlux":
         return OpenLuxGenerator()
+    if resolved == "claude":
+        return ClaudeGatewayGenerator()
+    if resolved == "grsai":
+        return GrsaiLLMGenerator()
+    if resolved.startswith("custom:"):
+        parts = resolved.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError("自定义模型路由格式应为 custom:接口ID:模型ID")
+        from src.video_workflow.model_registry import model_registry
+        connection = model_registry.connection(parts[1])
+        if connection.protocol != "openai_chat":
+            raise ValueError(f"自定义接口 {connection.name} 暂未接入 OpenAI Chat 协议")
+        return OpenLuxGenerator(
+            api_key=connection.api_key,
+            base_url=connection.base_url,
+            model=parts[2],
+            vision_model=parts[2],
+            provider_name=connection.name,
+        )
     if resolved in {"ark_doubao", "ark_deepseek", "ark"}:
-        return ArkLLMGenerator()
+        return ArkLLMGenerator(
+            model=settings.ARK_DEEPSEEK_MODEL if resolved == "ark_deepseek" else settings.ARK_LLM_MODEL
+        )
     return DeepSeekGenerator()
 
 
@@ -40,6 +68,12 @@ def resolve_reference_llm_provider(fallback: str | None = None) -> str:
     fallback_provider = (fallback or settings.LLM_PROVIDER or "deepseek").strip().lower()
     if fallback_provider == "openlux" and settings.OPENLUX_API_KEY:
         return "openlux"
+    if fallback_provider == "claude" and settings.CLAUDE_API_KEY:
+        return "claude"
+    if fallback_provider == "grsai" and settings.GRSAI_API_KEY:
+        return "grsai"
+    if settings.CLAUDE_API_KEY:
+        return "claude"
     if settings.ARK_API_KEY:
         return "ark"
     if settings.GLM_API_KEY:

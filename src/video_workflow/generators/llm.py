@@ -18,6 +18,10 @@ from src.video_workflow.speech_budget import (
 )
 from src.video_workflow.types import Storyboard
 from src.video_workflow.generators.base import LLMGenerator
+from src.video_workflow.prompt_profiles import (
+    content_from_snapshot,
+    render_prompt_template,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -459,6 +463,69 @@ def _build_prompt_context_text(
     return prompt_suffix
 
 
+def _profile_system_prompt(base_prompt: str, snapshot: dict[str, Any] | None) -> str:
+    if not snapshot:
+        return base_prompt
+    content = content_from_snapshot(snapshot)
+    runtime_values = snapshot.get("context_values", {})
+    values = runtime_values if isinstance(runtime_values, dict) else {}
+    director_template = render_prompt_template(content.director_template, values)
+    return f"{content.machine_contract}\n\n{director_template}".strip()
+
+
+def _build_profile_context_text(
+    snapshot: dict[str, Any] | None,
+    *,
+    topic: str,
+    title: str = "",
+    count: int,
+    target_duration: str = "",
+    average_shot_duration: str = "",
+    character_description: str | None = None,
+    image_style: str | None = None,
+    user_suggestions: str | None = None,
+    prompt_targets: str = "storyboard",
+) -> str:
+    if not snapshot:
+        return _build_prompt_context_text(character_description, image_style) + _build_user_suggestions_text(user_suggestions)
+    content = content_from_snapshot(snapshot)
+    values = {
+        "story": topic,
+        "title": title or "未填写",
+        "shot_count": count,
+        "target_duration": target_duration or "未填写",
+        "average_shot_duration": average_shot_duration or "未填写",
+        "characters": character_description or "未提供",
+        "style": image_style or "未提供",
+        "aspect_ratio": "项目设置",
+        "pacing": "项目设置",
+        "speech_pacing": "项目设置",
+        "spoken_text_policy": "项目设置",
+        "delivery_notes": "未填写",
+        "scene_profiles": "未提供",
+        "series_constraints": "未提供",
+        "run_notes": user_suggestions or "无",
+        "prompt_targets": prompt_targets,
+        "count_contract": "按指定镜头数量输出，不能新增、删除或拆分 scenes。",
+        "speech_contract": "声音事件按镜头时长安排，事件不得重叠。",
+    }
+    runtime_values = snapshot.get("context_values", {}) if isinstance(snapshot, dict) else {}
+    if isinstance(runtime_values, dict):
+        values.update(
+            {
+                key: value
+                for key, value in runtime_values.items()
+                if key in {
+                    "story", "title", "shot_count", "target_duration", "average_shot_duration",
+                    "characters", "style", "aspect_ratio", "pacing", "speech_pacing",
+                    "spoken_text_policy", "delivery_notes", "scene_profiles", "series_constraints",
+                    "run_notes", "prompt_targets", "count_contract", "speech_contract",
+                }
+            }
+        )
+    return render_prompt_template(content.context_template, values)
+
+
 def _build_user_suggestions_text(user_suggestions: str | None = None) -> str:
     suggestions = (user_suggestions or "").strip()
     if not suggestions:
@@ -592,6 +659,7 @@ class DeepSeekGenerator(LLMGenerator):
         image_style: str | None = None,
         user_suggestions: str | None = None,
         preserve_spoken_text: bool = False,
+        prompt_profile: dict[str, Any] | None = None,
     ) -> Storyboard:
         prompt = f"请为一个关于 '{topic}' 的短视频创作分镜脚本。请精确生成 {count} 个分镜。"
         
@@ -619,8 +687,14 @@ class DeepSeekGenerator(LLMGenerator):
 4. 绝对不要出现角色开口说话的描述。
 """
 
-        prompt += _build_prompt_context_text(character_description, image_style)
-        prompt += _build_user_suggestions_text(user_suggestions)
+        prompt += _build_profile_context_text(
+            prompt_profile,
+            topic=topic,
+            count=count,
+            character_description=character_description,
+            image_style=image_style,
+            user_suggestions=user_suggestions,
+        )
         prompt += _spoken_text_policy_instruction(preserve_spoken_text)
         
         if reference_image:
@@ -629,7 +703,7 @@ class DeepSeekGenerator(LLMGenerator):
         response = await self.client.chat.completions.create(
             model=settings.DEEPSEEK_MODEL,
             messages=[
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": _profile_system_prompt(self.system_prompt, prompt_profile)},
                 {"role": "user", "content": prompt}
             ],
             stream=False,
@@ -709,12 +783,22 @@ class DeepSeekGenerator(LLMGenerator):
 class OpenLuxGenerator(LLMGenerator):
     """OpenLux OpenAI-compatible GPT / Claude / Gemini multimodal adapter."""
 
-    def __init__(self):
-        if not settings.OPENLUX_API_KEY:
-            raise ValueError("OPENLUX_API_KEY 未配置")
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        vision_model: str | None = None,
+        provider_name: str = "OpenLux",
+    ):
+        api_key = api_key or settings.OPENLUX_API_KEY
+        if not api_key:
+            raise ValueError(f"{provider_name} API Key 未配置")
+        self.provider_name = provider_name
         self.client = AsyncOpenAI(
-            api_key=settings.OPENLUX_API_KEY,
-            base_url=settings.OPENLUX_BASE_URL.rstrip("/"),
+            api_key=api_key,
+            base_url=(base_url or settings.OPENLUX_BASE_URL).rstrip("/"),
             timeout=httpx.Timeout(
                 float(settings.OPENLUX_REQUEST_TIMEOUT_SECONDS),
                 connect=min(30.0, float(settings.OPENLUX_REQUEST_TIMEOUT_SECONDS)),
@@ -723,8 +807,8 @@ class OpenLuxGenerator(LLMGenerator):
             # explicit new action after the previous result/error is visible.
             max_retries=0,
         )
-        self.model = settings.OPENLUX_MODEL
-        self.vision_model = settings.OPENLUX_VISION_MODEL or settings.OPENLUX_MODEL
+        self.model = model or settings.OPENLUX_MODEL
+        self.vision_model = vision_model or settings.OPENLUX_VISION_MODEL or self.model
         self.last_response_path: Path | None = None
         self.system_prompt = """
 你是一位专业影视编剧、分镜导演和 AI 视频生成提示词工程师。请把用户的剧情与制作约束转成可直接生产的分镜脚本。
@@ -793,10 +877,11 @@ class OpenLuxGenerator(LLMGenerator):
             directory = Path(settings.OUTPUT_DIR) / "ai_responses"
             directory.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            destination = directory / f"openlux-{timestamp}-{uuid4().hex[:8]}.json"
+            provider_slug = "claude" if self.provider_name == "Claude 中转" else "openlux"
+            destination = directory / f"{provider_slug}-{timestamp}-{uuid4().hex[:8]}.json"
             temporary = destination.with_suffix(".tmp")
             payload = {
-                "provider": "openlux",
+                "provider": provider_slug,
                 "model": model,
                 "received_at": datetime.now(timezone.utc).isoformat(),
                 "image_count": image_count,
@@ -810,10 +895,10 @@ class OpenLuxGenerator(LLMGenerator):
             )
             temporary.replace(destination)
             self.last_response_path = destination.resolve()
-            logger.info("OpenLux 原始响应已保存: %s", self.last_response_path)
+            logger.info("%s 原始响应已保存: %s", self.provider_name, self.last_response_path)
             return self.last_response_path
         except OSError:
-            logger.exception("保存 OpenLux 原始响应失败")
+            logger.exception("保存 %s 原始响应失败", self.provider_name)
             return None
 
     def _raw_result_hint(self) -> str:
@@ -836,7 +921,7 @@ class OpenLuxGenerator(LLMGenerator):
                 stream=use_stream,
             )
         except Exception as exc:
-            raise RuntimeError(f"OpenLux API 调用失败（模型 {model}）: {exc}") from exc
+            raise RuntimeError(f"{self.provider_name} API 调用失败（模型 {model}）: {exc}") from exc
         if use_stream:
             chunks: list[str] = []
             try:
@@ -846,14 +931,14 @@ class OpenLuxGenerator(LLMGenerator):
                         delta = getattr(choice, "delta", None)
                         chunks.append(_coerce_openlux_text(getattr(delta, "content", None)))
             except Exception as exc:
-                raise RuntimeError(f"OpenLux 流式结果接收失败（模型 {model}）: {exc}") from exc
+                raise RuntimeError(f"{self.provider_name} 流式结果接收失败（模型 {model}）: {exc}") from exc
             content = "".join(chunks)
         else:
             choices = getattr(response, "choices", None) or []
             message = getattr(choices[0], "message", None) if choices else None
             content = _coerce_openlux_text(getattr(message, "content", None))
         if not content:
-            raise ValueError(f"OpenLux 返回空内容（模型 {model}）")
+            raise ValueError(f"{self.provider_name} 返回空内容（模型 {model}）")
         self._save_raw_response(
             model=model,
             content=content,
@@ -874,6 +959,7 @@ class OpenLuxGenerator(LLMGenerator):
         image_style: str | None = None,
         user_suggestions: str | None = None,
         preserve_spoken_text: bool = False,
+        prompt_profile: dict[str, Any] | None = None,
     ) -> Storyboard:
         prompt = (
             f"请为以下项目创作恰好 {count} 个分镜。必须重新组织完整剧情使其天然适配 {count} 镜，"
@@ -895,17 +981,23 @@ class OpenLuxGenerator(LLMGenerator):
                 "\n\n【无台词模式】每镜 event 只写可见动作；dialogue 与 dialogue_speaker 必须为空字符串；"
                 "不得描述人物开口说话。"
             )
-        prompt += _build_prompt_context_text(character_description, image_style)
-        prompt += _build_user_suggestions_text(user_suggestions)
+        prompt += _build_profile_context_text(
+            prompt_profile,
+            topic=topic,
+            count=count,
+            character_description=character_description,
+            image_style=image_style,
+            user_suggestions=user_suggestions,
+        )
         prompt += _spoken_text_policy_instruction(preserve_spoken_text)
         references = [reference_image] if reference_image else None
         content = await self._chat(
-            system_prompt=self.system_prompt,
+            system_prompt=_profile_system_prompt(self.system_prompt, prompt_profile),
             user_prompt=prompt,
             reference_images=references,
         )
         try:
-            payload = _parse_json_object(content, "OpenLux")
+            payload = _parse_json_object(content, self.provider_name)
         except ValueError as exc:
             raise ValueError(f"{exc}{self._raw_result_hint()}") from exc
         payload = _normalize_storyboard_payload(
@@ -917,7 +1009,7 @@ class OpenLuxGenerator(LLMGenerator):
             return Storyboard(**payload)
         except Exception as exc:
             raise ValueError(
-                f"OpenLux 分镜结构校验失败: {exc}{self._raw_result_hint()}"
+                f"{self.provider_name} 分镜结构校验失败: {exc}{self._raw_result_hint()}"
             ) from exc
 
     async def generate_json(
@@ -932,7 +1024,7 @@ class OpenLuxGenerator(LLMGenerator):
             reference_images=reference_images,
         )
         try:
-            return _parse_json_object(content, "OpenLux")
+            return _parse_json_object(content, self.provider_name)
         except ValueError as exc:
             raise ValueError(f"{exc}{self._raw_result_hint()}") from exc
 
@@ -970,13 +1062,46 @@ class OpenLuxGenerator(LLMGenerator):
             reference_images=[reference_image] if reference_image else None,
         )
         payload = _normalize_storyboard_payload(
-            _parse_json_object(content, "OpenLux"),
+            _parse_json_object(content, self.provider_name),
             include_dialogue=True,
         )
         try:
             return Storyboard(**payload)
         except Exception as exc:
-            raise ValueError(f"OpenLux 分镜修改结果校验失败: {exc}") from exc
+            raise ValueError(f"{self.provider_name} 分镜修改结果校验失败: {exc}") from exc
+
+
+class ClaudeGatewayGenerator(OpenLuxGenerator):
+    """Claude through a separately configured OpenAI-compatible relay."""
+
+    def __init__(self):
+        if not settings.CLAUDE_API_KEY:
+            raise ValueError("Claude 中转 API Key 未配置")
+        super().__init__(
+            api_key=settings.CLAUDE_API_KEY,
+            base_url=settings.CLAUDE_BASE_URL,
+            model=settings.CLAUDE_MODEL,
+            vision_model=settings.CLAUDE_VISION_MODEL,
+            provider_name="Claude 中转",
+        )
+
+
+class GrsaiLLMGenerator(OpenLuxGenerator):
+    """GRSAI OpenAI-compatible text/vision adapter."""
+
+    def __init__(self):
+        if not settings.GRSAI_API_KEY:
+            raise ValueError("GRSAI API Key 未配置")
+        base_url = settings.GRSAI_BASE_URL.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
+        super().__init__(
+            api_key=settings.GRSAI_API_KEY,
+            base_url=base_url,
+            model=settings.GRSAI_LLM_MODEL,
+            vision_model=settings.GRSAI_LLM_VISION_MODEL,
+            provider_name="GRSAI",
+        )
 
 
 class GLMGenerator(LLMGenerator):
@@ -1046,6 +1171,7 @@ class GLMGenerator(LLMGenerator):
         image_style: str | None = None,
         user_suggestions: str | None = None,
         preserve_spoken_text: bool = False,
+        prompt_profile: dict[str, Any] | None = None,
     ) -> Storyboard:
         import asyncio
         
@@ -1100,8 +1226,14 @@ class GLMGenerator(LLMGenerator):
                 text_prompt = template_enhancement + "\n\n" + text_prompt
 
             text_prompt += dialogue_prompt_addendum
-            text_prompt += _build_prompt_context_text(character_description, image_style)
-            text_prompt += _build_user_suggestions_text(user_suggestions)
+            text_prompt += _build_profile_context_text(
+                prompt_profile,
+                topic=topic,
+                count=count,
+                character_description=character_description,
+                image_style=image_style,
+                user_suggestions=user_suggestions,
+            )
             text_prompt += _spoken_text_policy_instruction(preserve_spoken_text)
 
             user_content.append({
@@ -1113,8 +1245,14 @@ class GLMGenerator(LLMGenerator):
             if template_enhancement:
                 text_prompt = template_enhancement + "\n\n【用户主题】" + text_prompt
 
-            text_prompt += _build_prompt_context_text(character_description, image_style)
-            text_prompt += _build_user_suggestions_text(user_suggestions)
+            text_prompt += _build_profile_context_text(
+                prompt_profile,
+                topic=topic,
+                count=count,
+                character_description=character_description,
+                image_style=image_style,
+                user_suggestions=user_suggestions,
+            )
             text_prompt += _spoken_text_policy_instruction(preserve_spoken_text)
             
             user_content.append({
@@ -1300,7 +1438,7 @@ class GLMGenerator(LLMGenerator):
 class ArkLLMGenerator(LLMGenerator):
     """火山方舟托管的 LLM（豆包1.8、DeepSeek 3.2 等）"""
     
-    def __init__(self):
+    def __init__(self, model: str | None = None):
         if not settings.ARK_API_KEY:
             raise ValueError("ARK_API_KEY is not configured")
         from volcenginesdkarkruntime import Ark
@@ -1308,7 +1446,7 @@ class ArkLLMGenerator(LLMGenerator):
             api_key=settings.ARK_API_KEY,
             base_url=settings.ARK_BASE_URL
         )
-        self.model = settings.ARK_LLM_MODEL
+        self.model = model or settings.ARK_LLM_MODEL
         self.system_prompt = """
 你是一位专业的AI短视频分镜师和导演，擅长创作爆款短视频脚本。
 你的任务是根据给定的主题生成详细的分镜脚本。
@@ -1370,6 +1508,7 @@ class ArkLLMGenerator(LLMGenerator):
         image_style: str | None = None,
         user_suggestions: str | None = None,
         preserve_spoken_text: bool = False,
+        prompt_profile: dict[str, Any] | None = None,
     ) -> Storyboard:
         import asyncio
         
@@ -1400,8 +1539,14 @@ class ArkLLMGenerator(LLMGenerator):
 5. 每个分镜的 motion_prompt 必须非空且至少一句完整动作+运镜描述。
 """
         
-        prompt += _build_prompt_context_text(character_description, image_style)
-        prompt += _build_user_suggestions_text(user_suggestions)
+        prompt += _build_profile_context_text(
+            prompt_profile,
+            topic=topic,
+            count=count,
+            character_description=character_description,
+            image_style=image_style,
+            user_suggestions=user_suggestions,
+        )
         prompt += _spoken_text_policy_instruction(preserve_spoken_text)
 
         reference_image_url = _resolve_reference_image_url(reference_image)
@@ -1429,7 +1574,7 @@ class ArkLLMGenerator(LLMGenerator):
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": _profile_system_prompt(self.system_prompt, prompt_profile)},
                     {"role": "user", "content": user_content}
                 ]
             )
@@ -1492,7 +1637,7 @@ class ArkLLMGenerator(LLMGenerator):
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": _profile_system_prompt(self.system_prompt, prompt_profile)},
                     {"role": "user", "content": user_content}
                 ]
             )

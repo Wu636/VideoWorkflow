@@ -246,6 +246,11 @@ class ProductionSeries(BaseModel):
     style_bible: str = ""
     style_profile: StyleProfile | None = None
     negative_prompt: str = ""
+    # Reusable storyboard/prompt profile inherited by new episodes.  The
+    # profile is snapshotted onto each project when generation starts.
+    prompt_template_id: str = "system-default"
+    prompt_template_version: int = Field(default=1, ge=1)
+    prompt_template_snapshot: dict[str, Any] = Field(default_factory=dict)
     # Rules that must be repeated in every Seedance shot for this series.
     # Kept separate from the visual style so refreshing a project/character
     # never drops safety or continuity requirements.
@@ -271,6 +276,13 @@ class Project(BaseModel):
     preferred_prompt_targets: list[Literal["h3", "seedance"]] = Field(
         default_factory=lambda: ["seedance"]
     )
+    # The exact profile used for the current episode. Empty snapshot means the
+    # built-in default, which keeps older projects backward compatible.
+    prompt_template_id: str = "system-default"
+    prompt_template_version: int = Field(default=1, ge=1)
+    prompt_template_source: Literal["system", "series", "user", "ai"] = "system"
+    prompt_template_snapshot: dict[str, Any] = Field(default_factory=dict)
+    prompt_template_hash: str = ""
     storyboard_warnings: list[str] = Field(default_factory=list)
     characters: list[CharacterProfile] = Field(default_factory=list)
     ai_recommended_shot_count: int | None = Field(default=None, ge=1, le=500)

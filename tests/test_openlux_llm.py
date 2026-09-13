@@ -13,6 +13,9 @@ from src.video_workflow.core.orchestrator import (
     resolve_reference_llm_provider,
 )
 from src.video_workflow.generators.llm import (
+    ArkLLMGenerator,
+    ClaudeGatewayGenerator,
+    GrsaiLLMGenerator,
     OpenLuxGenerator,
     _normalize_storyboard_payload,
     _parse_json_object,
@@ -138,6 +141,25 @@ class OpenLuxGeneratorTests(unittest.IsolatedAsyncioTestCase):
         generator = OpenLuxGenerator()
         self.assertEqual(generator.client.max_retries, 0)
 
+    def test_grsai_factory_uses_openai_compatible_v1_endpoint(self) -> None:
+        patches = [
+            patch.object(settings, "GRSAI_API_KEY", "grsai-test-key"),
+            patch.object(settings, "GRSAI_BASE_URL", "https://grsai.example"),
+            patch.object(settings, "GRSAI_LLM_MODEL", "gpt-5.6-terra"),
+            patch.object(settings, "GRSAI_LLM_VISION_MODEL", "gpt-5.6-sol"),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            generator = create_llm_generator("grsai")
+            self.assertIsInstance(generator, GrsaiLLMGenerator)
+            self.assertEqual(generator.client.base_url, "https://grsai.example/v1/")
+            self.assertEqual(generator.model, "gpt-5.6-terra")
+            self.assertEqual(generator.vision_model, "gpt-5.6-sol")
+        finally:
+            for item in reversed(patches):
+                item.stop()
+
     def test_storyboard_normalization_keeps_fifteen_second_action_arc_and_system_vo(self) -> None:
         payload = _normalize_storyboard_payload(
             {
@@ -250,11 +272,45 @@ class OpenLuxGeneratorTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertEqual(resolve_reference_llm_provider(), "openlux")
 
+    async def test_claude_relay_switches_text_and_image_models(self) -> None:
+        with (
+            patch.object(settings, "CLAUDE_API_KEY", "claude-fixture-key"),
+            patch.object(settings, "CLAUDE_BASE_URL", "https://relay.example.invalid/v1"),
+            patch.object(settings, "CLAUDE_MODEL", "claude-opus-5"),
+            patch.object(settings, "CLAUDE_VISION_MODEL", "claude-sonnet-4-6"),
+        ):
+            generator = create_llm_generator("claude")
+            self.assertIsInstance(generator, ClaudeGatewayGenerator)
+            self.assertEqual(str(generator.client.base_url), "https://relay.example.invalid/v1/")
+            generator.client = _FakeClient(['{"ok": true}', '{"style": "手绘"}'])
+            await generator.generate_json("system", "text")
+            with tempfile.TemporaryDirectory() as directory:
+                image = Path(directory) / "style.png"
+                image.write_bytes(b"style")
+                await generator.generate_json("system", "analyze", reference_images=[str(image)])
+            self.assertEqual(
+                [call["model"] for call in generator.client.completions.calls],
+                ["claude-opus-5", "claude-sonnet-4-6"],
+            )
+
+    def test_ark_deepseek_has_independent_resource_pack_model(self) -> None:
+        with (
+            patch.object(settings, "ARK_API_KEY", "ark-fixture-key"),
+            patch.object(settings, "ARK_DEEPSEEK_MODEL", "deepseek-v4-flash-ga-260731"),
+            patch.object(settings, "ARK_LLM_MODEL", "ep-other"),
+        ):
+            self.assertEqual(create_llm_generator("ark_deepseek").model, "deepseek-v4-flash-ga-260731")
+            self.assertEqual(create_llm_generator("ark").model, "ep-other")
+
     def test_runtime_settings_expose_openlux_fields_and_routes(self) -> None:
         payload = runtime_settings.public_payload()
         llm_group = next(group for group in payload["groups"] if group["id"] == "llm")
         keys = {field["key"] for field in llm_group["fields"]}
         self.assertTrue({
+            "CLAUDE_API_KEY",
+            "CLAUDE_MODEL",
+            "CLAUDE_VISION_MODEL",
+            "ARK_DEEPSEEK_MODEL",
             "OPENLUX_API_KEY",
             "OPENLUX_BASE_URL",
             "OPENLUX_MODEL",

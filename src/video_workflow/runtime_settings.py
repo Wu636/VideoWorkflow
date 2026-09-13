@@ -24,10 +24,10 @@ class RuntimeField:
 
 
 RUNTIME_FIELDS = (
-    RuntimeField("LLM_PROVIDER", "llm", "分镜生成模型", "用于生成完整分镜表。", options=("deepseek", "glm", "openlux", "ark", "ark_doubao", "ark_deepseek")),
-    RuntimeField("BRIEF_ANALYSIS_PROVIDER", "llm", "剧本分析模型", "auto 表示沿用分镜模型，遇到参考图时优先使用同一多模态服务。", options=("auto", "deepseek", "glm", "openlux", "ark", "ark_doubao", "ark_deepseek")),
-    RuntimeField("SHOT_COUNT_PROVIDER", "llm", "镜头数建议模型", "auto 表示沿用剧本分析模型。", options=("auto", "deepseek", "glm", "openlux", "ark", "ark_doubao", "ark_deepseek")),
-    RuntimeField("REFERENCE_ANALYSIS_PROVIDER", "llm", "参考图理解模型", "auto 优先沿用已选择的 OpenLux 多模态模型，再按方舟视觉 → GLM 选择。", options=("auto", "openlux", "glm", "ark", "ark_doubao")),
+    RuntimeField("LLM_PROVIDER", "llm", "分镜生成模型", "用于生成完整分镜表和主要 Prompt。", options=("deepseek", "glm", "grsai", "openlux", "claude", "ark", "ark_doubao", "ark_deepseek")),
+    RuntimeField("BRIEF_ANALYSIS_PROVIDER", "llm", "剧本分析模型", "auto 表示沿用分镜模型，遇到参考图时切换到多模态服务。", options=("auto", "deepseek", "glm", "grsai", "openlux", "claude", "ark", "ark_doubao", "ark_deepseek")),
+    RuntimeField("SHOT_COUNT_PROVIDER", "llm", "镜头数建议模型", "auto 表示沿用剧本分析模型。", options=("auto", "deepseek", "glm", "grsai", "openlux", "claude", "ark", "ark_doubao", "ark_deepseek")),
+    RuntimeField("REFERENCE_ANALYSIS_PROVIDER", "llm", "参考图理解模型", "用于角色图、场景图和上传风格图的理解；auto 优先已配置的 Claude 多模态。", options=("auto", "grsai", "claude", "openlux", "glm", "ark", "ark_doubao")),
     RuntimeField("DEEPSEEK_API_KEY", "llm", "DeepSeek API Key", secret=True),
     RuntimeField("DEEPSEEK_BASE_URL", "llm", "DeepSeek Base URL"),
     RuntimeField("DEEPSEEK_MODEL", "llm", "DeepSeek 模型"),
@@ -35,14 +35,22 @@ RUNTIME_FIELDS = (
     RuntimeField("GLM_MODEL", "llm", "GLM 视觉模型"),
     RuntimeField("OPENLUX_API_KEY", "llm", "OpenLux API Key", "在 OpenLux 控制台创建；用于 GPT、Claude、Gemini、DeepSeek 等模型。", secret=True),
     RuntimeField("OPENLUX_BASE_URL", "llm", "OpenLux Base URL", "官方 OpenAI 兼容地址，默认 https://api.openlux.ai/v1。"),
-    RuntimeField("OPENLUX_MODEL", "llm", "OpenLux 文本/分镜模型", "可填 OpenLux 模型广场中的模型 ID，例如 claude-sonnet-5、claude-opus-5、gpt-5.6-sol、gpt-5.5。"),
-    RuntimeField("OPENLUX_VISION_MODEL", "llm", "OpenLux 多模态模型", "用于参考图分析、人物形象补全和带图分镜；默认 gpt-5.6-sol。"),
+    RuntimeField("OPENLUX_MODEL", "llm", "OpenLux 文本/分镜模型", "可直接选 Claude Sonnet 5、Sonnet 4.6、Opus 5，也可填 OpenLux 模型广场中的其他 ID。"),
+    RuntimeField("PROMPT_OPTIMIZER_MODEL", "llm", "Prompt 模板优化模型", "固定通过 OpenLux 调用高质量模型生成模板草稿；默认 Claude Opus 5。", options=("claude-opus-5",)),
+    RuntimeField("OPENLUX_VISION_MODEL", "llm", "OpenLux 多模态模型", "用于角色/风格图理解；可选 Claude 三种模型或填写其他多模态模型 ID。"),
     RuntimeField("OPENLUX_REQUEST_TIMEOUT_SECONDS", "llm", "OpenLux 单次请求超时（秒）", "旗舰模型可能需要数分钟；默认 900 秒。程序不会自动产生第二次付费请求。"),
     RuntimeField("OPENLUX_STREAM", "llm", "OpenLux 流式长连接", "建议开启。持续接收增量结果，降低代理或网关因长时间无数据而断开连接的概率。"),
     RuntimeField("OPENLUX_SAVE_RAW_RESPONSES", "llm", "保存 OpenLux 原始响应", "建议开启。模型一旦返回就先落盘，后续 JSON 校验失败仍可恢复已经付费的结果。"),
+    RuntimeField("CLAUDE_API_KEY", "llm", "Claude 中转 API Key", "单独用于 Claude 中转，和 OpenLux 密钥互不混用。", secret=True),
+    RuntimeField("CLAUDE_BASE_URL", "llm", "Claude 中转 Base URL", "填写中转站提供的 OpenAI 兼容 API 地址；默认 https://www.bb-api.com/v1。"),
+    RuntimeField("CLAUDE_MODEL", "llm", "Claude 分镜/Prompt 模型", "供用户切换三种模型。", options=("claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-5")),
+    RuntimeField("CLAUDE_VISION_MODEL", "llm", "Claude 图片理解模型", "读取上传的角色和风格参考图。", options=("claude-sonnet-5", "claude-sonnet-4-6", "claude-opus-5")),
+    RuntimeField("GRSAI_LLM_MODEL", "llm", "GRSAI 文本/分镜模型", "GRSAI OpenAI 兼容接口中的 GPT 模型。", options=("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-6-astra")),
+    RuntimeField("GRSAI_LLM_VISION_MODEL", "llm", "GRSAI 图片理解模型", "用于上传角色图、场景图和风格图理解。", options=("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5", "gpt-6-astra")),
     RuntimeField("ARK_API_KEY", "llm", "火山方舟 API Key", secret=True),
     RuntimeField("ARK_BASE_URL", "llm", "火山方舟 Base URL"),
     RuntimeField("ARK_LLM_MODEL", "llm", "方舟文本模型"),
+    RuntimeField("ARK_DEEPSEEK_MODEL", "llm", "火山 DeepSeek 模型", "对应火山资源包；可填 deepseek-v4-pro-ga-260813 或 deepseek-v4-flash-ga-260731。", options=("deepseek-v4-pro-ga-260813", "deepseek-v4-flash-ga-260731")),
     RuntimeField("ARK_VISION_MODEL", "llm", "方舟视觉模型"),
     RuntimeField("IMAGE_PROVIDER", "image", "默认分镜图服务", options=("grsai", "ark")),
     RuntimeField("ARK_IMAGE_MODEL", "image", "方舟图像模型"),
@@ -50,6 +58,7 @@ RUNTIME_FIELDS = (
     RuntimeField("GRSAI_BASE_URL", "image", "GRSAI Base URL"),
     RuntimeField("GRSAI_IMAGE_MODEL", "image", "GRSAI 图像模型"),
     RuntimeField("GRSAI_IMAGE_SIZE", "image", "GRSAI 图像尺寸", options=("1K", "2K", "4K")),
+    RuntimeField("IMAGE_STYLE_REFERENCE_MODE", "image", "风格图传递方式", "direct 将上传风格图直接送进生图模型，仅参考画风；text_only 只使用分析后的文字风格。", options=("direct", "text_only")),
     RuntimeField("VIDEO_PROVIDER", "video", "默认外部视频服务", options=("grsai", "ark")),
     RuntimeField(
         "SEEDANCE_DEFAULT_MODEL", "video", "Seedance 默认模型",
@@ -153,6 +162,8 @@ class RuntimeSettingsManager:
         coerced = TypeAdapter(annotation).validate_python(value)
         if key == "SEEDANCE_RENDER_CONCURRENCY" and not 1 <= int(coerced) <= 8:
             raise ValueError("SEEDANCE_RENDER_CONCURRENCY 必须在 1–8 之间")
+        if key == "IMAGE_STYLE_REFERENCE_MODE" and coerced not in {"direct", "text_only"}:
+            raise ValueError("IMAGE_STYLE_REFERENCE_MODE 必须是 direct 或 text_only")
         return coerced
 
     def load(self) -> None:
@@ -235,8 +246,15 @@ class RuntimeSettingsManager:
         if provider == "openlux":
             model = settings.OPENLUX_VISION_MODEL if vision else settings.OPENLUX_MODEL
             return "OpenLux", model, bool(settings.OPENLUX_API_KEY)
+        if provider == "claude":
+            model = settings.CLAUDE_VISION_MODEL if vision else settings.CLAUDE_MODEL
+            return "Claude 中转", model, bool(settings.CLAUDE_API_KEY)
+        if provider == "grsai":
+            model = settings.GRSAI_LLM_VISION_MODEL if vision else settings.GRSAI_LLM_MODEL
+            return "GRSAI", model, bool(settings.GRSAI_API_KEY)
         if provider in {"ark", "ark_doubao", "ark_deepseek"}:
-            return "火山方舟", settings.ARK_VISION_MODEL if vision else settings.ARK_LLM_MODEL, bool(settings.ARK_API_KEY)
+            model = settings.ARK_VISION_MODEL if vision else settings.ARK_DEEPSEEK_MODEL if provider == "ark_deepseek" else settings.ARK_LLM_MODEL
+            return "火山方舟 DeepSeek" if provider == "ark_deepseek" else "火山方舟", model, bool(settings.ARK_API_KEY)
         return "DeepSeek", settings.DEEPSEEK_MODEL, bool(settings.DEEPSEEK_API_KEY)
 
     @staticmethod
@@ -250,7 +268,9 @@ class RuntimeSettingsManager:
             {"value": "auto", "label": "自动选择"},
             {"value": "deepseek", "label": "DeepSeek"},
             {"value": "glm", "label": "智谱 GLM"},
+            {"value": "grsai", "label": "GRSAI（GPT）"},
             {"value": "openlux", "label": "OpenLux（GPT / Claude / Gemini）"},
+            {"value": "claude", "label": "Claude 中转（Sonnet / Opus）"},
             {"value": "ark", "label": "火山方舟（默认端点）"},
             {"value": "ark_doubao", "label": "火山方舟（豆包/通用端点）"},
             {"value": "ark_deepseek", "label": "火山方舟（DeepSeek 端点）"},
@@ -258,7 +278,9 @@ class RuntimeSettingsManager:
         vision_options = [
             {"value": "auto", "label": "自动选择"},
             {"value": "openlux", "label": "OpenLux 多模态"},
+            {"value": "claude", "label": "Claude 图片理解"},
             {"value": "glm", "label": "智谱 GLM"},
+            {"value": "grsai", "label": "GRSAI 多模态"},
             {"value": "ark", "label": "火山方舟视觉（默认端点）"},
             {"value": "ark_doubao", "label": "火山方舟视觉"},
         ]
@@ -270,6 +292,10 @@ class RuntimeSettingsManager:
         if vision_selected == "auto":
             if brief_effective == "openlux" and settings.OPENLUX_API_KEY:
                 vision_effective = "openlux"
+            elif brief_effective == "claude" and settings.CLAUDE_API_KEY:
+                vision_effective = "claude"
+            elif settings.CLAUDE_API_KEY:
+                vision_effective = "claude"
             elif settings.ARK_API_KEY:
                 vision_effective = "ark_doubao"
             elif settings.GLM_API_KEY:
@@ -339,11 +365,11 @@ class RuntimeSettingsManager:
                 "description": "生成逐镜剧情、画面、动作、镜头、声音和 H3 Prompt。",
             },
             {
-                "id": "reference_vision", "label": "角色参考图理解", "setting_key": "REFERENCE_ANALYSIS_PROVIDER",
+                "id": "reference_vision", "label": "参考图理解（角色/风格/场景）", "setting_key": "REFERENCE_ANALYSIS_PROVIDER",
                 "selected": vision_selected, "options": vision_options, "effective_label": vision_label,
                 "model": vision_model, "configured": vision_ready,
-                "priority": ["OpenLux（分镜模型已选且配置时）", "火山方舟视觉（备用）", "智谱 GLM（备用）", "剧本模型文本描述（兜底）"],
-                "description": "读取角色参考图外貌、服饰与固定视觉特征。",
+                "priority": ["已选多模态分镜服务", "Claude 中转（已配置时）", "火山方舟视觉（备用）", "智谱 GLM（备用）"],
+                "description": "读取角色参考图、场景图和用户上传风格图；出图时可另将风格图直接交给生图模型。",
             },
             {
                 "id": "keyframe", "label": "分镜首帧生成", "setting_key": "IMAGE_PROVIDER",

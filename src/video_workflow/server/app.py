@@ -11,7 +11,7 @@ from src.video_workflow.runtime_settings import runtime_settings
 runtime_settings.load()
 configure_logging()
 
-from src.video_workflow.server.routers import files, projects, system, webhooks, workflow
+from src.video_workflow.server.routers import files, projects, prompt_templates, system, webhooks, workflow
 
 
 @asynccontextmanager
@@ -70,6 +70,7 @@ app.include_router(workflow.router, prefix="/api")
 app.include_router(files.router, prefix="/api")
 app.include_router(webhooks.router, prefix="/api")
 app.include_router(projects.router, prefix="/api")
+app.include_router(prompt_templates.router, prefix="/api")
 app.include_router(projects.public_router, prefix="/api")
 app.include_router(system.router, prefix="/api")
 app.mount("/static", StaticFiles(directory=settings.OUTPUT_DIR), name="static")
